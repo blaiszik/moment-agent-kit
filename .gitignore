@@ -1,0 +1,29 @@
+# --- Secrets / local config (never commit) ---
+.env
+.env.*
+.mcp.json
+.moment.json
+# keep the templates
+!.mcp.json.example
+!.moment.json.example
+
+# --- Node / MCP server ---
+node_modules/
+dist/
+*.tsbuildinfo
+
+# --- Python / CLI ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+.pytest_cache/
+.venv/
+venv/
+
+# --- OS / editor ---
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,18 @@
+[project]
+name = "moment-cli"
+version = "2.3.0"
+description = "Moment research agent CLI"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "httpx>=0.24.0",
+    "pypdf>=4.0.0",
+]
+
+[project.scripts]
+moment = "moment_cli.cli:app"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

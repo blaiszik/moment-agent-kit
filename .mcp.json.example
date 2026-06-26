@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "moment": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "./mcp-server/dist/index.js",
+        "--api-url=https://moment-next.vercel.app",
+        "--api-key=YOUR_MOMENT_API_KEY"
+      ]
+    }
+  }
+}
