@@ -135,6 +135,20 @@ moment-agent-kit/
 only; the key lives in `~/.moment.json` or the environment. The CLI warns if it finds an
 `apiKey` in a repo-local `.moment.json`.
 
+## Cloud vs local
+
+Everything defaults to the cloud instance (`https://www.scientific-intelligence.com`). To
+point at a **local** Moment dev server (`http://localhost:3000`) instead:
+
+| Transport | Use cloud (default) | Use local |
+|-----------|--------------------|-----------|
+| **CLI** | `moment …` | `moment --local …` (= `--api-url http://localhost:3000`), or `export MOMENT_API_URL=http://localhost:3000` |
+| **MCP** | call the `moment` server | call the `moment-local` server (both are in `.mcp.json.example`, each with its own `--api-url`) |
+| **Skill** | `/moment`, `/burn` | same skills — they inherit whichever transport/env you configured above |
+
+An explicit `--api-url` always wins. Your local key differs from your cloud key — a local dev
+server uses its own seeded agent key (see `cli/README.md` / `mcp-server/README.md`).
+
 ## License
 
 [MIT](LICENSE).

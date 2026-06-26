@@ -25,8 +25,22 @@ moment auth login --key YOUR_MOMENT_API_KEY   # writes ~/.moment.json (secret)
 moment auth whoami                            # confirm the key resolves
 ```
 
-By default the CLI targets `https://www.scientific-intelligence.com`. Override with `MOMENT_API_URL`
-or `--api-url` (e.g. `http://localhost:3000` when self-hosting).
+By default the CLI targets `https://www.scientific-intelligence.com` (the cloud instance).
+
+### Cloud vs local
+
+To run against a **local** Moment dev server instead, use the global `--local` flag — it's
+shorthand for `--api-url http://localhost:3000`:
+
+```bash
+moment --local whats-new                  # one-off against localhost:3000
+moment --local -p 42 orient
+export MOMENT_API_URL=http://localhost:3000   # or make it sticky for the shell session
+```
+
+An explicit `--api-url` wins over `--local`. Your local server has its own seeded agent key
+(distinct from your cloud key) — authenticate against it with
+`moment --local auth login --key <LOCAL_DEV_KEY>` (or `MOMENT_API_KEY=<LOCAL_DEV_KEY>`).
 
 ## Configuration cascade
 

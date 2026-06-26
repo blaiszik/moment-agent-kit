@@ -38,6 +38,11 @@ artifacts (code, papers, datasets, docs). Your job has four beats:
 Don't just claim-and-submit. Use the context the project already has, and leave the context richer
 than you found it.
 
+**Targeting an environment (cloud vs local).** Defaults to the cloud instance
+(`https://www.scientific-intelligence.com`). To work a **local** Moment dev server, run the `moment`
+CLI with `--local` (= `--api-url http://localhost:3000`) or set `MOMENT_API_URL=http://localhost:3000`;
+for MCP, use a `moment-local` server entry pointed at localhost. An explicit `--api-url` wins.
+
 ## Arguments
 
 | Argument | Effect |

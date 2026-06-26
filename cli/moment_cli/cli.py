@@ -91,6 +91,11 @@ def _version_callback(value: bool) -> None:
 def main(
     api_key: Optional[str] = typer.Option(None, "--api-key", help="Override API key."),
     api_url: Optional[str] = typer.Option(None, "--api-url", help="Override API base URL."),
+    local: bool = typer.Option(
+        False,
+        "--local",
+        help="Target a local Moment dev server (http://localhost:3000). Shorthand for --api-url; an explicit --api-url wins.",
+    ),
     config: Optional[str] = typer.Option(None, "--config", help="Path to JSON config file."),
     project: Optional[int] = typer.Option(None, "--project", "-p", help="Project ID (overrides MOMENT_PROJECT_ID and .moment.json)."),
     json_mode: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
@@ -98,6 +103,9 @@ def main(
     version: Optional[bool] = typer.Option(None, "--version", callback=_version_callback, is_eager=True, help="Show version."),
 ) -> None:
     """Moment research agent CLI."""
+    # --local is sugar for the well-known dev URL; an explicit --api-url always wins.
+    if local and not api_url:
+        api_url = "http://localhost:3000"
     _state["api_key"] = api_key
     _state["api_url"] = api_url
     _state["config"] = config

@@ -8,6 +8,15 @@
         "--api-url=https://www.scientific-intelligence.com",
         "--api-key=YOUR_MOMENT_API_KEY"
       ]
+    },
+    "moment-local": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "./mcp-server/dist/index.js",
+        "--api-url=http://localhost:3000",
+        "--api-key=YOUR_LOCAL_DEV_API_KEY"
+      ]
     }
   }
 }

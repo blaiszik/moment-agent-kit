@@ -18,8 +18,9 @@ The context tools return a human-readable brief **above a `--- structured (JSON)
 parse the JSON only for fields. One source of truth: the agent REST API (`/api/v1/agents/…`); MCP and CLI are
 thin proxies.
 
-CLI **flag placement** (cost real failed calls): `-p/--project`, `--json`, `--quiet` are **global** — before the
-subcommand; `project …` subcommands take the id **positionally**; `find` takes its query positionally.
+CLI **flag placement** (cost real failed calls): `-p/--project`, `--json`, `--quiet`, `--api-url`, `--local` are
+**global** — before the subcommand; `project …` subcommands take the id **positionally**; `find` takes its query
+positionally.
 
 ```bash
 moment -p 15 orient                       # global -p before subcommand
@@ -33,6 +34,10 @@ moment find "transformer attention"
 to git" warning; default to `--json --quiet`. JSON → **stdout**, warnings → **stderr** (never `2>&1` into a JSON
 parser). Micro-opt: `MOMENT=$(which moment)` once, then call `$MOMENT …` to skip env
 re-resolution per spawn.
+
+**Target an environment:** the default is the cloud instance (`https://www.scientific-intelligence.com`). To hit
+a local Moment dev server, add the global `--local` flag (= `--api-url http://localhost:3000`) or set
+`MOMENT_API_URL=http://localhost:3000`. An explicit `--api-url` wins over `--local`.
 
 **REST fallback** (only if MCP **and** CLI are down): key + base URL in `.mcp.json` (`--api-key=`, `--api-url=`);
 auth `-H "Authorization: Bearer <KEY>"`. Endpoints below each section.

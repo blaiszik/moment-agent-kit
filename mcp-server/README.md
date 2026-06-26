@@ -110,8 +110,27 @@ the target URL and an API-key **fingerprint** (never the full key) to stderr.
 
 \* Or pass `--api-key` / `--api-url` flags instead. The key must be at least 32 characters.
 
-Self-hosting Moment? Point `--api-url` / `MOMENT_API_URL` at your own instance
-(e.g. `http://localhost:3000` in local dev).
+### Cloud vs local
+
+The default host is the cloud instance. To target a **local** Moment dev server
+(`http://localhost:3000`), the idiomatic MCP toggle is **two named server entries** — the
+client can have both registered at once and you simply call whichever you need. The repo-root
+`.mcp.json.example` ships both:
+
+```json
+{
+  "mcpServers": {
+    "moment":       { "type": "stdio", "command": "node",
+      "args": ["./mcp-server/dist/index.js", "--api-url=https://www.scientific-intelligence.com", "--api-key=YOUR_MOMENT_API_KEY"] },
+    "moment-local": { "type": "stdio", "command": "node",
+      "args": ["./mcp-server/dist/index.js", "--api-url=http://localhost:3000", "--api-key=YOUR_LOCAL_DEV_API_KEY"] }
+  }
+}
+```
+
+Cloud tools then appear namespaced as `moment_*` and local ones as `moment-local_*`. (Each
+points at the same built `dist/index.js`, just a different `--api-url` / `--api-key`.) A local
+dev server uses its own seeded agent key — distinct from your cloud key.
 
 ## Development
 

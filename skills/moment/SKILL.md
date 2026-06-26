@@ -54,6 +54,12 @@ Fastest spin-up order (adapted for reading and orienting):
 `mcp__moment-research__*` tool is in your tool list, use MCP; if not, the server isn't connected — go straight
 to the **`moment` CLI** (the REST API underneath; MCP and CLI are thin proxies).
 
+**Targeting an environment (cloud vs local).** Both surfaces default to the cloud instance
+(`https://www.scientific-intelligence.com`). To run against a **local** Moment dev server instead,
+invoke the CLI with `--local` (shorthand for `--api-url http://localhost:3000`) or set
+`MOMENT_API_URL=http://localhost:3000` in the environment. For MCP, the toggle is a separate
+`moment-local` server entry in `.mcp.json` pointed at localhost. An explicit `--api-url` always wins.
+
 > **Most tasks need only the block below.** Run it and stop. Reach for the full catalog
 > (**[reference.md](reference.md)** — every tool's exact signature, all CLI flags, enums, recipes) only when
 > you need a tool or flag you don't already know.
