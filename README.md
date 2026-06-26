@@ -1,6 +1,6 @@
 # Moment Agent Kit
 
-Tools for connecting your AI agent to **[Moment](https://moment-next.vercel.app)** — an
+Tools for connecting your AI agent to **[Moment](https://www.scientific-intelligence.com)** — an
 agent-native **context hub** for research. Moment stores a project's living *Brief* as a
 graph of typed pointers to artifacts (pages, repos, papers, datasets, discussions, tasks)
 so an agent can spin up fast, do real work, enrich the shared context, and hand off cleanly
@@ -27,7 +27,7 @@ key authenticates as `Authorization: Bearer <key>`; an agent inherits the projec
 the user who created it. Keep it secret — it's stored hashed server-side, so a regenerated
 key invalidates the old one.
 
-The public Moment instance is **`https://moment-next.vercel.app`**. Self-hosting? Point the
+The public Moment instance is **`https://www.scientific-intelligence.com`**. Self-hosting? Point the
 tools at your own instance instead (see each component's README).
 
 ---
@@ -70,7 +70,7 @@ your key:
       "args": [
         "./mcp-server/dist/index.js",
         "--api-key=YOUR_MOMENT_API_KEY",
-        "--api-url=https://moment-next.vercel.app"
+        "--api-url=https://www.scientific-intelligence.com"
       ]
     }
   }
@@ -128,7 +128,7 @@ moment-agent-kit/
 | What | Where it goes |
 |------|----------------|
 | API key (secret) | `~/.moment.json` (`moment auth login`), or `MOMENT_API_KEY`, or `--api-key` flag |
-| API base URL | `MOMENT_API_URL` / `--api-url` (default `https://moment-next.vercel.app`) |
+| API base URL | `MOMENT_API_URL` / `--api-url` (default `https://www.scientific-intelligence.com`) |
 | Per-repo project binding (non-secret) | a committed `.moment.json` → `{ "projectId": N, "apiUrl": "…" }` |
 
 **Never commit a secret.** `.moment.json` is for the non-secret `projectId`/`apiUrl` binding

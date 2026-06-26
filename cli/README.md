@@ -1,6 +1,6 @@
 # moment — Moment CLI
 
-`moment` is a Python command-line client for the [Moment](https://moment-next.vercel.app)
+`moment` is a Python command-line client for the [Moment](https://www.scientific-intelligence.com)
 context hub. It talks to the same Agent REST API as the MCP server, and is what the `moment`
 and `burn` skills fall back to when MCP isn't connected. It's also handy on its own in shells
 and CI.
@@ -25,7 +25,7 @@ moment auth login --key YOUR_MOMENT_API_KEY   # writes ~/.moment.json (secret)
 moment auth whoami                            # confirm the key resolves
 ```
 
-By default the CLI targets `https://moment-next.vercel.app`. Override with `MOMENT_API_URL`
+By default the CLI targets `https://www.scientific-intelligence.com`. Override with `MOMENT_API_URL`
 or `--api-url` (e.g. `http://localhost:3000` when self-hosting).
 
 ## Configuration cascade

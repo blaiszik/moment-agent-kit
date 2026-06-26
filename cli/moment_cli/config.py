@@ -95,7 +95,7 @@ def resolve_config(
         os.environ.get("MCP_MOMENT_API_URL"),
         home_config.get("apiUrl"),
         mcp_config.get("apiUrl"),
-    ) or "https://moment-next.vercel.app"
+    ) or "https://www.scientific-intelligence.com"
     resolved_url = resolved_url.rstrip("/")
 
     # Project binding cascade: flag → MOMENT_PROJECT_ID → repo → home .moment.json.

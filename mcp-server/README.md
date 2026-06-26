@@ -66,7 +66,7 @@ The server reads its config from CLI flags, then env vars, then a `--config` JSO
       "args": [
         "./mcp-server/dist/index.js",
         "--api-key=YOUR_MOMENT_API_KEY",
-        "--api-url=https://moment-next.vercel.app"
+        "--api-url=https://www.scientific-intelligence.com"
       ]
     }
   }
@@ -83,7 +83,7 @@ The server reads its config from CLI flags, then env vars, then a `--config` JSO
       "args": ["/absolute/path/to/mcp-server/dist/index.js"],
       "env": {
         "MOMENT_MCP_API_KEY": "YOUR_MOMENT_API_KEY",
-        "MOMENT_MCP_API_URL": "https://moment-next.vercel.app"
+        "MOMENT_MCP_API_URL": "https://www.scientific-intelligence.com"
       }
     }
   }
@@ -103,8 +103,8 @@ the target URL and an API-key **fingerprint** (never the full key) to stderr.
 |----------|----------|---------|-------------|
 | `MOMENT_MCP_API_KEY` | Yes\* | – | Preferred env var for the agent API key |
 | `MOMENT_API_KEY` | Yes\* | – | Fallback for the API key |
-| `MOMENT_MCP_API_URL` | No | `https://moment-next.vercel.app` | Preferred env var for the API base URL |
-| `MOMENT_API_URL` | No | `https://moment-next.vercel.app` | Fallback for the API base URL |
+| `MOMENT_MCP_API_URL` | No | `https://www.scientific-intelligence.com` | Preferred env var for the API base URL |
+| `MOMENT_API_URL` | No | `https://www.scientific-intelligence.com` | Fallback for the API base URL |
 | `MOMENT_MCP_CONFIG` | No | – | Path to a JSON file `{ "apiKey": string, "apiUrl": string }` |
 | `MOMENT_MCP_DEBUG` | No | `false` | When truthy, logs every API call and the config fingerprint |
 
@@ -118,7 +118,7 @@ Self-hosting Moment? Point `--api-url` / `MOMENT_API_URL` at your own instance
 ```bash
 npm run dev                 # tsc --watch
 npm run build               # one-shot compile
-node dist/index.js --api-key YOUR_KEY --api-url https://moment-next.vercel.app
+node dist/index.js --api-key YOUR_KEY --api-url https://www.scientific-intelligence.com
 ```
 
 ## Troubleshooting

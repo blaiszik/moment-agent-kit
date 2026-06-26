@@ -1,7 +1,7 @@
 # Moment skills
 
 Agent skills that teach Claude Code and Codex how to work with the
-[Moment](https://moment-next.vercel.app) context hub. Two skills:
+[Moment](https://www.scientific-intelligence.com) context hub. Two skills:
 
 - **`moment`** — the read/write context loop for one project: orient on the Brief, pull pages
   and resources into context, enrich the graph (pages, resources, links, images), and close
@@ -44,7 +44,7 @@ The skills act through the MCP server or CLI, so configure the API key/URL there
 - **CLI** — `moment auth login --key YOUR_MOMENT_API_KEY` (writes `~/.moment.json`).
 
 Get an API key from the Moment app's **AI Agents** page. The public instance is
-`https://moment-next.vercel.app`.
+`https://www.scientific-intelligence.com`.
 
 ## Layout
 
