@@ -120,6 +120,21 @@ function proseFirst(brief: string, structured: unknown): string {
   return `${brief.trim()}\n\n--- structured (JSON) ---\n${JSON.stringify(structured, null, 2)}`;
 }
 
+const DEPRECATED_TOOL_ALIASES: Record<string, string> = {
+  find_context: 'search_context',
+  build_context: 'import_context',
+  gather_context: 'compile_context',
+};
+
+const HIDDEN_DEPRECATED_TOOL_NAMES = new Set(Object.keys(DEPRECATED_TOOL_ALIASES));
+
+function withDeprecationNote(toolName: string, text: string): string {
+  const replacement = DEPRECATED_TOOL_ALIASES[toolName];
+  return replacement
+    ? `Deprecated alias: ${toolName} is hidden from ListTools; use ${replacement} for new calls.\n\n${text}`
+    : text;
+}
+
 /**
  * Compact the get_project_context structured echo (P3). The prose brief above
  * the fence ALREADY carries the full content (handoff text, page bodies,
@@ -331,7 +346,7 @@ const TOOLS = [
   {
     name: 'submit_task',
     description:
-      'Submit your completed work for a task — the record a reviewer reads to decide, and the next agent reads to build on what you did. Include output (for analysis work) or prUrl (for code contributions), plus reasoning that tells the story of the work. Be as thorough as the contribution warrants — match depth to significance: a meaningful finding or a hard-won dead-end deserves full detail; a trivial change needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+      'Submit completed task work. Required: taskId, reasoning, confidenceScore; include output for JSON work or prUrl for code work. Returns the submission record for review.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -346,7 +361,7 @@ const TOOLS = [
         reasoning: {
           type: 'string',
           description:
-            'The story of the work for the reviewer and the next agent: the approach you took and why, what you TRIED that did not work and why you rejected it, the assumptions and edge cases you handled (and any you did not), the limitations, and what the reviewer/next-agent should watch for. Cite specifics — file paths, names, ids, links, repro steps. Be as thorough as the contribution warrants — match depth to significance: a meaningful finding or a hard-won dead-end deserves full detail; a trivial change needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+            'Reviewer-facing rationale: approach, sources, rejected alternatives, caveats, and next steps. Cite concrete ids, links, files, or commands where relevant.',
         },
         confidenceScore: {
           type: 'number',
@@ -359,7 +374,7 @@ const TOOLS = [
         completionReport: {
           type: 'object',
           description:
-            'Optional structured close-out for the next agent/reviewer — what you tried (incl. dead-ends), what you relied on, what you created, a concrete watch-out, and an optional next task. Optional — fill what the contribution warrants; a trivial change can skip it. Never pad trivial work; never compress real signal.',
+            'Optional structured close-out: tried paths, sources used, pages/resources created, watch-out, and a suggested next task.',
           properties: {
             approachesTried: {
               type: 'array',
@@ -398,7 +413,7 @@ const TOOLS = [
   {
     name: 'submit_task_pr',
     description:
-      'Submit a pull request URL for a code-contribution task — link the GitHub PR and explain the change so a reviewer can evaluate it and the next agent can pick it up. Be as thorough as the contribution warrants — match depth to significance: a meaningful finding or a hard-won dead-end deserves full detail; a trivial change needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+      'Register a pull request for a code-contribution task. Required: taskId, prUrl, reasoning. Returns PR submission status for review.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -413,7 +428,7 @@ const TOOLS = [
         reasoning: {
           type: 'string',
           description:
-            'The implementation story for the reviewer and the next agent: the approach and why, alternatives you tried and rejected, edge cases handled, and what to watch for in review or follow-up (flaky tests, migrations, perf, anything load-bearing). Cite file paths, names, and ids. Be as thorough as the contribution warrants — match depth to significance: a meaningful finding or a hard-won dead-end deserves full detail; a trivial change needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+            'Reviewer-facing implementation notes: approach, alternatives rejected, edge cases handled, tests, and follow-up watch-outs. Cite files, commands, and ids.',
         },
         confidenceScore: {
           type: 'number',
@@ -422,7 +437,7 @@ const TOOLS = [
         completionReport: {
           type: 'object',
           description:
-            'Optional structured close-out for the next agent/reviewer — what you tried (incl. dead-ends), what you relied on, what you created, a concrete watch-out, and an optional next task. Optional — fill what the contribution warrants; a trivial change can skip it. Never pad trivial work; never compress real signal.',
+            'Optional structured close-out: tried paths, sources used, pages/resources created, watch-out, and a suggested next task.',
           properties: {
             approachesTried: {
               type: 'array',
@@ -559,7 +574,7 @@ const TOOLS = [
         reasoning: {
           type: 'string',
           description:
-            'Explain the reasoning behind this contribution so a reader can trust and act on it: what led you here, the evidence, and any caveat. Be as thorough as the contribution warrants — match depth to significance: a meaningful finding or a hard-won dead-end deserves full detail; a trivial change needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+            'Optional evidence and caveats for this contribution so readers can assess it.',
         },
       },
       required: ['projectId', 'type', 'content'],
@@ -627,7 +642,7 @@ const TOOLS = [
   {
     name: 'create_project',
     description:
-      "Create a NEW research project on Moment — a fresh context hub — owned by your creator. Use this to open a project before you seed its context (add_resource / upsert_page) or open work (propose_task). Minimal input: title + description; domain defaults to OTHER (set it for discoverability). Pass a githubUrl to link a repo so you can then import_context to auto-populate the brief. Returns the new projectId. (Requires your creator to have project-creation standing.)",
+      'Create a new research project owned by your creator. Required: title, description. Returns projectId. Use bootstrap_project when you also need initial pages, resources, or handoff.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -692,7 +707,7 @@ const TOOLS = [
             type: 'object',
             properties: {
               uri: { type: 'string' },
-              summary: { type: 'string', description: 'What it is, what\'s in it, how it was/should be used, and any caveats — a substantive note, not a one-liner. Be as thorough as the contribution warrants — match depth to significance: a meaningful finding or a hard-won dead-end deserves full detail; a trivial change needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.' },
+              summary: { type: 'string', description: 'What the resource is, what it contains, how to use it, and any caveats.' },
               kind: { type: 'string', description: 'DATASET|CODE_REPO|PAPER|… (auto-detected if omitted)' },
               role: { type: 'string', description: 'BACKGROUND|INPUT|OUTPUT|TOOL|REFERENCE' },
             },
@@ -718,7 +733,7 @@ const TOOLS = [
   {
     name: 'get_project_context',
     description:
-      "Use this once you know WHICH project you're working on — it reads that one project in full: the handoff (works-now / next step / watch-out), must-read pages, the resource manifest, recent session notes, and the read-order protocol. (Not explore, which surveys many projects; not search_context, which finds context across the graph by meaning.) Returns the composed spin-up brief as text, with the structured object below it.",
+      'Read one known project. Required: projectId. Returns the full prompt-ready brief by default; view=spinup is a lean engagement peek and view=brief is a manifest-level brief. Use explore before you know the project, or search_context to find specific nodes by meaning.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -728,8 +743,8 @@ const TOOLS = [
         },
         view: {
           type: 'string',
-          enum: ['spinup'],
-          description: "Optional. view:'spinup' = a lean payload to decide whether to engage; omit for the full brief.",
+          enum: ['spinup', 'brief'],
+          description: "Optional: 'spinup' for a lean engagement peek, 'brief' for handoff plus manifests, omit for the full prompt-ready brief.",
         },
       },
       required: ['projectId'],
@@ -752,7 +767,7 @@ const TOOLS = [
   {
     name: 'log_session',
     description:
-      'Close out a work session on a project: log a session note (the durable record of what happened) and optionally refresh the project handoff. Run this as the LAST step after submitting work — it is the only context the next human or agent will have, and they have none of yours. Be as thorough as the contribution warrants — match depth to significance: a meaningful finding or a hard-won dead-end deserves full detail; a trivial change needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+      'Close out a project work session. Required: projectId, note. Optionally pass taskId, nextStep, and handoff patch. Returns the session note and updated handoff state.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -763,7 +778,7 @@ const TOOLS = [
         note: {
           type: 'string',
           description:
-            'The durable record for the next agent, who has NONE of your context. Capture what you did and why, what you TRIED that failed and why (so nobody repeats it), the dead-ends and surprises, the watch-outs (specific — name the file/test/command and how to reproduce), and the links/ids that matter. Be as thorough as the contribution warrants — match depth to significance: a meaningful finding or a hard-won dead-end deserves full detail; a trivial change needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+            'Durable close-out note: what changed, why, tried paths, watch-outs, and links/ids needed to continue.',
         },
         nextStep: {
           type: 'string',
@@ -776,16 +791,16 @@ const TOOLS = [
         handoff: {
           type: 'object',
           description:
-            'Optional: refresh the forward-looking handoff — the spin-up state the next agent starts from. Only the fields you pass are updated; the rest are left unchanged. Be as thorough as the contribution warrants — match depth to significance: a meaningful finding or a hard-won dead-end deserves full detail; a trivial change needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+            'Optional forward-looking handoff patch. Only provided fields are updated; omitted fields stay unchanged.',
           properties: {
             worksNow: { type: 'string', description: 'What works / is done now — concretely enough that the next agent can rely on it (what to run, what it proves).' },
             inProgress: { type: 'string', description: "What's actively in flight — where you left it, and the next move so someone can pick it up mid-stride." },
             blocked: { type: 'string', description: 'Broken / blocked / waiting-on — name the blocker, what you tried, and what would unblock it.' },
             nextStep: { type: 'string', description: 'Single most useful next action — specific enough to act on without re-deriving your context.' },
             watchOut: { type: 'string', description: 'Traps, flaky tests, stale context, footguns — be specific: name the file/test/command and the repro so the next agent dodges it.' },
-            triedAndFailed: { type: 'string', description: 'What was attempted that did NOT work, and why — so the next agent does not repeat the dead-ends. Optional — fill what the work warrants; a trivial change can skip it. Never pad trivial work; never compress real signal.' },
-            decisions: { type: 'string', description: 'Key choices you made and the alternatives you rejected, with the reasoning — so the next agent understands why things are the way they are. Optional — fill what the work warrants; a trivial change can skip it. Never pad trivial work; never compress real signal.' },
-            openQuestions: { type: 'string', description: 'Unresolved questions and things still to verify — what you were unsure of or could not confirm. Optional — fill what the work warrants; a trivial change can skip it. Never pad trivial work; never compress real signal.' },
+            triedAndFailed: { type: 'string', description: 'Attempted paths that did not work, and why.' },
+            decisions: { type: 'string', description: 'Key choices made, rejected alternatives, and reasoning.' },
+            openQuestions: { type: 'string', description: 'Unresolved questions or checks still needed.' },
             readFirst: {
               type: 'array',
               description: 'Where to start: a list of { label, ref?, why? }',
@@ -808,7 +823,7 @@ const TOOLS = [
   {
     name: 'upsert_page',
     description:
-      'Add or update a freeform markdown page on a project brief — the "add a page" capability, like dropping a new doc into the project\'s context (architecture notes, a runbook, findings). Pass a stable slug to keep updating the same page. Markdown bodies support embedded images (![](url)) and YouTube links (which render as players). Use upload_image first to host a generated plot, then embed its URL. Be as thorough as the contribution warrants — match depth to significance: a meaningful finding or a hard-won dead-end deserves full detail; a trivial change needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+      'Add or update one markdown page in a project brief. Required: projectId, title, body. Use a stable slug for updates; use upload_image first for embeddable images. Returns the created/updated page.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -817,7 +832,7 @@ const TOOLS = [
         body: {
           type: 'string',
           description:
-            'Markdown body (supports images and YouTube embeds). Give it real structure — headings, the why behind decisions, what was tried and rejected, watch-outs, and links/ids — so a reader with none of your context can act on it. Be as thorough as the contribution warrants — match depth to significance: an important page (architecture, conventions, a hard-won finding) deserves full detail; a small note needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+            'Markdown body. Supports embedded images and YouTube links; include headings, decisions, watch-outs, and relevant links/ids.',
         },
         slug: {
           type: 'string',
@@ -857,7 +872,7 @@ const TOOLS = [
   {
     name: 'add_resource',
     description:
-      'Attach a resolvable resource (dataset, code repo, paper, PDF, doc, dashboard) to a project by URL. The resolver auto-detects the kind + title (github / arxiv / huggingface / DOI / drive / a PDF URL / generic http). Later, read_resource pulls its content into context on demand — including extracting a PDF\'s text layer. Give the next agent enough to know what this is and how to actually use it. Be as thorough as the contribution warrants — match depth to significance: a central dataset or tool deserves a real description and access note; a passing reference needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+      'Attach one resolvable artifact URL to a project. Required: projectId, uri. Auto-detects kind/title when omitted; read_resource pulls content later. Use upsert_page for synthesized notes.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -869,7 +884,7 @@ const TOOLS = [
           enum: ['DATASET', 'CODE_REPO', 'PAPER', 'PROTOCOL', 'MODEL', 'COMPUTE_ENV', 'NOTEBOOK', 'DOCUMENT', 'ENDPOINT', 'DASHBOARD', 'OTHER'],
           description: 'Optional kind (auto-detected if omitted). Use DASHBOARD for monitoring/analytics dashboards; DOCUMENT for Overleaf projects, Google Docs, and collaborative writing tools; CODE_REPO for repos to clone and work in.',
         },
-        summary: { type: 'string', description: 'What it is, what\'s in it, how you used it (or how the next agent should), and any caveats — a substantive note, not a one-liner. Be as thorough as the contribution warrants — match depth to significance: a central artifact deserves full detail; a passing reference needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.' },
+        summary: { type: 'string', description: 'What the artifact is, what it contains, how to use it, and any caveats.' },
         accessNote: { type: 'string', description: 'How to actually fetch/use it — auth/creds needed, the relevant path/section to look at, and gotchas (rate limits, large files, required env, login walls).' },
         role: { type: 'string', enum: ['BACKGROUND', 'INPUT', 'OUTPUT', 'TOOL', 'REFERENCE'], description: 'Optional role' },
         isWorkSurface: {
@@ -883,7 +898,7 @@ const TOOLS = [
   {
     name: 'ingest',
     description:
-      "Drop a RAW stream of text — a meeting transcript, a Slack/chat thread, an email, a PR narrative, a paper's extracted text, a pasted note — and let the lab auto-extract typed CANDIDATES for review. One LLM pass turns it into a summary page, signals (questions / findings / suggestions), any URLs mentioned, and a session note. NOTHING is published: the page + resources land as PENDING proposals and the signals as DRAFT, all awaiting a human's review. Idempotent on (projectId, source, externalId) — re-sending the same item is a safe no-op. Use this for UNSTRUCTURED multi-fact input; use add_resource / upsert_page instead when you already have ONE typed item to add directly. To pull in a PDF by URL, prefer add_resource(uri) + read_resource (the resolver extracts the text); for a local PDF file, the CLI `moment ingest paper.pdf` extracts it and sends it here.",
+      "Ingest raw multi-fact text such as a transcript, thread, PR narrative, paper text, or pasted note. Required: projectId, text. Returns reviewable page/resource/signal candidates; nothing is published directly. Use add_resource or upsert_page when you already have one typed item.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1083,7 +1098,7 @@ const TOOLS = [
         supportingEvidence: {
           type: 'string',
           description:
-            'The evidence behind the insight so a reader can weigh and verify it: data, results, citations, repro steps, or the observations it rests on — with the links/ids/file paths that back it up. Be as thorough as the contribution warrants — match depth to significance: a load-bearing finding or hypothesis deserves full evidence; a passing observation needs only what\'s useful. Never compress real signal to save tokens; never pad trivial work.',
+            'Evidence for the insight: data, citations, repro steps, observations, and relevant links/ids/files.',
         },
       },
       required: ['projectId', 'type', 'content'],
@@ -1282,9 +1297,11 @@ const TOOLS = [
   },
 ];
 
+const LISTED_TOOLS = TOOLS.filter((tool) => !HIDDEN_DEPRECATED_TOOL_NAMES.has(tool.name));
+
 // Handle list tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: TOOLS };
+  return { tools: LISTED_TOOLS };
 });
 
 // Handle tool calls
@@ -1677,7 +1694,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // ============================================
       case 'get_project_context': {
         const { projectId, view } = args as { projectId: number; view?: string };
-        const ctxQuery = view === 'spinup' ? '?view=spinup' : '';
+        const ctxQuery = view === 'spinup' || view === 'brief' ? `?view=${view}` : '';
         const context = await apiClient.get(
           `/api/v1/agents/projects/${projectId}/context${ctxQuery}`
         ) as Record<string, unknown> & { promptContext?: string };
@@ -1862,8 +1879,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           results?: ContextHit[];
         };
         // Render hits as a short labeled list; keep the raw JSON below for fields.
+        const text = proseFirst(renderContextHits(result.results || []), result);
         return {
-          content: [{ type: 'text', text: proseFirst(renderContextHits(result.results || []), result) }],
+          content: [{ type: 'text', text: withDeprecationNote(name, text) }],
         };
       }
 
@@ -1878,8 +1896,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           { task, page, depth, tokenBudget, maxNodes }
         ) as { mode?: string; nodes?: GatherNode[]; tokenEstimate?: number; edgesWalked?: number };
         // Render the bundle as a ranked, readable list; raw JSON below.
+        const text = proseFirst(renderGatherBundle(result), result);
         return {
-          content: [{ type: 'text', text: proseFirst(renderGatherBundle(result), result) }],
+          content: [{ type: 'text', text: withDeprecationNote(name, text) }],
         };
       }
 
@@ -1926,8 +1945,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { projectId, source } = args as { projectId: number; source?: string };
         const result = await apiClient.post(`/api/v1/agents/projects/${projectId}/extract`, { source });
         const confirm = `Imported context into project ${projectId}${source ? ` from ${source}` : ' from its linked repo'}.`;
+        const text = proseFirst(confirm, result);
         return {
-          content: [{ type: 'text', text: proseFirst(confirm, result) }],
+          content: [{ type: 'text', text: withDeprecationNote(name, text) }],
         };
       }
 

@@ -10,6 +10,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
+    "docs:tools": "node scripts/gen-tool-docs.mjs --write README.md",
     "start": "node dist/index.js"
   },
   "dependencies": {

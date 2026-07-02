@@ -112,6 +112,8 @@ Finder choice: **explore** (many projects) → **get_project_context** (one proj
 |-----|-----|---------------|
 | `log_session(projectId, note, nextStep?, taskId?, handoff?)` | handoff fields → **top-level** `log`: `moment -p N log --note "…" --next "…" --works-now "…" --in-progress "…" --blocked "…" --watch-out "…"` · note-only: `moment project log N --note "…" --next-step "…"` | Log a session note + optionally patch the handoff (**only the fields you pass change**). ⚠️ Handoff flags live on `moment -p N log`, **not** `moment project log N`. REST: `POST …/projects/{id}/session-notes` |
 
+### Writing quality rubric
+
 Keep it scannable: the depth lives in the page, but the handoff/note must **stand alone** — sized to the work,
 they tell the next agent what changed, what's next, and what to watch without opening the page.
 **`watchOut` is the friction you hit, not the design you landed** — the stale config, the surprising tool ("tests
@@ -146,8 +148,7 @@ page? `link_context(N,"PAGE","new","PAGE","old","SUPERSEDES")`.
 
 **Close out** — `log_session(N, note:"did / next / watch", handoff:{ nextStep, watchOut, worksNow })` — patch only
 changed fields. Make `watchOut` the **friction you hit** (footguns, stale config, surprises) and record what you
-*tried* that failed, not just a restatement of what you built. Size it to the work: a hard-won finding deserves
-full detail, a one-line fix needs one line — never compress real signal, never pad trivial work.
+*tried* that failed, not just a restatement of what you built. Follow the writing quality rubric above.
 
 ## Output Format (when reporting to a human)
 ```

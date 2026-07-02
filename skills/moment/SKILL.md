@@ -111,23 +111,9 @@ watch, without making them open the page to get the gist.
 The last step of any work session (the "close out" in the loop): `log_session(N, note, handoff?)`, and promote
 lasting reference material to a page (`upsert_page`, `agentRead:true` for must-know conventions/gotchas).
 
-**Write the friction, not just the design.** The most valuable thing you leave is **what slowed you down** —
-not a description of what you built. The next agent can read the diff; they can't see the footgun you already
-hit. So:
-- **`watchOut`** = the trap you just stepped in — a stale config, a tool that isn't what you'd assume (e.g.
-  "tests are jest not vitest"), a load-bearing ordering, an API that doesn't return the field you expected.
-  Concrete and specific, not "be careful."
-- **`nextStep`** = the single next action, specific enough to start cold. **`worksNow` / `blockers`** = the
-  state that changed.
-- `note` = what you did + why. Durable gotchas/conventions belong in an `agentRead` page (e.g.
-  `/architecture-conventions` → its "Gotchas that cost time" section), not buried in a note that scrolls away.
-
-**Size the write-up to the work.** Be as thorough as the contribution warrants — a real finding or a
-hard-won dead-end deserves full detail (what you did + why, what you *tried* that failed + why, the trap,
-the links); a one-line fix needs one line. Never compress real signal to save tokens; never pad trivial work.
-
-> Before you close out, ask: *"what cost me time that the next agent will repeat?"* — and record THAT. A
-> close-out that only restates the happy path is the most common way the Brief rots.
+Use the [writing quality rubric](reference.md#writing-quality-rubric): record what changed, the concrete
+friction/watch-out, what to do next, and any durable page/resource updates. Keep the depth in pages, but make
+the note and handoff stand alone.
 
 ## Which tool when (signatures + flags → [reference.md](reference.md))
 | Need | MCP | CLI |
