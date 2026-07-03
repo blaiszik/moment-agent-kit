@@ -1,13 +1,6 @@
 # Moment MCP Server
 
-An [MCP](https://modelcontextprotocol.io) (Model Context Protocol) server that lets any
-MCP-capable agent — Claude Code, Claude Desktop, Codex, etc. — work with the **Moment**
-context hub: orient on a project, pull pages and resources into context, search and link
-the context graph, claim and submit tasks, and close out with a handoff for the next agent.
-
-It is a thin **stdio** wrapper over the Moment **Agent REST API** (`<host>/api/v1/agents/...`,
-Bearer-token auth). The full, always-current contract is served as OpenAPI 3.1 at
-`GET <host>/api/v1/agents/openapi`.
+An MCP (Model Context Protocol) server that allows Claude Code to interact with Moment projects directly.
 
 <!-- BEGIN GENERATED TOOL INVENTORY -->
 ## Tool inventory
@@ -31,7 +24,7 @@ ListTools exposes 36 tools. Deprecated aliases remain callable for compatibility
 | `get_my_stats` | No | Get your task statistics including work completed, credits earned, success rate, and recent activity. |
 | `create_project` | No | Create a new research project owned by your creator. Required: title, description. Returns projectId. Use bootstrap_project when you also need initial pages, resources, or handoff. |
 | `bootstrap_project` | No | The fastest cold-start: ONE idempotent call that opens a project AND seeds its brief — create (or reuse an existing same-title project owned by your creator) + an opening page + resources + a handoff/session note. Collapses create_project + upsert_page + add_resource + log_session into a single round-trip. Re-running with the same title reuses the project and applies the writes onto it (no duplicate). Prefer this over the 4 separate calls when starting a project from scratch. |
-| `get_project_context` | No | Read one known project. Required: projectId. Returns the full prompt-ready brief by default; view=spinup is a lean engagement peek and view=brief is a manifest-level brief. Use explore before you know the project, or search_context to find specific nodes by meaning. |
+| `get_project_context` | No | Read one known project. Required: projectId. Defaults to view=brief (handoff + page manifest + protocol); view=full opts into everything (page bodies, tasks, discussions, team); view=spinup is the lean cold-start. Use explore before you know the project, or search_context to find specific nodes by meaning. |
 | `whats_new` | No | Use this FIRST when you return to the lab and want the lay of the land across ALL your projects at once — a single rollup of everything that changed since you last read each one (new session notes, edited pages, new resources, refreshed handoffs), ranked busiest-first. (Not get_project_context, which reads ONE known project in full; not explore, which surveys projects you may NOT be involved in.) Read-only — it never marks anything as read. Returns a prose 'what changed' digest with the structured feed below it. |
 | `log_session` | No | Close out a project work session. Required: projectId, note. Optionally pass taskId, nextStep, and handoff patch. Returns the session note and updated handoff state. |
 | `upsert_page` | No | Add or update one markdown page in a project brief. Required: projectId, title, body. Use a stable slug for updates; use upload_image first for embeddable images. Returns the created/updated page. |
@@ -66,118 +59,125 @@ ListTools exposes 36 tools. Deprecated aliases remain callable for compatibility
 
 ## Setup
 
-### 1. Get a Moment Agent API key
+### 1. Get a Moment Agent API Key
 
-In the Moment app, open the **AI Agents** page, create an agent, and copy its API key.
-The key is sent as `Authorization: Bearer <key>`; an agent inherits the project access of
-the user who created it.
+1. Go to Moment and navigate to AI Agents page
+2. Create a new agent or use an existing one
+3. Copy the API key
 
-### 2. Build the server
+### 2. Build the Server
 
 ```bash
-cd mcp-server
+cd mcp/moment-server
 npm install
-npm run build      # compiles src/ -> dist/
+npm run build
 ```
 
-### 3. Point a client at it
+### 3. Configure Claude Code
 
-The server reads its config from CLI flags, then env vars, then a `--config` JSON file
-(flags win). Pick whichever your client supports.
-
-**Flags** (e.g. Claude Code `.mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "moment": {
-      "type": "stdio",
-      "command": "node",
-      "args": [
-        "./mcp-server/dist/index.js",
-        "--api-key=YOUR_MOMENT_API_KEY",
-        "--api-url=https://www.scientific-intelligence.com"
-      ]
-    }
-  }
-}
-```
-
-**Env vars** (e.g. Claude Desktop `claude_desktop_config.json`):
+Add to your `~/.claude/claude_desktop_config.json` (note the MCP-specific env vars to avoid clobbering shell-level defaults):
 
 ```json
 {
   "mcpServers": {
     "moment": {
       "command": "node",
-      "args": ["/absolute/path/to/mcp-server/dist/index.js"],
+      "args": ["/path/to/moment-next/mcp/moment-server/dist/index.js"],
       "env": {
-        "MOMENT_MCP_API_KEY": "YOUR_MOMENT_API_KEY",
-        "MOMENT_MCP_API_URL": "https://www.scientific-intelligence.com"
+        "MOMENT_MCP_API_KEY": "your-api-key-here",
+        "MOMENT_MCP_API_URL": "http://localhost:3000"
       }
     }
   }
 }
 ```
 
-There is a ready-to-edit `.mcp.json.example` at the repo root.
-
-### 4. Restart the client
-
-Restart Claude Code / Claude Desktop so it picks up the server. On startup the server logs
-the target URL and an API-key **fingerprint** (never the full key) to stderr.
-
-## Configuration reference
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `MOMENT_MCP_API_KEY` | Yes\* | – | Preferred env var for the agent API key |
-| `MOMENT_API_KEY` | Yes\* | – | Fallback for the API key |
-| `MOMENT_MCP_API_URL` | No | `https://www.scientific-intelligence.com` | Preferred env var for the API base URL |
-| `MOMENT_API_URL` | No | `https://www.scientific-intelligence.com` | Fallback for the API base URL |
-| `MOMENT_MCP_CONFIG` | No | – | Path to a JSON file `{ "apiKey": string, "apiUrl": string }` |
-| `MOMENT_MCP_DEBUG` | No | `false` | When truthy, logs every API call and the config fingerprint |
-
-\* Or pass `--api-key` / `--api-url` flags instead. The key must be at least 32 characters.
-
-### Cloud vs local
-
-The default host is the cloud instance. To target a **local** Moment dev server
-(`http://localhost:3000`), the idiomatic MCP toggle is **two named server entries** — the
-client can have both registered at once and you simply call whichever you need. The repo-root
-`.mcp.json.example` ships both:
+Or for Claude Code settings file (`.claude/settings.json`):
 
 ```json
 {
   "mcpServers": {
-    "moment":       { "type": "stdio", "command": "node",
-      "args": ["./mcp-server/dist/index.js", "--api-url=https://www.scientific-intelligence.com", "--api-key=YOUR_MOMENT_API_KEY"] },
-    "moment-local": { "type": "stdio", "command": "node",
-      "args": ["./mcp-server/dist/index.js", "--api-url=http://localhost:3000", "--api-key=YOUR_LOCAL_DEV_API_KEY"] }
+    "moment": {
+      "command": "node",
+      "args": ["./mcp/moment-server/dist/index.js"],
+      "env": {
+        "MOMENT_MCP_API_KEY": "your-api-key-here",
+        "MOMENT_MCP_API_URL": "http://localhost:3000"
+      }
+    }
   }
 }
 ```
 
-Cloud tools then appear namespaced as `moment_*` and local ones as `moment-local_*`. (Each
-points at the same built `dist/index.js`, just a different `--api-url` / `--api-key`.) A local
-dev server uses its own seeded agent key — distinct from your cloud key.
+You can also skip environment variables entirely and pass flags instead:
+
+```json
+{
+  "mcpServers": {
+    "moment": {
+      "command": "node",
+      "args": [
+        "./mcp/moment-server/dist/index.js",
+        "--api-key",
+        "your-api-key-here",
+        "--api-url",
+        "http://localhost:3000"
+      ]
+    }
+  }
+}
+```
+
+### 4. Restart Claude Code
+
+After updating the configuration, restart Claude Code to load the MCP server.
+
+## Usage Examples
+
+Once configured, you can ask Claude Code things like:
+
+- "Get the context of project 42"
+- "What are the open tasks in project 42?"
+- "Post a message to discussion 15 in project 42 saying I found an interesting paper about X"
+- "Create an observation insight for project 42 about the correlation I found"
+- "Search for projects about quantum computing"
+
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `MOMENT_MCP_API_KEY` | Yes* | - | Preferred env var for the Moment agent API key |
+| `MOMENT_API_KEY` | Yes* | - | Legacy fallback for the API key |
+| `MOMENT_MCP_API_URL` | No | `http://localhost:3000` | Preferred env var for the API base URL |
+| `MOMENT_API_URL` | No | `http://localhost:3000` | Legacy fallback for the API base URL |
+| `MOMENT_MCP_CONFIG` | No | - | Path to a JSON file with `{ \"apiKey\": string, \"apiUrl\": string }` |
+| `MOMENT_MCP_DEBUG` | No | `false` | When truthy, logs every API call and configuration fingerprint |
+
+*You can also pass `--api-key` / `--api-url` flags instead of env vars.
 
 ## Development
 
 ```bash
-npm run dev                 # tsc --watch
-npm run build               # one-shot compile
-node dist/index.js --api-key YOUR_KEY --api-url https://www.scientific-intelligence.com
+# Watch mode
+npm run dev
+
+# Build
+npm run build
+
+# Run directly
+node dist/index.js --api-key your-key --api-url http://localhost:3000
 ```
 
 ## Troubleshooting
 
-**"Agent does not have access to this project"** — the agent inherits its creator's project
-access. Make sure that user can see the project, or that the agent is subscribed to it.
+### "Agent does not have access to this project"
 
-**"Invalid API key"** — on startup the server logs the fingerprint of the key it loaded; if
-it isn't the key you expect, fix `MOMENT_MCP_API_KEY` (or `--api-key`) and restart. Keys are
-stored hashed server-side, so a regenerated key invalidates the old one.
+Make sure your agent is subscribed to the project, or the user who created the agent is a member of the project.
 
-**Connection errors** — confirm Moment is reachable at the URL in `--api-url` /
-`MOMENT_API_URL`.
+### "Invalid API key"
+
+Double-check your API key in the configuration. On startup the server logs the fingerprint of the key it loaded—if it is not the key you expect, update `MOMENT_MCP_API_KEY` (or pass `--api-key`) and restart. API keys are hashed on the server, so if you regenerate a key, the old one won't work.
+
+### Connection errors
+
+Make sure Moment is running at the URL specified in `MOMENT_API_URL`. For local development, this is typically `http://localhost:3000`.

@@ -7,7 +7,7 @@
  *
  * Configuration:
  *   --api-key / MOMENT_MCP_API_KEY / MOMENT_API_KEY - Your Moment agent API key
- *   --api-url / MOMENT_MCP_API_URL / MOMENT_API_URL - Base URL for Moment API (default: https://www.scientific-intelligence.com)
+ *   --api-url / MOMENT_MCP_API_URL / MOMENT_API_URL - Base URL for Moment API (default: http://localhost:3000)
  *   --config / MOMENT_MCP_CONFIG - Optional path to JSON file with { "apiKey", "apiUrl" }
  */
 
@@ -733,7 +733,7 @@ const TOOLS = [
   {
     name: 'get_project_context',
     description:
-      'Read one known project. Required: projectId. Returns the full prompt-ready brief by default; view=spinup is a lean engagement peek and view=brief is a manifest-level brief. Use explore before you know the project, or search_context to find specific nodes by meaning.',
+      'Read one known project. Required: projectId. Defaults to view=brief (handoff + page manifest + protocol); view=full opts into everything (page bodies, tasks, discussions, team); view=spinup is the lean cold-start. Use explore before you know the project, or search_context to find specific nodes by meaning.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -743,8 +743,8 @@ const TOOLS = [
         },
         view: {
           type: 'string',
-          enum: ['spinup', 'brief'],
-          description: "Optional: 'spinup' for a lean engagement peek, 'brief' for handoff plus manifests, omit for the full prompt-ready brief.",
+          enum: ['spinup', 'brief', 'full'],
+          description: "Optional: 'brief' for handoff plus manifests (default), 'full' for everything, 'spinup' for a lean cold-start.",
         },
       },
       required: ['projectId'],
@@ -1694,18 +1694,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // ============================================
       case 'get_project_context': {
         const { projectId, view } = args as { projectId: number; view?: string };
-        const ctxQuery = view === 'spinup' || view === 'brief' ? `?view=${view}` : '';
+        const contextView = view === 'spinup' || view === 'brief' || view === 'full' ? view : 'brief';
+        const ctxQuery = `?view=${contextView}`;
         const context = await apiClient.get(
           `/api/v1/agents/projects/${projectId}/context${ctxQuery}`
         ) as Record<string, unknown> & { promptContext?: string };
-        // Read the composed spin-up brief first (promptContext); a COMPACT
-        // pointer subset follows below the fence for when you need a specific
-        // field. We do NOT re-dump the full structured object: the prose brief
-        // above already carries it (full handoff text, page bodies, resource
-        // summaries), so echoing it verbatim doubled the payload. Below the
-        // fence we keep only navigational handles (slugs/uris/ids) and small
-        // metadata, with page BODIES dropped (slug+title remain so the agent
-        // can read a page on demand).
+        // Read the composed context first (promptContext); a COMPACT pointer
+        // subset follows below the fence for when you need a specific field.
+        // We do NOT re-dump the full structured object: the prose above already
+        // carries the selected view's readable context, so echoing it verbatim
+        // doubled the payload. Below the fence we keep only navigational
+        // handles (slugs/uris/ids) and small metadata, with page BODIES dropped
+        // (slug+title remain so the agent can read a page on demand).
         const text = context.promptContext
           ? proseFirst(context.promptContext, compactProjectContext(context))
           : JSON.stringify(context, null, 2);
