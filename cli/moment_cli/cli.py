@@ -15,7 +15,8 @@ from typing import Optional
 import typer
 from rich.panel import Panel
 
-from moment_cli import __version__, hooks as hooks_mod
+from moment_cli import __version__, close_out, hooks as hooks_mod
+from moment_cli import doctor as doctor_mod
 from moment_cli.api import ApiError, MomentApiClient
 from moment_cli.config import resolve_config
 from moment_cli.display import (
@@ -55,7 +56,10 @@ from moment_cli.display import (
 
 app = typer.Typer(
     name="moment",
-    help="Moment research agent CLI — work discovery, claiming, submission, and project contributions.",
+    help=(
+        "Moment research agent CLI — work discovery, claiming, submission, and project contributions. "
+        "Bound-project shortcuts: `moment page` (add/update a page), `moment doctor` (diagnose the binding)."
+    ),
     no_args_is_help=True,
     rich_markup_mode="rich",
     pretty_exceptions_enable=False,
@@ -91,11 +95,6 @@ def _version_callback(value: bool) -> None:
 def main(
     api_key: Optional[str] = typer.Option(None, "--api-key", help="Override API key."),
     api_url: Optional[str] = typer.Option(None, "--api-url", help="Override API base URL."),
-    local: bool = typer.Option(
-        False,
-        "--local",
-        help="Target a local Moment dev server (http://localhost:3000). Shorthand for --api-url; an explicit --api-url wins.",
-    ),
     config: Optional[str] = typer.Option(None, "--config", help="Path to JSON config file."),
     project: Optional[int] = typer.Option(None, "--project", "-p", help="Project ID (overrides MOMENT_PROJECT_ID and .moment.json)."),
     json_mode: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
@@ -103,9 +102,6 @@ def main(
     version: Optional[bool] = typer.Option(None, "--version", callback=_version_callback, is_eager=True, help="Show version."),
 ) -> None:
     """Moment research agent CLI."""
-    # --local is sugar for the well-known dev URL; an explicit --api-url always wins.
-    if local and not api_url:
-        api_url = "http://localhost:3000"
     _state["api_key"] = api_key
     _state["api_url"] = api_url
     _state["config"] = config
@@ -175,7 +171,7 @@ def _default_api_url(api_url: Optional[str] = None) -> str:
         or _state.get("api_url")
         or os.environ.get("MOMENT_API_URL")
         or os.environ.get("MOMENT_MCP_API_URL")
-        or "https://www.scientific-intelligence.com"
+        or "http://localhost:3000"
     ).rstrip("/")
 
 
@@ -489,6 +485,24 @@ def project_page(
     agent_read: bool = typer.Option(False, "--agent-read", help="Pull the full page into every agent's context."),
 ) -> None:
     """Add or update a freeform markdown page."""
+    _upsert_page(
+        project_id, title=title, body=body, body_file=body_file,
+        slug=slug, icon=icon, pinned=pinned, agent_read=agent_read,
+    )
+
+
+def _upsert_page(
+    project_id: int,
+    *,
+    title: str,
+    body: Optional[str],
+    body_file: Optional[str],
+    slug: Optional[str],
+    icon: Optional[str],
+    pinned: bool,
+    agent_read: bool,
+) -> None:
+    """Shared page-upsert body for `project page` (explicit id) and `page` (bound id)."""
     if bool(body) == bool(body_file):
         raise typer.BadParameter("Provide exactly one of --body or --body-file.")
     body_text = sys.stdin.read() if body == "-" else (body if body is not None else _read_file(body_file))  # type: ignore[arg-type]
@@ -614,6 +628,29 @@ def backlinks(
         _handle_error(exc)
 
 
+@app.command("page")
+def page(
+    title: str = typer.Option(..., "--title"),
+    body: Optional[str] = typer.Option(None, "--body", help="Inline markdown body (pass '-' to read stdin). Alternative to --body-file."),
+    body_file: Optional[str] = typer.Option(None, "--body-file", help="Path to a markdown file for the page body."),
+    slug: Optional[str] = typer.Option(None, "--slug", help="Stable slug to update an existing page."),
+    icon: Optional[str] = typer.Option(None, "--icon"),
+    pinned: bool = typer.Option(False, "--pinned"),
+    agent_read: bool = typer.Option(False, "--agent-read", help="Pull the full page into every agent's context."),
+) -> None:
+    """Add or update a page on the bound project (--project / .moment.json). Same as `project page` without the id."""
+    try:
+        _get_client()  # populate _state['_config'] so the binding resolves
+        pid = _resolve_project_id()
+    except Exception as exc:
+        _handle_error(exc)
+        return
+    _upsert_page(
+        pid, title=title, body=body, body_file=body_file,
+        slug=slug, icon=icon, pinned=pinned, agent_read=agent_read,
+    )
+
+
 @app.command("log")
 def log(
     note: Optional[str] = typer.Option(None, "--note", help="What you did; the next step; what to watch."),
@@ -624,6 +661,8 @@ def log(
     in_progress: Optional[str] = typer.Option(None, "--in-progress", help="Refresh handoff: in progress."),
     blocked: Optional[str] = typer.Option(None, "--blocked", help="Refresh handoff: blocked / broken."),
     watch_out: Optional[str] = typer.Option(None, "--watch-out", help="Refresh handoff: watch out for."),
+    no_tree: bool = typer.Option(False, "--no-tree", help="Do not append the working-tree fingerprint to the note."),
+    commits: Optional[str] = typer.Option(None, "--commits", help="Git range, e.g. abc123..def456 — appends a commit summary to the note."),
     sync: bool = typer.Option(False, "--sync", help="Regenerate .continuity/ after logging."),
 ) -> None:
     """Close out a session: log a note and optionally refresh the handoff."""
@@ -631,6 +670,16 @@ def log(
         if bool(note) == bool(note_file):
             raise typer.BadParameter("Provide exactly one of --note or --note-file.")
         note_text = note if note else _read_file(note_file)  # type: ignore[arg-type]
+        # Append git truth to the NOTE only (never the handoff fields): a mechanical
+        # working-tree fingerprint (unless --no-tree) and, when asked, a commit summary.
+        if not no_tree:
+            fingerprint = close_out.tree_fingerprint()
+            if fingerprint:
+                note_text = f"{note_text}\n\n{fingerprint}"
+        if commits:
+            commit_block = close_out.commits_summary(commits)
+            if commit_block:
+                note_text = f"{note_text}\n\n{commit_block}"
         payload = _build_session_payload(
             note_text, next_step, task,
             works_now=works_now, in_progress=in_progress, blocked=blocked, watch_out=watch_out,
@@ -660,6 +709,43 @@ def sync(
         _run_sync(pid, client, check=check, out=out)
     except Exception as exc:
         _handle_error(exc)
+
+
+@app.command("doctor")
+def doctor() -> None:
+    """Diagnose the binding in one screen — config, key, reachability, auth, project, MCP drift."""
+    from rich.markup import escape
+
+    results = doctor_mod.run_doctor(
+        config_path=_state.get("config"),
+        api_url_override=_state.get("api_url"),
+    )
+    failed = [r for r in results if r.status == "fail"]
+
+    if _state.get("json"):
+        print_json([{"name": r.name, "status": r.status, "detail": r.detail} for r in results])
+        if failed:
+            raise typer.Exit(1)
+        return
+
+    tokens = {"ok": "ok", "fail": "FAIL", "skip": "skip"}
+    colors = {"ok": GLOW, "fail": ROSE, "skip": "grey50"}
+    name_w = max((len(r.name) for r in results), default=0)
+    for r in results:
+        token = tokens.get(r.status, r.status)
+        color = colors.get(r.status, "white")
+        console.print(f"  [{color}]{token:>4}[/]  {escape(r.name.ljust(name_w))}  [dim]{escape(r.detail)}[/]")
+
+    if failed:
+        names = ", ".join(r.name for r in failed)
+        console.print(f"\n  [{ROSE}]{len(failed)} check(s) failed: {escape(names)}.[/]")
+    else:
+        skipped = sum(1 for r in results if r.status == "skip")
+        tail = f" ({skipped} skipped)" if skipped else ""
+        console.print(f"\n  [{GLOW}]Binding healthy — all checks passed{tail}.[/]")
+
+    if failed:
+        raise typer.Exit(1)
 
 
 def _continuity_dir(out: Optional[str]) -> Path:

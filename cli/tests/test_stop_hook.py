@@ -6,7 +6,7 @@ read-merge-write of `~/.claude/settings.json` (Stop + SessionEnd) and the Codex
 All paths are monkeypatched onto a temp dir so nothing touches the real user config.
 
 Run (no pytest needed):
-    python tests/test_stop_hook.py
+    mamba run -n moment python tools/moment-cli/tests/test_stop_hook.py
 Exit code is non-zero on any failure.
 """
 import json

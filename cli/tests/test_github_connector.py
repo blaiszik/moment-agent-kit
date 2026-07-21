@@ -10,7 +10,7 @@ pinned symbol is not yet on disk, the relevant check FAILS with a clear
 useful regression target both before and after the CLI lands.
 
 Run (no pytest needed):
-    python tests/test_github_connector.py
+    mamba run -n moment python tools/moment-cli/tests/test_github_connector.py
 Exit code is non-zero on any failure.
 """
 import difflib
@@ -45,7 +45,7 @@ def _require(name: str):
     return fn
 
 
-REPO = "octocat/moment-demo"
+REPO = "blaiszik/moment-next"
 
 
 # --- gh-shaped fixtures -------------------------------------------------------
@@ -62,7 +62,7 @@ def _merged_pr() -> dict:
             "- [x] keep this checked item\n"
             "Closes #41."
         ),
-        "author": {"login": "octocat"},
+        "author": {"login": "blaiszik"},
         "comments": [
             {"author": {"login": "alice"}, "body": "Nice, ship it."},
             {"author": {"login": "dependabot[bot]"}, "body": "Bump lodash 1.0->1.1"},
@@ -79,7 +79,7 @@ def _merged_pr() -> dict:
         "closedAt": "2026-06-10T12:00:00Z",
         "updatedAt": "2026-06-10T12:05:00Z",
         "state": "MERGED",
-        "url": "https://github.com/octocat/moment-demo/pull/42",
+        "url": "https://github.com/blaiszik/moment-next/pull/42",
         "labels": [{"name": "feature"}, {"name": "connector"}],
         "reviewDecision": "APPROVED",
     }
@@ -90,7 +90,7 @@ def _closed_unmerged_pr() -> dict:
         "number": 7,
         "title": "Abandoned experiment",
         "body": "Never mind.",
-        "author": {"login": "octocat"},
+        "author": {"login": "blaiszik"},
         "comments": [],
         "reviews": [],
         "mergeCommit": None,
@@ -101,7 +101,7 @@ def _closed_unmerged_pr() -> dict:
         "closedAt": "2026-06-09T09:00:00Z",
         "updatedAt": "2026-06-09T09:30:00Z",
         "state": "CLOSED",
-        "url": "https://github.com/octocat/moment-demo/pull/7",
+        "url": "https://github.com/blaiszik/moment-next/pull/7",
         "labels": [],
     }
 
@@ -111,7 +111,7 @@ def _closed_issue() -> dict:
         "number": 13,
         "title": "Sync drops bot noise",
         "body": "Bot comments should not pollute context.\n<!-- internal note -->",
-        "author": {"login": "octocat"},
+        "author": {"login": "blaiszik"},
         "comments": [
             {"author": {"login": "dave"}, "body": "Agreed, filter them."},
             {"author": {"login": "renovate"}, "body": "I am a bot"},
@@ -119,7 +119,7 @@ def _closed_issue() -> dict:
         "closedAt": "2026-06-08T15:00:00Z",
         "updatedAt": "2026-06-08T15:10:00Z",
         "state": "CLOSED",
-        "url": "https://github.com/octocat/moment-demo/issues/13",
+        "url": "https://github.com/blaiszik/moment-next/issues/13",
         "labels": [{"name": "bug"}],
     }
 
@@ -135,7 +135,7 @@ def test_is_bot_author() -> None:
     check("github-actions[bot] is a bot", fn("github-actions[bot]") is True)
     check("renovate (bare) is a bot", fn("renovate") is True)
     check("anything ending [bot] is a bot", fn("some-random-app[bot]") is True)
-    check("human login is NOT a bot", fn("octocat") is False)
+    check("human login is NOT a bot", fn("blaiszik") is False)
     check("human login 'alice' is NOT a bot", fn("alice") is False)
 
 
@@ -176,12 +176,12 @@ def test_build_pr_envelope() -> None:
     env = fn(REPO, _merged_pr())
     check("source == github_pr", env.get("source") == "github_pr")
     check("externalId is the merged sha key", env.get("externalId") == f"{REPO}#42@abc1234def5678")
-    check("uri is the PR html url", env.get("uri") == "https://github.com/octocat/moment-demo/pull/42")
+    check("uri is the PR html url", env.get("uri") == "https://github.com/blaiszik/moment-next/pull/42")
     check("title preserved", env.get("title") == "Add the GitHub connector")
     check("occurredAt == mergedAt", env.get("occurredAt") == "2026-06-10T12:00:00Z")
 
     participants = env.get("participants") or []
-    check("participants: author present", "octocat" in participants)
+    check("participants: author present", "blaiszik" in participants)
     check("participants: human commenter present", "alice" in participants)
     check("participants: human reviewer present", "carol" in participants)
     check("participants: dependabot stripped", "dependabot[bot]" not in participants)
@@ -199,7 +199,7 @@ def test_build_pr_envelope() -> None:
     check("meta.number", meta.get("number") == 42)
     check("meta.merged is True", meta.get("merged") is True)
     check("meta.mergeCommitSha", meta.get("mergeCommitSha") == "abc1234def5678")
-    check("meta.author", meta.get("author") == "octocat")
+    check("meta.author", meta.get("author") == "blaiszik")
     check("meta.labels are name strings", meta.get("labels") == ["feature", "connector"])
 
 
@@ -209,7 +209,7 @@ def test_normalize_pr_narrative() -> None:
     if fn is None:
         return
     blob = fn(REPO, _merged_pr())
-    check("contains Link: line", "Link: https://github.com/octocat/moment-demo/pull/42" in blob)
+    check("contains Link: line", "Link: https://github.com/blaiszik/moment-next/pull/42" in blob)
     check("contains ## Description", "## Description" in blob)
     check("contains the human review body", "LGTM, merging." in blob)
     check("contains the human comment body", "Nice, ship it." in blob)
@@ -228,7 +228,7 @@ def test_build_issue_envelope() -> None:
     env = fn(REPO, _closed_issue())
     check("source == github_issue", env.get("source") == "github_issue")
     check("externalId uses updatedAt", env.get("externalId") == f"{REPO}#13@2026-06-08T15:10:00Z")
-    check("uri is the issue html url", env.get("uri") == "https://github.com/octocat/moment-demo/issues/13")
+    check("uri is the issue html url", env.get("uri") == "https://github.com/blaiszik/moment-next/issues/13")
     check("title preserved", env.get("title") == "Sync drops bot noise")
 
     meta = env.get("meta") or {}
@@ -236,13 +236,13 @@ def test_build_issue_envelope() -> None:
     check("meta has all issue spec keys", expected_issue_meta.issubset(set(meta.keys())))
     check("meta.repo", meta.get("repo") == REPO)
     check("meta.number", meta.get("number") == 13)
-    check("meta.author", meta.get("author") == "octocat")
+    check("meta.author", meta.get("author") == "blaiszik")
     check("meta.labels are name strings", meta.get("labels") == ["bug"])
 
     blob_fn = _sym("_normalize_issue_narrative")
     if blob_fn is not None:
         blob = blob_fn(REPO, _closed_issue())
-        check("issue blob has Link: line", "Link: https://github.com/octocat/moment-demo/issues/13" in blob)
+        check("issue blob has Link: line", "Link: https://github.com/blaiszik/moment-next/issues/13" in blob)
         check("issue blob keeps human comment", "Agreed, filter them." in blob)
         check("issue blob strips bot comment", "I am a bot" not in blob)
 

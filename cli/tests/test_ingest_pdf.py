@@ -9,7 +9,7 @@ Uses the committed fixture tests/fixtures/sample.pdf — the SAME bytes the TS
 resolver test (app/prisma/verify-pdf.ts) generates and asserts on.
 
 Run (no pytest needed):
-    python tests/test_ingest_pdf.py
+    /Users/blaiszik/mamba/envs/moment/bin/python tools/moment-cli/tests/test_ingest_pdf.py
 Exit code is non-zero on any failure.
 """
 import os

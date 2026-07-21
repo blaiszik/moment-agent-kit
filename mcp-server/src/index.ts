@@ -217,6 +217,41 @@ interface GatherNode {
   uri?: string;
 }
 
+/** A single inspectable evidence item in a Research Context Packet. */
+interface PacketEvidenceItem {
+  title: string;
+  uri?: string;
+  locator?: { href?: string };
+  authority: string;
+  match: { reason: string };
+}
+
+/** The fields needed to render a Research Context Packet prose-first. */
+interface ContextPacketResponse {
+  question: string;
+  caveats: string[];
+  evidence: PacketEvidenceItem[];
+  tokenEstimate: number;
+  tokenBudget: number;
+}
+
+/** Metadata returned for a persisted Research Context Packet snapshot. */
+interface SavedPacketMeta {
+  id: number;
+  projectId: number;
+  question: string;
+  compilerVersion: string;
+  createdAt: string;
+  createdBy?: { name: string | null } | null;
+  createdByAgent?: { name: string | null } | null;
+  evidenceCount: number;
+}
+
+/** A persisted packet includes its full immutable snapshot. */
+interface SavedPacket extends SavedPacketMeta {
+  packet: ContextPacketResponse;
+}
+
 /**
  * Render a compiled context bundle (compile_context / gather_context) as a
  * ranked, labeled list of nodes within the token budget.
@@ -242,6 +277,57 @@ function renderGatherBundle(result: {
     const excerpt = n.excerpt ? truncate(n.excerpt.replace(/\s+/g, ' ').trim(), 200) : '';
     lines.push(`${i + 1}. **${title}** — ${type}${handle ? ` (${handle})` : ''}${excerpt ? `\n   ${excerpt}` : ''}`);
   });
+  return lines.join('\n');
+}
+
+/** Render the inspectable evidence summary that leads a Research Context Packet. */
+function renderContextPacket(packet: ContextPacketResponse): string {
+  const evidence = packet.evidence || [];
+  const caveats = packet.caveats || [];
+  const lines = [
+    '## Research Context Packet',
+    `Question: ${packet.question}`,
+    `Evidence items: ${evidence.length}`,
+    `Token estimate: ${packet.tokenEstimate} / ${packet.tokenBudget}`,
+    'Caveats:',
+    ...(caveats.length > 0 ? caveats.map((caveat) => `- ${caveat}`) : ['- None']),
+    '',
+  ];
+
+  for (const item of evidence) {
+    const locator = item.locator?.href || item.uri;
+    lines.push(
+      `- [${item.authority}] ${item.title} — ${item.match.reason}${locator ? ` (${locator})` : ''}`
+    );
+  }
+
+  return lines.join('\n');
+}
+
+/** Render the stable handle returned after saving a packet snapshot. */
+function renderSavedPacketMeta(packet: SavedPacketMeta): string {
+  return [
+    '## Research Context Packet saved',
+    `ID: ${packet.id}`,
+    `Question: ${packet.question}`,
+    `Evidence items: ${packet.evidenceCount}`,
+    `Permalink: /projects/${packet.projectId}/packets/${packet.id}`,
+  ].join('\n');
+}
+
+/** Render saved packet metadata as compact, scannable lines. */
+function renderSavedPacketList(packets: SavedPacketMeta[]): string {
+  if (packets.length === 0) {
+    return 'No saved Research Context Packets found for this project.';
+  }
+
+  const lines = [`## Saved Research Context Packets (${packets.length})`, ''];
+  for (const packet of packets) {
+    const author = packet.createdBy?.name || packet.createdByAgent?.name || 'Unknown author';
+    lines.push(
+      `- #${packet.id} — ${packet.question} — ${packet.evidenceCount} evidence item${packet.evidenceCount === 1 ? '' : 's'} — ${packet.createdAt} — ${author}`
+    );
+  }
   return lines.join('\n');
 }
 
@@ -346,7 +432,7 @@ const TOOLS = [
   {
     name: 'submit_task',
     description:
-      'Submit completed task work. Required: taskId, reasoning, confidenceScore; include output for JSON work or prUrl for code work. Returns the submission record for review.',
+      'Submit completed task work. Required: taskId, reasoning, confidenceScore; include output for JSON work or prUrl for code work. Optional campaign measurements are filed as REPORTED on approval; steward verification is separate, and you must never claim reported measurements move campaign dials. Returns the submission record for review.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -406,6 +492,22 @@ const TOOLS = [
             },
           },
         },
+        campaignMeasurements: {
+          type: 'array',
+          maxItems: 100,
+          description:
+            'Optional campaign evidence. Measurements are filed as REPORTED on approval; steward verification is separate. Never claim reported measurements move campaign dials.',
+          items: {
+            type: 'object',
+            properties: {
+              targetId: { type: 'integer', minimum: 1, description: 'Campaign target ID' },
+              value: { type: 'number', description: 'Finite reported measurement value' },
+              note: { type: 'string', maxLength: 2000 },
+              evidenceUrl: { type: 'string', maxLength: 500 },
+            },
+            required: ['targetId', 'value'],
+          },
+        },
       },
       required: ['taskId', 'reasoning', 'confidenceScore'],
     },
@@ -413,7 +515,7 @@ const TOOLS = [
   {
     name: 'submit_task_pr',
     description:
-      'Register a pull request for a code-contribution task. Required: taskId, prUrl, reasoning. Returns PR submission status for review.',
+      'Register a pull request for a code-contribution task. Required: taskId, prUrl, reasoning. Optional campaign measurements are filed as REPORTED on approval; steward verification is separate, and you must never claim reported measurements move campaign dials. Returns PR submission status for review.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -469,8 +571,50 @@ const TOOLS = [
             },
           },
         },
+        campaignMeasurements: {
+          type: 'array',
+          maxItems: 100,
+          description:
+            'Optional campaign evidence. Measurements are filed as REPORTED on approval; steward verification is separate. Never claim reported measurements move campaign dials.',
+          items: {
+            type: 'object',
+            properties: {
+              targetId: { type: 'integer', minimum: 1, description: 'Campaign target ID' },
+              value: { type: 'number', description: 'Finite reported measurement value' },
+              note: { type: 'string', maxLength: 2000 },
+              evidenceUrl: { type: 'string', maxLength: 500 },
+            },
+            required: ['targetId', 'value'],
+          },
+        },
       },
       required: ['taskId', 'prUrl', 'reasoning'],
+    },
+  },
+  {
+    name: 'list_campaign_tasks',
+    description:
+      'List tasks decomposed under a readable campaign. Optionally filter by status, difficulty, or good-first suitability. Returns the campaign task rail from the public HTTP API.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        campaignSlug: { type: 'string', description: 'The campaign slug' },
+        status: {
+          type: 'string',
+          enum: ['OPEN', 'IN_PROGRESS', 'UNDER_REVIEW', 'COMPLETED'],
+          description: 'Optional task status filter',
+        },
+        difficulty: {
+          type: 'string',
+          enum: ['TRIVIAL', 'EASY', 'MEDIUM', 'HARD', 'EXPERT'],
+          description: 'Optional task difficulty filter',
+        },
+        goodFirst: {
+          type: 'boolean',
+          description: 'Optional: only open, ungated TRIVIAL or EASY tasks',
+        },
+      },
+      required: ['campaignSlug'],
     },
   },
   {
@@ -575,6 +719,12 @@ const TOOLS = [
           type: 'string',
           description:
             'Optional evidence and caveats for this contribution so readers can assess it.',
+        },
+        evidenceLinks: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'For insights: up to 5 http(s) URLs backing the claim (papers, datasets, repos, notebooks). Each becomes a cited project resource in the context graph — prefer this over burying links in prose.',
         },
       },
       required: ['projectId', 'type', 'content'],
@@ -748,6 +898,21 @@ const TOOLS = [
         },
       },
       required: ['projectId'],
+    },
+  },
+  {
+    name: 'get_team_context',
+    description:
+      'Read a persistent Team (a standing group of researchers). Required: team (the team slug). Returns a ready-to-read brief — who is on the team, its mission, what projects it works on (with handoff highlights for projects you can access), what skills it needs, and recent record activity; the structured JSON follows below it. Use get_project_context to read one of the team\'s projects in full.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        team: {
+          type: 'string',
+          description: 'The slug of the team to get context for.',
+        },
+      },
+      required: ['team'],
     },
   },
   {
@@ -1100,6 +1265,12 @@ const TOOLS = [
           description:
             'Evidence for the insight: data, citations, repro steps, observations, and relevant links/ids/files.',
         },
+        evidenceLinks: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Up to 5 http(s) URLs backing the claim (papers, datasets, repos, notebooks). Each becomes a cited project resource in the context graph.',
+        },
       },
       required: ['projectId', 'type', 'content'],
     },
@@ -1228,6 +1399,61 @@ const TOOLS = [
         maxNodes: { type: 'number', description: 'Hard cap on nodes in the bundle (default 30, max 100).' },
       },
       required: ['projectId'],
+    },
+  },
+  {
+    name: 'compile_packet',
+    description:
+      "Use this when you have a question WITHIN one project and need inspectable evidence, not just ranked context. Returns a Research Context Packet: deterministic, budgeted evidence whose items carry authority, freshness, provenance, locator, and why-matched. (Not search_context, which discovers context across the WHOLE lab; not compile_context, which returns raw ranked nodes.)",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The ID of the project' },
+        question: { type: 'string', description: 'The question the evidence packet should address.' },
+        tokenBudget: { type: 'number', description: 'Approx token cap for the packet (default 4000).' },
+        maxNodes: { type: 'number', description: 'Hard cap on evidence nodes (default 40, max 100).' },
+        depth: { type: 'number', description: 'Graph hops to expand (1-3, default 2).' },
+      },
+      required: ['projectId', 'question'],
+    },
+  },
+  {
+    name: 'save_packet',
+    description:
+      'Save an IMMUTABLE snapshot of a Research Context Packet you compiled with compile_packet, optionally curated by removing evidence items first. The snapshot is attributed to you, readable by every project member at a stable URL, and requires edit access. This saves your own compiled evidence; it is NOT the proposal path and publishes nothing else.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The ID of the project' },
+        packet: { type: 'object', description: 'The full Research Context Packet snapshot to save.' },
+      },
+      required: ['projectId', 'packet'],
+    },
+  },
+  {
+    name: 'list_packets',
+    description:
+      'List immutable Research Context Packet snapshots saved for one project, newest first. Returns compact metadata for each packet, including its stable ID, question, evidence count, date, and author; requires view access.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The ID of the project' },
+        limit: { type: 'number', description: 'Maximum packets to return (default 20, max 50).' },
+      },
+      required: ['projectId'],
+    },
+  },
+  {
+    name: 'get_packet',
+    description:
+      'Read one immutable Research Context Packet snapshot, including its full frozen evidence, by stable packet ID. Use this when a saved packet needs to be inspected or cited later; every project member with view access can read it.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The ID of the project' },
+        packetId: { type: 'number', description: 'The ID of the saved packet' },
+      },
+      required: ['projectId', 'packetId'],
     },
   },
   {
@@ -1386,13 +1612,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'submit_task': {
-        const { taskId, output, reasoning, confidenceScore, prUrl, completionReport } = args as {
+        const { taskId, output, reasoning, confidenceScore, prUrl, completionReport, campaignMeasurements } = args as {
           taskId: number;
           output?: unknown;
           reasoning: string;
           confidenceScore?: number;
           prUrl?: string;
           completionReport?: Record<string, unknown>;
+          campaignMeasurements?: Array<{
+            targetId: number;
+            value: number;
+            note?: string;
+            evidenceUrl?: string;
+          }>;
         };
 
         const result = await apiClient.post(
@@ -1403,6 +1635,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             confidenceScore,
             prUrl,
             completionReport,
+            campaignMeasurements,
           }
         );
 
@@ -1412,19 +1645,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'submit_task_pr': {
-        const { taskId, prUrl, reasoning, confidenceScore, completionReport } = args as {
+        const { taskId, prUrl, reasoning, confidenceScore, completionReport, campaignMeasurements } = args as {
           taskId: number;
           prUrl: string;
           reasoning: string;
           confidenceScore?: number;
           completionReport?: Record<string, unknown>;
+          campaignMeasurements?: Array<{
+            targetId: number;
+            value: number;
+            note?: string;
+            evidenceUrl?: string;
+          }>;
         };
 
         const result = await apiClient.post(
           `/api/v1/agents/tasks/${taskId}/submit-pr`,
-          { prUrl, reasoning, confidenceScore, completionReport }
+          { prUrl, reasoning, confidenceScore, completionReport, campaignMeasurements }
         );
 
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case 'list_campaign_tasks': {
+        const { campaignSlug, status, difficulty, goodFirst } = args as {
+          campaignSlug: string;
+          status?: string;
+          difficulty?: string;
+          goodFirst?: boolean;
+        };
+        const params = new URLSearchParams();
+        if (status) params.set('status', status);
+        if (difficulty) params.set('difficulty', difficulty);
+        if (goodFirst !== undefined) params.set('goodFirst', String(goodFirst));
+        const query = params.toString();
+        const result = await apiClient.get(
+          `/api/campaigns/${encodeURIComponent(campaignSlug)}/tasks${query ? `?${query}` : ''}`
+        );
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         };
@@ -1505,13 +1764,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // QUICK CONTRIBUTION TOOL HANDLERS
       // ============================================
       case 'contribute': {
-        const { projectId, type, content, discussionId, confidence, reasoning } = args as {
+        const { projectId, type, content, discussionId, confidence, reasoning, evidenceLinks } = args as {
           projectId: number;
           type: string;
           content: string;
           discussionId?: number;
           confidence?: number;
           reasoning?: string;
+          evidenceLinks?: string[];
         };
 
         let result: unknown;
@@ -1556,6 +1816,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               content,
               confidence,
               supportingEvidence: reasoning,
+              evidenceLinks,
             }
           );
         }
@@ -1709,6 +1970,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const text = context.promptContext
           ? proseFirst(context.promptContext, compactProjectContext(context))
           : JSON.stringify(context, null, 2);
+        return {
+          content: [{ type: 'text', text }],
+        };
+      }
+
+      case 'get_team_context': {
+        const { team } = args as { team: string };
+        const context = (await apiClient.get(
+          `/api/v1/agents/teams/${encodeURIComponent(team)}/context`
+        )) as { text?: string; brief?: string; structured?: unknown };
+        // The route already composes the prose brief above a structured (JSON)
+        // fence in `text` — pass it straight through.
+        const text = context.text
+          ? context.text
+          : proseFirst(context.brief ?? '', context.structured ?? context);
         return {
           content: [{ type: 'text', text }],
         };
@@ -1902,6 +2178,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'compile_packet': {
+        const { projectId, question, tokenBudget, maxNodes, depth } = args as {
+          projectId: number; question: string; tokenBudget?: number; maxNodes?: number; depth?: number;
+        };
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/packet`,
+          { question, tokenBudget, maxNodes, depth }
+        ) as ContextPacketResponse;
+        return {
+          content: [{ type: 'text', text: proseFirst(renderContextPacket(result), result) }],
+        };
+      }
+
+      case 'save_packet': {
+        const { projectId, packet } = args as { projectId: number; packet: Record<string, unknown> };
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/packets`,
+          { packet }
+        ) as SavedPacketMeta;
+        return {
+          content: [{ type: 'text', text: proseFirst(renderSavedPacketMeta(result), result) }],
+        };
+      }
+
+      case 'list_packets': {
+        const { projectId, limit } = args as { projectId: number; limit?: number };
+        const params = new URLSearchParams();
+        if (limit !== undefined) params.set('limit', String(limit));
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        const result = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/packets${suffix}`
+        ) as { packets: SavedPacketMeta[] };
+        return {
+          content: [{ type: 'text', text: proseFirst(renderSavedPacketList(result.packets || []), result) }],
+        };
+      }
+
+      case 'get_packet': {
+        const { projectId, packetId } = args as { projectId: number; packetId: number };
+        const result = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/packets/${packetId}`
+        ) as SavedPacket;
+        return {
+          content: [{ type: 'text', text: proseFirst(renderContextPacket(result.packet), result) }],
+        };
+      }
+
       case 'get_backlinks': {
         const { projectId, page } = args as { projectId: number; page: string };
         const result = await apiClient.get(
@@ -2021,12 +2344,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'create_insight': {
-        const { projectId, type, content, confidence, supportingEvidence } = args as {
+        const { projectId, type, content, confidence, supportingEvidence, evidenceLinks } = args as {
           projectId: number;
           type: string;
           content: string;
           confidence?: number;
           supportingEvidence?: string;
+          evidenceLinks?: string[];
         };
 
         const result = await apiClient.post(
@@ -2036,6 +2360,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content,
             confidence,
             supportingEvidence,
+            evidenceLinks,
           }
         );
         return {

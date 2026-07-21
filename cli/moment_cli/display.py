@@ -21,6 +21,7 @@ ACCENT_STRONG = "#3bb8f5"
 SPARK = "#ffd166"
 GLOW = "#8ce99a"
 ROSE = "#ff8fab"
+READ_NOW_COUNT = 3
 
 
 def print_json(data: Any) -> None:
@@ -297,8 +298,18 @@ def render_brief(payload: dict, quiet: bool = False) -> None:
     # 4. Read order — the assembler's own prioritization.
     read_order = (payload.get("protocol") or {}).get("readOrder") or []
     if read_order:
+        read_order_lines = [
+            f"  {i + 1}. {step}"
+            for i, step in enumerate(read_order[:READ_NOW_COUNT])
+        ]
+        remaining = len(read_order) - READ_NOW_COUNT
+        if remaining > 0:
+            read_order_lines.append(
+                f"[dim]… and {remaining} reference docs — "
+                "`moment gather <topic>` pulls what you need.[/]"
+            )
         console.print(Panel(
-            "\n".join(f"  {i + 1}. {step}" for i, step in enumerate(read_order)),
+            "\n".join(read_order_lines),
             title="Read order", border_style=ACCENT))
 
     # 5. Pages canvas.
