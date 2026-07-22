@@ -473,6 +473,9 @@ def project_read_resource(
         _handle_error(exc)
 
 
+PAGE_ROLES = ("BRIEF", "SPEC", "PLAN", "DECISION", "REPORT", "REFERENCE", "NOTE")
+
+
 @project_app.command("page")
 def project_page(
     project_id: int = typer.Argument(help="Project ID."),
@@ -483,11 +486,12 @@ def project_page(
     icon: Optional[str] = typer.Option(None, "--icon"),
     pinned: bool = typer.Option(False, "--pinned"),
     agent_read: bool = typer.Option(False, "--agent-read", help="Pull the full page into every agent's context."),
+    role: Optional[str] = typer.Option(None, "--role", help="BRIEF|SPEC|PLAN|DECISION|REPORT|REFERENCE|NOTE (inferred from slug/title when omitted)."),
 ) -> None:
     """Add or update a freeform markdown page."""
     _upsert_page(
         project_id, title=title, body=body, body_file=body_file,
-        slug=slug, icon=icon, pinned=pinned, agent_read=agent_read,
+        slug=slug, icon=icon, pinned=pinned, agent_read=agent_read, role=role,
     )
 
 
@@ -501,6 +505,7 @@ def _upsert_page(
     icon: Optional[str],
     pinned: bool,
     agent_read: bool,
+    role: Optional[str] = None,
 ) -> None:
     """Shared page-upsert body for `project page` (explicit id) and `page` (bound id)."""
     if bool(body) == bool(body_file):
@@ -511,6 +516,11 @@ def _upsert_page(
         payload["slug"] = slug
     if icon:
         payload["icon"] = icon
+    if role:
+        role_upper = role.strip().upper()
+        if role_upper not in PAGE_ROLES:
+            raise typer.BadParameter(f"--role must be one of {', '.join(PAGE_ROLES)} (got {role!r}).")
+        payload["role"] = role_upper
     try:
         print_json(_get_client().upsert_page(project_id, payload))
     except Exception as exc:
@@ -637,6 +647,7 @@ def page(
     icon: Optional[str] = typer.Option(None, "--icon"),
     pinned: bool = typer.Option(False, "--pinned"),
     agent_read: bool = typer.Option(False, "--agent-read", help="Pull the full page into every agent's context."),
+    role: Optional[str] = typer.Option(None, "--role", help="BRIEF|SPEC|PLAN|DECISION|REPORT|REFERENCE|NOTE (inferred from slug/title when omitted)."),
 ) -> None:
     """Add or update a page on the bound project (--project / .moment.json). Same as `project page` without the id."""
     try:
@@ -647,7 +658,7 @@ def page(
         return
     _upsert_page(
         pid, title=title, body=body, body_file=body_file,
-        slug=slug, icon=icon, pinned=pinned, agent_read=agent_read,
+        slug=slug, icon=icon, pinned=pinned, agent_read=agent_read, role=role,
     )
 
 

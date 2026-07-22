@@ -1013,6 +1013,12 @@ const TOOLS = [
           description:
             "Make this a page agents always read in full — it's pulled into every agent's project context (use for architecture, conventions, must-know constraints).",
         },
+        role: {
+          type: 'string',
+          enum: ['BRIEF', 'SPEC', 'PLAN', 'DECISION', 'REPORT', 'REFERENCE', 'NOTE'],
+          description:
+            'Optional page role (BRIEF/SPEC/PLAN/DECISION/REPORT/REFERENCE/NOTE); inferred from slug/title when omitted.',
+        },
       },
       required: ['projectId', 'title', 'body'],
     },
@@ -2027,7 +2033,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'upsert_page': {
-        const { projectId, title, body, slug, icon, pinned, agentRead } = args as {
+        const { projectId, title, body, slug, icon, pinned, agentRead, role } = args as {
           projectId: number;
           title: string;
           body: string;
@@ -2035,10 +2041,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           icon?: string;
           pinned?: boolean;
           agentRead?: boolean;
+          role?: string;
         };
         const result = await apiClient.post(
           `/api/v1/agents/projects/${projectId}/pages`,
-          { title, body, slug, icon, pinned, agentRead }
+          { title, body, slug, icon, pinned, agentRead, role }
         );
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
