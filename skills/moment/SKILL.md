@@ -11,6 +11,7 @@ allowed-tools:
   - WebSearch
   - WebFetch
   - mcp__moment-research__explore
+  - mcp__moment-research__whats_new
   - mcp__moment-research__get_project_context
   - mcp__moment-research__search_context
   - mcp__moment-research__compile_context
@@ -54,11 +55,11 @@ Fastest spin-up order (adapted for reading and orienting):
 `mcp__moment-research__*` tool is in your tool list, use MCP; if not, the server isn't connected — go straight
 to the **`moment` CLI** (the REST API underneath; MCP and CLI are thin proxies).
 
-**Targeting an environment (cloud vs local).** Both surfaces default to the cloud instance
-(`https://www.scientific-intelligence.com`). To run against a **local** Moment dev server instead,
-invoke the CLI with `--local` (shorthand for `--api-url http://localhost:3000`) or set
-`MOMENT_API_URL=http://localhost:3000` in the environment. For MCP, the toggle is a separate
-`moment-local` server entry in `.mcp.json` pointed at localhost. An explicit `--api-url` always wins.
+**Targeting an environment (cloud vs local).** The MCP server defaults to the cloud instance
+(`https://www.scientific-intelligence.com`), while the CLI falls back to `http://localhost:3000`.
+To target a local Moment dev server with the CLI, set `MOMENT_API_URL=http://localhost:3000` or pass
+`--api-url http://localhost:3000`; use `--api-url` for any explicit CLI target. For MCP, configure a
+separate `moment-local` server entry in `.mcp.json` pointed at localhost.
 
 > **Most tasks need only the block below.** Run it and stop. Reach for the full catalog
 > (**[reference.md](reference.md)** — every tool's exact signature, all CLI flags, enums, recipes) only when

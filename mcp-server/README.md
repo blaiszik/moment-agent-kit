@@ -79,41 +79,43 @@ ListTools exposes 47 tools. Deprecated aliases remain callable for compatibility
 ### 2. Build the Server
 
 ```bash
-cd mcp/moment-server
+cd mcp-server
 npm install
 npm run build
 ```
 
-### 3. Configure Claude Code
+### 3. Configure Claude Desktop
 
-Add to your `~/.claude/claude_desktop_config.json` (note the MCP-specific env vars to avoid clobbering shell-level defaults):
+Add to Claude Desktop's `~/.claude/claude_desktop_config.json` (note the MCP-specific env vars to avoid clobbering shell-level defaults):
 
 ```json
 {
   "mcpServers": {
     "moment": {
       "command": "node",
-      "args": ["/path/to/moment-next/mcp/moment-server/dist/index.js"],
+      "args": ["<KIT_PATH>/mcp-server/dist/index.js"],
       "env": {
         "MOMENT_MCP_API_KEY": "your-api-key-here",
-        "MOMENT_MCP_API_URL": "http://localhost:3000"
+        "MOMENT_MCP_API_URL": "https://www.scientific-intelligence.com"
       }
     }
   }
 }
 ```
 
-Or for Claude Code settings file (`.claude/settings.json`):
+### 4. Configure Claude Code
+
+Create or update the project-level `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "moment": {
       "command": "node",
-      "args": ["./mcp/moment-server/dist/index.js"],
+      "args": ["<KIT_PATH>/mcp-server/dist/index.js"],
       "env": {
         "MOMENT_MCP_API_KEY": "your-api-key-here",
-        "MOMENT_MCP_API_URL": "http://localhost:3000"
+        "MOMENT_MCP_API_URL": "https://www.scientific-intelligence.com"
       }
     }
   }
@@ -128,20 +130,20 @@ You can also skip environment variables entirely and pass flags instead:
     "moment": {
       "command": "node",
       "args": [
-        "./mcp/moment-server/dist/index.js",
+        "<KIT_PATH>/mcp-server/dist/index.js",
         "--api-key",
         "your-api-key-here",
         "--api-url",
-        "http://localhost:3000"
+        "https://www.scientific-intelligence.com"
       ]
     }
   }
 }
 ```
 
-### 4. Restart Claude Code
+### 5. Restart your client
 
-After updating the configuration, restart Claude Code to load the MCP server.
+After updating the configuration, restart Claude Desktop or Claude Code to load the MCP server.
 
 ## Usage Examples
 
@@ -159,8 +161,8 @@ Once configured, you can ask Claude Code things like:
 |----------|----------|---------|-------------|
 | `MOMENT_MCP_API_KEY` | Yes* | - | Preferred env var for the Moment agent API key |
 | `MOMENT_API_KEY` | Yes* | - | Legacy fallback for the API key |
-| `MOMENT_MCP_API_URL` | No | `http://localhost:3000` | Preferred env var for the API base URL |
-| `MOMENT_API_URL` | No | `http://localhost:3000` | Legacy fallback for the API base URL |
+| `MOMENT_MCP_API_URL` | No | `https://www.scientific-intelligence.com` | Preferred env var for the API base URL |
+| `MOMENT_API_URL` | No | `https://www.scientific-intelligence.com` | Legacy fallback for the API base URL |
 | `MOMENT_MCP_CONFIG` | No | - | Path to a JSON file with `{ \"apiKey\": string, \"apiUrl\": string }` |
 | `MOMENT_MCP_DEBUG` | No | `false` | When truthy, logs every API call and configuration fingerprint |
 
@@ -191,4 +193,4 @@ Double-check your API key in the configuration. On startup the server logs the f
 
 ### Connection errors
 
-Make sure Moment is running at the URL specified in `MOMENT_API_URL`. For local development, this is typically `http://localhost:3000`.
+Make sure Moment is reachable at the configured API URL. The server resolves it in this order: `--api-url`, config-file `apiUrl`, `MOMENT_MCP_API_URL`, `MCP_MOMENT_API_URL`, then the legacy `MOMENT_API_URL`; otherwise it uses `https://www.scientific-intelligence.com`. For local development, set `MOMENT_MCP_API_URL=http://localhost:3000` (or use `--api-url`).

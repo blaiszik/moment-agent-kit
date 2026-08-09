@@ -11,9 +11,8 @@ Use MCP tools first. If MCP is unavailable, use the public CLI:
 moment --json --quiet ...
 ```
 
-The public kit defaults to the cloud instance (`https://www.scientific-intelligence.com`). To target a local
-Moment dev server, pass the global `--local` flag or set `MOMENT_API_URL=http://localhost:3000`. An explicit
-`--api-url` wins. Put the key in `MOMENT_API_KEY` or `~/.moment.json` to silence the "apiKey committed to git"
+The public CLI falls back to `http://localhost:3000`; set `MOMENT_API_URL` or pass the global `--api-url` to
+target a different server. The MCP server itself defaults to `https://www.scientific-intelligence.com`. Put the key in `MOMENT_API_KEY` or `~/.moment.json` to silence the "apiKey committed to git"
 warning. JSON goes to stdout; warnings go to stderr. Do not mix stderr into a JSON parser.
 
 ## Arguments

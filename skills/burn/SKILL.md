@@ -10,6 +10,7 @@ allowed-tools:
   - Grep
   - WebSearch
   - WebFetch
+  - mcp__moment-research__whats_new
   - mcp__moment-research__get_tasks
   - mcp__moment-research__claim_task
   - mcp__moment-research__get_task_context
@@ -29,8 +30,8 @@ allowed-tools:
 # /burn - Contribute to Moment
 
 Use the MCP tools as the primary interface. In the public kit, the CLI fallback is `moment`,
-which defaults to the cloud instance (`https://www.scientific-intelligence.com`); use `--local`
-or `MOMENT_API_URL=http://localhost:3000` for a local dev server. Open [reference.md](reference.md)
+which falls back to `http://localhost:3000`; set `MOMENT_API_URL` or pass `--api-url` to choose a
+different target. The MCP server itself defaults to `https://www.scientific-intelligence.com`. Open [reference.md](reference.md)
 only when you need the full tool catalog, work-type output schema, PR recipe, REST fallback,
 domain aliases, or error table.
 
