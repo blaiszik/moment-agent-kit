@@ -43,9 +43,13 @@ from moment_cli.display import (
     render_ingest_result,
     render_ingest_watch_dry_run,
     render_ingest_watch_result,
+    render_packet,
+    render_packet_list,
+    render_page,
     render_pr_status,
     render_project_context,
     render_propose_result,
+    render_saved_packet,
     render_stats,
     render_submission,
     render_timeline,
@@ -123,6 +127,7 @@ def _resolve_cli_config(
         api_url=_state.get("api_url"),
         config_path=_state.get("config"),
         project_id=project if project is not None else _state.get("project"),
+        quiet=bool(_state.get("quiet")),
     )
     _state["_config"] = cfg
     return cfg
@@ -476,6 +481,22 @@ def project_read_resource(
 PAGE_ROLES = ("BRIEF", "SPEC", "PLAN", "DECISION", "REPORT", "REFERENCE", "NOTE")
 
 
+@project_app.command("page-read")
+def project_page_read(
+    project_id: int = typer.Argument(help="Project ID."),
+    slug: str = typer.Argument(help="Page slug (from orient's read order, gather, or `project context`)."),
+) -> None:
+    """Read one page's full markdown body — the read twin of `project page`."""
+    try:
+        result = _get_client().read_page(project_id, slug)
+        if _state.get("json"):
+            print_json(result)
+            return
+        render_page(result)
+    except Exception as exc:
+        _handle_error(exc)
+
+
 @project_app.command("page")
 def project_page(
     project_id: int = typer.Argument(help="Project ID."),
@@ -621,6 +642,79 @@ def gather(
         _handle_error(exc)
 
 
+def _packet_permalink(meta: dict) -> str:
+    """The stable project URL a saved snapshot lives at."""
+    cfg = _state.get("_config")
+    base = _default_api_url(getattr(cfg, "api_url", None))
+    return f"{base}/projects/{meta.get('projectId')}/packets/{meta.get('id')}"
+
+
+@app.command("packet")
+def packet(
+    question: str = typer.Argument(help="The question the evidence should address."),
+    budget: Optional[int] = typer.Option(None, "--budget", help="Approx token budget for the packet (default 4000)."),
+    max_nodes: Optional[int] = typer.Option(None, "--max-nodes", help="Hard cap on evidence items (default 40, max 100)."),
+    depth: Optional[int] = typer.Option(None, "--depth", help="Graph hops to expand (1-3, default 2)."),
+    save: bool = typer.Option(False, "--save", help="Freeze the compiled packet as an immutable snapshot (needs edit access)."),
+) -> None:
+    """Compile a Research Context Packet — inspectable evidence for one question, each item carrying authority, freshness, locator, and why it matched."""
+    try:
+        client = _get_client()
+        pid = _resolve_project_id()
+        payload: dict = {"question": question}
+        if budget is not None:
+            payload["tokenBudget"] = budget
+        if max_nodes is not None:
+            payload["maxNodes"] = max_nodes
+        if depth is not None:
+            payload["depth"] = depth
+        result = client.compile_packet(pid, payload)
+        saved = client.save_packet(pid, result) if save else None
+        if _state.get("json"):
+            print_json({"packet": result, "saved": saved} if save else result)
+            return
+        render_packet(result, quiet=bool(_state.get("quiet")))
+        if saved:
+            render_saved_packet(saved, _packet_permalink(saved))
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@app.command("packet-list")
+def packet_list(
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Max snapshots to list (default 20, max 50)."),
+) -> None:
+    """List the saved packet snapshots on this project, newest first."""
+    try:
+        client = _get_client()
+        pid = _resolve_project_id()
+        result = client.list_packets(pid, limit)
+        if _state.get("json"):
+            print_json(result)
+            return
+        render_packet_list(result.get("packets") or [])
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@app.command("packet-get")
+def packet_get(
+    packet_id: int = typer.Argument(help="Saved packet ID (from `packet-list`)."),
+) -> None:
+    """Read one saved packet snapshot in full — its frozen evidence, exactly as cited."""
+    try:
+        client = _get_client()
+        pid = _resolve_project_id()
+        result = client.get_packet(pid, packet_id)
+        if _state.get("json"):
+            print_json(result)
+            return
+        render_saved_packet(result, _packet_permalink(result), title="Packet snapshot")
+        render_packet(result.get("packet") or {}, quiet=bool(_state.get("quiet")))
+    except Exception as exc:
+        _handle_error(exc)
+
+
 @app.command("backlinks")
 def backlinks(
     page: str = typer.Argument(help="Page slug."),
@@ -634,6 +728,23 @@ def backlinks(
             print_json(result)
             return
         render_graph(result, page)
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@app.command("page-read")
+def page_read(
+    slug: str = typer.Argument(help="Page slug (from orient's read order, gather, or the brief)."),
+) -> None:
+    """Read one page in full from the bound project (--project / .moment.json). Same as `project page-read` without the id."""
+    try:
+        client = _get_client()
+        pid = _resolve_project_id()
+        result = client.read_page(pid, slug)
+        if _state.get("json"):
+            print_json(result)
+            return
+        render_page(result)
     except Exception as exc:
         _handle_error(exc)
 

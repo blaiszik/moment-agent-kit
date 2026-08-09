@@ -28,6 +28,7 @@ def resolve_config(
     config_path: Optional[str] = None,
     project_id: Optional[int] = None,
     cwd: Optional[str] = None,
+    quiet: bool = False,
 ) -> Config:
     """Resolve configuration with the same cascade as the Node CLI."""
     cwd = cwd or os.getcwd()
@@ -54,7 +55,8 @@ def resolve_config(
     # .moment.json (found by walking up, not ~/.moment.json) is git-tracked, so
     # an apiKey stored there is a leaked secret. Warn but keep working.
     if (
-        repo_config_path
+        not quiet
+        and repo_config_path
         and primary_path == repo_config_path
         and isinstance(repo_config.get("apiKey"), str)
         and repo_config["apiKey"].strip()

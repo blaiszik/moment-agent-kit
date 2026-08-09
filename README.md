@@ -12,7 +12,7 @@ This kit gives external agents three ways in — use whichever fits your setup:
 |---|---|---|
 | **`skills/`** | Claude Code / Codex skills (`moment`, `burn`) | Agents in Claude Code or Codex — the highest-level, opinionated workflow |
 | **`mcp-server/`** | An MCP (Model Context Protocol) stdio server (~40 tools) | Any MCP-capable client (Claude Code, Claude Desktop, Codex, …) |
-| **`cli/`** | `moment` — a Python CLI (`pip install`) | Shells, scripts, CI, and as the skills' non-MCP fallback |
+| **`cli/`** | `moment` — a Python CLI (`pip install .`) | Shells, scripts, CI, and as the skills' non-MCP fallback |
 
 All three talk to the same **Moment Agent REST API** (`<host>/api/v1/agents/…`, Bearer-token
 auth). You can also integrate against that REST API directly — its always-current contract is
@@ -58,8 +58,10 @@ npm install
 npm run build
 ```
 
-Add it to your client. For Claude Code, copy `.mcp.json.example` to `.mcp.json` and fill in
-your key:
+Add it to your MCP client's configuration. Replace `<KIT_PATH>` with the absolute path to
+your clone of `moment-agent-kit`; using an absolute path makes the server independent of the
+client's working directory. For a project-local Claude Code config, this is the `mcpServers`
+entry in `.mcp.json`:
 
 ```json
 {
@@ -68,7 +70,7 @@ your key:
       "type": "stdio",
       "command": "node",
       "args": [
-        "./mcp-server/dist/index.js",
+        "<KIT_PATH>/mcp-server/dist/index.js",
         "--api-key=YOUR_MOMENT_API_KEY",
         "--api-url=https://www.scientific-intelligence.com"
       ]
@@ -83,9 +85,10 @@ See [`mcp-server/README.md`](mcp-server/README.md) for the full tool list and co
 
 ```bash
 cd cli
-pip install .                 # or: pipx install .
+python3 -m pip install .       # or: pipx install .
+export MOMENT_API_URL=https://www.scientific-intelligence.com
 moment auth login --key YOUR_MOMENT_API_KEY
-moment whats-new
+moment activity
 moment -p <projectId> orient
 ```
 
@@ -128,7 +131,7 @@ moment-agent-kit/
 | What | Where it goes |
 |------|----------------|
 | API key (secret) | `~/.moment.json` (`moment auth login`), or `MOMENT_API_KEY`, or `--api-key` flag |
-| API base URL | `MOMENT_API_URL` / `--api-url` (default `https://www.scientific-intelligence.com`) |
+| API base URL | `MOMENT_API_URL` / `--api-url` (CLI default: `http://localhost:3000`; MCP default: `https://www.scientific-intelligence.com`) |
 | Per-repo project binding (non-secret) | a committed `.moment.json` → `{ "projectId": N, "apiUrl": "…" }` |
 
 **Never commit a secret.** `.moment.json` is for the non-secret `projectId`/`apiUrl` binding
@@ -137,12 +140,13 @@ only; the key lives in `~/.moment.json` or the environment. The CLI warns if it 
 
 ## Cloud vs local
 
-Everything defaults to the cloud instance (`https://www.scientific-intelligence.com`). To
-point at a **local** Moment dev server (`http://localhost:3000`) instead:
+The MCP server defaults to the cloud instance (`https://www.scientific-intelligence.com`),
+but the CLI defaults to a local dev server (`http://localhost:3000`). Set `MOMENT_API_URL` or
+pass `--api-url` whenever the CLI should use the other environment:
 
-| Transport | Use cloud (default) | Use local |
-|-----------|--------------------|-----------|
-| **CLI** | `moment …` | `moment --local …` (= `--api-url http://localhost:3000`), or `export MOMENT_API_URL=http://localhost:3000` |
+| Transport | Use cloud | Use local |
+|-----------|-----------|-----------|
+| **CLI** | `export MOMENT_API_URL=https://www.scientific-intelligence.com` | `moment --api-url http://localhost:3000 …`, or `export MOMENT_API_URL=http://localhost:3000` |
 | **MCP** | call the `moment` server | call the `moment-local` server (both are in `.mcp.json.example`, each with its own `--api-url`) |
 | **Skill** | `/moment`, `/burn` | same skills — they inherit whichever transport/env you configured above |
 

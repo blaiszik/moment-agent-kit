@@ -364,9 +364,132 @@ def render_gather(payload: dict, label: str) -> None:
         via = ", ".join(n.get("viaKinds") or [])
         score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
         console.print(f"[{GLOW}]{score_s}[/]  [bold]{n.get('title', '')}[/]" + (f"  [dim]· {via}[/]" if via else ""))
-        ex = (n.get("excerpt") or "").strip()
-        if ex:
-            console.print(f"      [dim]{ex[:200]}[/]")
+        body = n.get("body")
+        if isinstance(body, str) and body.strip():
+            # The engine spent budget on this node's FULL body — deliver it raw
+            # (pipe-friendly), never re-truncated back into an excerpt.
+            console.print("      [dim]— full body —[/]")
+            sys.stdout.write(body.rstrip() + "\n")
+        else:
+            ex = (n.get("excerpt") or "").strip()
+            if ex:
+                console.print(f"      [dim]{ex}[/]")
+    excerpt_only = [n for n in nodes if n.get("slug") and not isinstance(n.get("body"), str)]
+    if excerpt_only:
+        console.print("[dim]Excerpt-only pages — read any in full: moment page-read <slug>[/]")
+
+
+# --- Research Context Packets ---
+
+# Authority is how a source earned its place; freshness is honest age labeling.
+AUTHORITY_STYLE = {"REVIEWED": GLOW, "CURATED": ACCENT, "UNREVIEWED": SPARK}
+FRESHNESS_STYLE = {"CURRENT": GLOW, "STALE": ROSE, "UNKNOWN": "dim"}
+
+
+def _clip(text: Any, limit: int = 240) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def _packet_author(meta: dict) -> str:
+    user = meta.get("createdBy") or {}
+    agent = meta.get("createdByAgent") or {}
+    return user.get("name") or agent.get("name") or "unknown"
+
+
+def render_packet(payload: dict, quiet: bool = False) -> None:
+    """A compiled Research Context Packet — inspectable evidence, not just ranked context."""
+    evidence = payload.get("evidence") or []
+    caveats = payload.get("caveats") or []
+    meta = (
+        f"{len(evidence)} evidence · "
+        f"~{payload.get('tokenEstimate', '?')}/{payload.get('tokenBudget', '?')} tokens · "
+        f"{payload.get('excludedCount', 0)} withheld · {payload.get('compilerVersion', '?')}"
+    )
+    console.print(Panel(
+        f"[bold]Question:[/] {payload.get('question', '')}\n[dim]{meta}[/]",
+        title="Research Context Packet", border_style=ACCENT_STRONG))
+
+    # Caveats are the honest limits — budget clips, staleness, empty results.
+    if caveats:
+        console.print(Panel("\n".join(f"• {c}" for c in caveats), title="Caveats", border_style=SPARK))
+
+    if not evidence:
+        console.print("[dim]No evidence matched — try a different question, or check the project has a context graph.[/]")
+        return
+
+    for item in evidence:
+        authority = str(item.get("authority") or "UNREVIEWED")
+        freshness = str(item.get("freshness") or "UNKNOWN")
+        entity = item.get("entity") or {}
+        source = str((item.get("provenance") or {}).get("sourceType") or entity.get("type") or "")
+        locator = item.get("locator") or {}
+        where = locator.get("label") or locator.get("href") or item.get("uri") or ""
+        line = (
+            f"[bold]{item.get('title', '(untitled)')}[/]"
+            + (f" [dim]· {source.lower()}[/]" if source else "")
+            + f" {chip(authority, AUTHORITY_STYLE.get(authority, ACCENT_STRONG))}"
+            + f" {chip(freshness, FRESHNESS_STYLE.get(freshness, 'dim'))}"
+            + (f" [dim]· {where}[/]" if where else "")
+        )
+        console.print(line)
+        reason = (item.get("match") or {}).get("reason")
+        if reason:
+            console.print(f"      [dim]why: {reason}[/]")
+        if not quiet:
+            excerpt = _clip(item.get("excerpt"), 400)
+            if excerpt:
+                console.print(f"      [dim]{excerpt}[/]")
+
+
+def render_saved_packet(meta: dict, permalink: Optional[str] = None,
+                        title: str = "Packet snapshot saved") -> None:
+    """The stable handle for a frozen packet snapshot."""
+    lines = [
+        kv("Packet", f"#{meta.get('id')}"),
+        kv("Question", _clip(meta.get("question"), 160)),
+        kv("Evidence", meta.get("evidenceCount", 0)),
+        kv("Saved by", _packet_author(meta)),
+        kv("Permalink", permalink or f"/projects/{meta.get('projectId')}/packets/{meta.get('id')}"),
+    ]
+    console.print(Panel("\n".join(lines), title=title, border_style=GLOW))
+
+
+def render_packet_list(packets: list) -> None:
+    """Saved snapshots for one project, newest first."""
+    if not packets:
+        console.print(Panel("[dim]No saved packets yet — `moment -p N packet \"<question>\" --save` freezes one.[/]",
+                            title="Saved packets", border_style=ACCENT_STRONG))
+        return
+
+    table = Table(title="Saved packets", border_style=ACCENT_STRONG, show_lines=False)
+    table.add_column("ID", style="bold", no_wrap=True)
+    table.add_column("Question")
+    table.add_column("Evidence", style=SPARK, justify="right")
+    table.add_column("Saved", style="dim", no_wrap=True)
+    table.add_column("By", style="dim")
+    for p in packets:
+        table.add_row(
+            f"#{p.get('id', '?')}",
+            _clip(p.get("question"), 80),
+            str(p.get("evidenceCount", 0)),
+            str(p.get("createdAt", ""))[:10],
+            _packet_author(p),
+        )
+    console.print(table)
+
+
+def render_page(payload: dict) -> None:
+    """A single page in full — title header, then the raw markdown body on stdout."""
+    page = payload.get("page") or {}
+    title = page.get("title") or page.get("slug") or "(untitled)"
+    bits = [b for b in (page.get("role"), f"/{page.get('slug')}" if page.get("slug") else None) if b]
+    console.print(Panel(f"[bold]{title}[/]" + (f"\n[dim]{' · '.join(str(b) for b in bits)}[/]" if bits else ""), border_style=ACCENT_STRONG))
+    body = page.get("body") or ""
+    if body.strip():
+        sys.stdout.write(body.rstrip() + "\n")
+    else:
+        console.print("[dim](this page is empty)[/]")
 
 
 def render_graph(payload: dict, page: str) -> None:

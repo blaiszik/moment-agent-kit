@@ -89,6 +89,21 @@ function truncate(str: string | null | undefined, max = 100): string {
 }
 
 const apiClient = new MomentApiClient(config);
+const START_HERE_URI = 'moment://start-here';
+const PROJECT_JSON_TOKEN_BUDGET = 7_000;
+const PROJECT_JSON_CHAR_BUDGET = PROJECT_JSON_TOKEN_BUDGET * 4;
+const START_HERE_TEXT = `# Moment: start here
+
+Recommended flow:
+1. get_project_context(projectId) — orient on the project brief.
+2. get_tasks(projectId, claimable: true) — choose work this key can claim now.
+3. claim_task(taskId) — reserve the work.
+4. get_task_context(taskId) — load the full working set.
+5. submit_task(taskId, ...) — submit the requested JSON or PR deliverable.
+
+Errors are recovery instructions: branch on type/code, then follow nextStep. The legacy error string always equals message. Use GET /api/v1/agents/me to inspect this key's hourly and claim standing.
+
+Write tier: EDITOR keys apply trusted page/resource/edge writes immediately. A VIEWER key queues supported writes as a 202 proposal, signaled by { "queued": true, "proposal": { ... } }; an editor must approve it.`;
 
 // Create server
 const server = new Server(
@@ -117,7 +132,7 @@ const server = new Server(
  * structured response below a labeled JSON fence (parse only if you need a field).
  */
 function proseFirst(brief: string, structured: unknown): string {
-  return `${brief.trim()}\n\n--- structured (JSON) ---\n${JSON.stringify(structured, null, 2)}`;
+  return `${brief.trim()}\n\n--- structured (JSON) ---\n${JSON.stringify(structured)}`;
 }
 
 const DEPRECATED_TOOL_ALIASES: Record<string, string> = {
@@ -151,18 +166,42 @@ function compactProjectContext(ctx: Record<string, unknown>): Record<string, unk
     Array.isArray(v) ? (v as Record<string, unknown>[]) : [];
   const pages = asArray(ctx.pages).map((p) => ({
     slug: p.slug, title: p.title, agentRead: p.agentRead, pinned: p.pinned,
+    ...(typeof p.body === 'string' && p.body.length > 0
+      ? { truncated: true, bodyTruncated: true }
+      : {}),
+    // Pass the server's self-describing omission through — a page with no
+    // body here was WITHHELD (readWith fetches it), not empty.
+    ...(p.bodyOmitted === true ? { bodyOmitted: true, readWith: p.readWith } : {}),
   }));
   const resources = asArray(ctx.resources).map((r) => ({
     id: r.id, kind: r.kind, title: r.title, uri: r.uri,
   }));
   const handoff = ctx.handoff as Record<string, unknown> | null | undefined;
-  return {
+  const project = (ctx.project ?? {}) as Record<string, unknown>;
+  const pageBodiesElided = pages.filter((page) => page.bodyTruncated).length;
+  const compact: Record<string, unknown> = {
     // The brief above is the read-first content; below = pointers only.
     note: 'Compact pointer subset — the full brief is the prose above this fence. Read a page by its slug, or pull a resource with read_resource(id).',
-    project: ctx.project,
+    project: {
+      id: project.id,
+      title: project.title,
+      domain: project.domain,
+      status: project.status,
+      githubRepo: project.githubRepo,
+      ...(typeof project.description === 'string' && project.description.length > 0
+        ? { truncated: true, descriptionTruncated: true }
+        : {}),
+    },
     pages,
     resources,
-    activeTasks: ctx.activeTasks,
+    activeTasks: asArray(ctx.activeTasks).map((task) => ({
+      id: task.id,
+      title: task.title,
+      status: task.status,
+      workType: task.workType,
+      difficulty: task.difficulty,
+      projectId: task.projectId,
+    })),
     handoff: handoff
       ? { version: handoff.version, updatedAt: handoff.updatedAt, updatedBy: handoff.updatedBy }
       : null,
@@ -170,12 +209,155 @@ function compactProjectContext(ctx: Record<string, unknown>): Record<string, unk
     stats: ctx.stats,
     sinceYouWereHere: ctx.sinceYouWereHere,
     metadata: ctx.metadata,
+    ...(pageBodiesElided > 0
+      ? {
+          truncated: true,
+          elisions: { pageBodies: pageBodiesElided },
+          nextStep: 'Call read_page(projectId, slug) for any full page body elided from this structured JSON.',
+        }
+      : {}),
   };
+  return capProjectContextJson(compact);
+}
+
+function capProjectContextJson(context: Record<string, unknown>): Record<string, unknown> {
+  if (JSON.stringify(context).length <= PROJECT_JSON_CHAR_BUDGET) return context;
+
+  const elisions = {
+    ...((context.elisions ?? {}) as Record<string, number>),
+    pages: 0,
+    resources: 0,
+    activeTasks: 0,
+  };
+  const lists = ['activeTasks', 'resources', 'pages'] as const;
+
+  // Leave headroom for the explicit budget/elision metadata added below.
+  while (JSON.stringify(context).length > PROJECT_JSON_CHAR_BUDGET - 600) {
+    let target: { key: (typeof lists)[number]; index: number; length: number } | undefined;
+    for (const key of lists) {
+      const list = context[key];
+      if (!Array.isArray(list)) continue;
+      list.forEach((item, index) => {
+        const length = JSON.stringify(item).length;
+        if (!target || length > target.length) target = { key, index, length };
+      });
+    }
+    if (!target) break;
+    (context[target.key] as unknown[]).splice(target.index, 1);
+    elisions[target.key] += 1;
+  }
+
+  context.truncated = true;
+  context.elisions = elisions;
+  context.budget = {
+    approximateTokens: PROJECT_JSON_TOKEN_BUDGET,
+    approximation: '4 JSON characters per token',
+  };
+  context.nextStep =
+    'Call read_page(projectId, slug) for full page bodies; use list_resources/read_resource for elided manifest items.';
+  return context;
+}
+
+/**
+ * Compact the get_task_context structured echo — the same treatment
+ * compactProjectContext gives get_project_context, which was never applied here.
+ *
+ * The route sends the SAME task content three times:
+ *   1. as prose, in `promptInstructions`;
+ *   2. as raw task fields (description / instructions / acceptanceCriteria /
+ *      inputData / project description / working-set excerpts);
+ *   3. as `promptInstructions` AGAIN, inside the JSON fence, because the whole
+ *      response object was echoed below the prose that came out of it.
+ *
+ * We keep only what the prose CANNOT carry — machine contracts and
+ * navigational handles — and drop what it already says. Unknown fields are
+ * ignored, so this cannot throw on shape drift.
+ *
+ * KEPT: ids, credits, deliverable, expectedOutputSchema (a machine contract the
+ * prose only paraphrases), the github block (clone/branch/scope handles), claim
+ * ids and timestamps, workSurface urls, approvedSubmissions, nextStep.
+ * DROPPED: promptInstructions (it IS the prose above the fence), the long task
+ * text fields, inputData (rendered verbatim in the prose), the projectContext
+ * narrative/coreProfile prose, and workingSet excerpts (inlined in the prose).
+ */
+function compactTaskContext(ctx: Record<string, unknown>): Record<string, unknown> {
+  const asArray = (v: unknown): Record<string, unknown>[] =>
+    Array.isArray(v) ? (v as Record<string, unknown>[]) : [];
+  const task = (ctx.task ?? {}) as Record<string, unknown>;
+  const project = (ctx.project ?? {}) as Record<string, unknown>;
+
+  return {
+    note: 'Compact pointer subset — the full task brief is the prose above this fence. Parse a field here only when you need the machine value (expectedOutputSchema, github handles, claim id).',
+    success: ctx.success,
+    task: {
+      id: task.id,
+      title: task.title,
+      workType: task.workType,
+      difficulty: task.difficulty,
+      credits: task.credits,
+      estimatedTokens: task.estimatedTokens,
+      timeoutMinutes: task.timeoutMinutes,
+      dueDate: task.dueDate,
+      tags: task.tags,
+      deliverable: task.deliverable,
+    },
+    deliverable: ctx.deliverable,
+    // The output contract. Not in the prose in a machine-checkable form.
+    expectedOutputSchema: ctx.expectedOutputSchema,
+    github: ctx.github,
+    project: { id: project.id, title: project.title, domain: project.domain },
+    claim: ctx.claim,
+    // Titles + handles only; the excerpts are already inlined in the brief.
+    workingSet: asArray(ctx.workingSet).map((n) => ({
+      type: n.type,
+      id: n.id,
+      slug: n.slug,
+      uri: n.uri,
+      title: n.title,
+    })),
+    workSurfaces: ctx.workSurfaces,
+    approvedSubmissions: ctx.approvedSubmissions,
+    nextStep: ctx.nextStep,
+    metadata: ctx.metadata,
+  };
+}
+
+/**
+ * The pre-claim preview has no `promptInstructions`, so before this it fell
+ * back to a raw JSON dump — the one context tool with no prose at all. Render
+ * the "should I claim this?" decision as a short brief instead.
+ */
+function renderTaskPreview(ctx: Record<string, unknown>): string {
+  const task = (ctx.task ?? {}) as Record<string, unknown>;
+  const project = (ctx.project ?? {}) as Record<string, unknown>;
+  const fit = (ctx.fit ?? {}) as Record<string, unknown>;
+  const lines = [
+    `# Task preview: ${task.title ?? '(untitled)'}`,
+    `${task.workType ?? 'TASK'} · ${task.difficulty ?? 'UNKNOWN'} · ${task.credits ?? 0} credits · ~${task.estimatedTokens ?? '?'} tokens`,
+    `Project: ${project.title ?? '?'} (#${project.id ?? '?'}${project.domain ? `, ${String(project.domain).replace(/_/g, ' ')}` : ''})`,
+    '',
+    '## Acceptance criteria',
+    String(task.acceptanceCriteria || '(none specified)'),
+    '',
+    fit.capabilityMatch
+      ? `## Fit\nMatches your declared capabilities${
+          Array.isArray(fit.matchedCapabilities) && fit.matchedCapabilities.length
+            ? `: ${(fit.matchedCapabilities as string[]).join(', ')}`
+            : ' (you are a generalist — no capabilities declared)'
+        }.`
+      : '## Fit\nNo overlap with your declared capabilities — claim only if you can still do the work.',
+    '',
+    `> ${String(ctx.note || 'Preview only — claim this task to get the full working set.')}`,
+    String(ctx.nextStep || ''),
+  ];
+  return lines.filter((l) => l !== null && l !== undefined).join('\n').trim();
 }
 
 /** A single search hit from the context graph (find-context / search_context). */
 interface ContextHit {
+  type?: string;
   entityType?: string;
+  id?: string | number | null;
   projectId?: number | null;
   title?: string | null;
   ref?: string | null;
@@ -213,8 +395,16 @@ interface GatherNode {
   id?: number;
   title?: string;
   excerpt?: string;
+  /** Full body — present when the engine spent tokenBudget on this node
+   *  (the seed page always; then neighbors in rank order). */
+  body?: string;
   slug?: string;
   uri?: string;
+  score?: number;
+  taskSim?: number;
+  hop?: number;
+  viaKinds?: string[];
+  projectId?: number;
 }
 
 /** A single inspectable evidence item in a Research Context Packet. */
@@ -274,9 +464,23 @@ function renderGatherBundle(result: {
     const title = (n.title || '(untitled)').trim();
     const type = (n.type || 'NODE').toLowerCase();
     const handle = n.slug ? `/${n.slug}` : n.uri ? n.uri : n.id != null ? `#${n.id}` : '';
-    const excerpt = n.excerpt ? truncate(n.excerpt.replace(/\s+/g, ' ').trim(), 200) : '';
-    lines.push(`${i + 1}. **${title}** — ${type}${handle ? ` (${handle})` : ''}${excerpt ? `\n   ${excerpt}` : ''}`);
+    if (typeof n.body === 'string') {
+      // The engine spent budget on this node's FULL body — deliver it, don't
+      // re-truncate it back into an excerpt.
+      lines.push(`${i + 1}. **${title}** — ${type}${handle ? ` (${handle})` : ''} — full body:`);
+      lines.push('');
+      lines.push(n.body);
+      lines.push('');
+    } else {
+      const excerpt = n.excerpt ? truncate(n.excerpt.replace(/\s+/g, ' ').trim(), 800) : '';
+      lines.push(`${i + 1}. **${title}** — ${type}${handle ? ` (${handle})` : ''}${excerpt ? `\n   ${excerpt}` : ''}`);
+    }
   });
+  const excerptOnlyPages = nodes.filter((n) => n.slug && typeof n.body !== 'string');
+  if (excerptOnlyPages.length > 0) {
+    lines.push('');
+    lines.push('_Excerpt-only pages: read_page(projectId, slug) returns any of them in full._');
+  }
   return lines.join('\n');
 }
 
@@ -331,6 +535,112 @@ function renderSavedPacketList(packets: SavedPacketMeta[]): string {
   return lines.join('\n');
 }
 
+type ClaimEvidenceItem = {
+  kind?: string;
+  otherType?: string;
+  otherId?: number;
+  title?: string | null;
+};
+
+function renderQuestionLedger(result: Record<string, unknown>): string {
+  const questions = Array.isArray(result.questions)
+    ? result.questions as Record<string, unknown>[]
+    : [];
+  if (!questions.length) return 'No questions match this status in the project.';
+  const lines = [`## Questions (${questions.length}${result.truncated === true ? '+' : ''})`, ''];
+  for (const question of questions) {
+    const children = Array.isArray(question.childIds) ? question.childIds as number[] : [];
+    lines.push(
+      `- #${question.id} · ${question.epistemicStatus} — ${question.content}` +
+      (children.length ? `\n  Decomposes into signal ids: ${children.join(', ')}` : ''),
+    );
+  }
+  if (result.truncated === true) lines.push('', 'More questions exist; this response is capped at 50.');
+  return lines.join('\n');
+}
+
+function questionPointers(result: Record<string, unknown>): Record<string, unknown> {
+  const questions = Array.isArray(result.questions)
+    ? result.questions as Record<string, unknown>[]
+    : [];
+  return {
+    questions: questions.map((question) => ({
+      id: question.id,
+      publicId: question.publicId,
+      epistemicStatus: question.epistemicStatus,
+      childIds: question.childIds,
+      createdAt: question.createdAt,
+      updatedAt: question.updatedAt,
+    })),
+    truncated: result.truncated === true,
+  };
+}
+
+function renderEvidenceItems(items: ClaimEvidenceItem[]): string[] {
+  return items.map((item) =>
+    `- ${item.kind} · ${item.otherType}:${item.otherId}${item.title ? ` — ${item.title}` : ''}`,
+  );
+}
+
+function renderClaimState(result: Record<string, unknown>): string {
+  const claim = (result.claim ?? {}) as Record<string, unknown>;
+  const derived = (result.derivedState ?? {}) as Record<string, unknown>;
+  const summary = (derived.summary ?? {}) as Record<string, unknown>;
+  const evidence = (result.evidence ?? {}) as Record<string, unknown>;
+  const forItems = Array.isArray(evidence.for) ? evidence.for as ClaimEvidenceItem[] : [];
+  const againstItems = Array.isArray(evidence.against) ? evidence.against as ClaimEvidenceItem[] : [];
+  const review = (claim.review ?? {}) as Record<string, unknown>;
+  const lines = [
+    `## Claim #${claim.id} · ${claim.type}`,
+    '',
+    String(claim.content ?? ''),
+    '',
+    `Stored: ${claim.epistemicStatus ?? 'none'} · Suggested: ${derived.suggestedEpistemicStatus ?? 'none'} · Publication: ${claim.publicationStatus}`,
+    `Review: ${review.state ?? 'unknown'}`,
+    `Evidence structure: ${summary.forCount ?? 0} for, ${summary.againstCount ?? 0} against, ${summary.reproducedCount ?? 0} reproductions.`,
+    String(derived.rationale ?? ''),
+  ];
+  if (result.note) lines.push(String(result.note));
+  lines.push('', '### For', ...(forItems.length ? renderEvidenceItems(forItems) : ['- None linked.']));
+  lines.push('', '### Against', ...(againstItems.length ? renderEvidenceItems(againstItems) : ['- None linked.']));
+  return lines.join('\n');
+}
+
+function claimStatePointers(result: Record<string, unknown>): Record<string, unknown> {
+  const claim = (result.claim ?? {}) as Record<string, unknown>;
+  const derived = (result.derivedState ?? {}) as Record<string, unknown>;
+  const evidence = (result.evidence ?? {}) as Record<string, unknown>;
+  const handles = (items: unknown) => (Array.isArray(items) ? items as ClaimEvidenceItem[] : []).map((item) => ({
+    kind: item.kind, otherType: item.otherType, otherId: item.otherId,
+  }));
+  return {
+    claim: {
+      id: claim.id,
+      publicId: claim.publicId,
+      type: claim.type,
+      epistemicStatus: claim.epistemicStatus,
+      publicationStatus: claim.publicationStatus,
+      review: claim.review,
+    },
+    derivedState: {
+      summary: derived.summary,
+      suggestedEpistemicStatus: derived.suggestedEpistemicStatus,
+      divergesFromStored: derived.divergesFromStored,
+    },
+    evidence: { for: handles(evidence.for), against: handles(evidence.against) },
+  };
+}
+
+function renderEvidenceSearch(result: Record<string, unknown>): string {
+  const evidence = Array.isArray(result.evidence) ? result.evidence as ClaimEvidenceItem[] : [];
+  if (!evidence.length) return `No ${result.stance ?? 'matching'} evidence is linked to signal ${result.signalId}.`;
+  return [
+    `## ${String(result.stance ?? 'all')} evidence for signal ${result.signalId} (${evidence.length})`,
+    '',
+    ...renderEvidenceItems(evidence),
+  ].join('\n');
+}
+
 // Helper to create concise task summary for browsing
 function summarizeTask(c: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -344,11 +654,78 @@ function summarizeTask(c: Record<string, unknown>): Record<string, unknown> {
     projectId: c.project ? (c.project as Record<string, unknown>).id : null,
     projectTitle: c.project ? truncate(String((c.project as Record<string, unknown>).title || ''), 50) : null,
     aiScore: c.aiRecommendation ? (c.aiRecommendation as Record<string, unknown>).score : null,
+    claimable: c.claimable,
+    ...(typeof c.claimBlockedBy === 'string' ? { claimBlockedBy: c.claimBlockedBy } : {}),
   };
 }
 
 // Define tools
 const TOOLS = [
+  // ============================================
+  // CLAIM LEDGER TOOLS
+  // ============================================
+  {
+    name: 'list_open_questions',
+    description:
+      'Use when choosing what the project still needs answered or inspecting its question decomposition. Unlike get_claim_state, this scans one project and returns up to 50 published questions with one level of PART_OF children; status defaults to open.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'integer', minimum: 1, description: 'The project whose published questions to list.' },
+        status: { type: 'string', enum: ['open', 'answered', 'all'], description: 'Question state filter (default: open).' },
+      },
+      required: ['projectId'],
+    },
+  },
+  {
+    name: 'get_claim_state',
+    description:
+      'Use when deciding how one claim currently stands before citing, challenging, or extending it. Unlike find_evidence, this returns the claim core, human review state, the full structurally derived epistemic state, and both evidence stances; it never invents falsifiers.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        signalId: { type: 'integer', minimum: 1, description: 'Numeric signal id for the claim.' },
+      },
+      required: ['signalId'],
+    },
+  },
+  {
+    name: 'find_evidence',
+    description:
+      'Use when gathering the authored evidence linked to one claim, optionally narrowed by stance. Unlike get_claim_state, this is the focused evidence lookup: support includes EVIDENCE_FOR, REPRODUCES, and ANSWERS; opposition includes CONTRADICTS and REFUTES.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        signalId: { type: 'integer', minimum: 1, description: 'Numeric signal id for the claim.' },
+        stance: { type: 'string', enum: ['for', 'against', 'all'], description: 'Evidence stance filter (default: all).' },
+      },
+      required: ['signalId'],
+    },
+  },
+  {
+    name: 'propose_evidence_link',
+    description:
+      'Use when you have a concrete typed relation to add to a claim and want a human to attest it. Unlike link_context, this never writes an edge directly: it always queues a PENDING EDGE_ADD proposal after validating the claim-relation vocabulary.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        signalId: { type: 'integer', minimum: 1, description: 'The subject claim or question.' },
+        kind: {
+          type: 'string',
+          enum: ['EVIDENCE_FOR', 'CONTRADICTS', 'REPRODUCES', 'ANSWERS', 'REFUTES', 'SUPERSEDES', 'PART_OF', 'DEPENDS_ON'],
+          description: 'Authored relation kind; orientation follows Moment’s claim vocabulary.',
+        },
+        targetType: {
+          type: 'string',
+          enum: ['PAGE', 'RESOURCE', 'SESSION_NOTE', 'SUBMISSION', 'DISCUSSION', 'SIGNAL'],
+          description: 'Type of the relation’s other endpoint.',
+        },
+        targetId: { type: 'integer', minimum: 1, description: 'Numeric id of the relation’s other endpoint.' },
+        note: { type: 'string', maxLength: 500, description: 'Optional reviewer-facing reason this relation holds.' },
+      },
+      required: ['signalId', 'kind', 'targetType', 'targetId'],
+    },
+  },
   // ============================================
   // TASK TOOLS (Unified Model)
   // These tools use the unified Task model
@@ -357,7 +734,7 @@ const TOOLS = [
   {
     name: 'get_tasks',
     description:
-      'Get tasks available for AI. Returns work items with clear AI eligibility signals (canAI field). This is the preferred way to find work - tasks marked canAI=true are AI-appropriate. Optionally pass a query to find tasks semantically related to what you want to work on (e.g. your specialty), instead of the default credits/priority ranking.',
+      'Get AI-eligible tasks. Prefer claimable=true for work this key can take now; otherwise read each task\'s claimable and claimBlockedBy fields before claim_task. The default remains unfiltered. Optionally pass a query to rank tasks by semantic relevance.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -395,6 +772,10 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: natural-language description of what you want to work on; tasks are ranked by semantic relevance instead of credits/priority',
         },
+        claimable: {
+          type: 'boolean',
+          description: 'Set true to return only tasks this authenticated key can claim now',
+        },
       },
       required: [],
     },
@@ -402,13 +783,14 @@ const TOOLS = [
   {
     name: 'claim_task',
     description:
-      'Claim a task to start working on it. Use the ID from get_tasks. Returns claim details and next steps.',
+      'Claim a task to start working on it. Use the ID from get_tasks. LIMIT: you may hold at most 20 claims in a rolling 24 hours — over the cap this returns a 429 carrying limit/used/retryAfter, so finish what you hold before claiming more. Claiming needs EDITOR access to the project. Returns claim details and next steps.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         taskId: {
-          type: 'number',
-          description: 'The ID of the task to claim',
+          type: 'integer',
+          minimum: 1,
+          description: 'The ID of the task to claim (from get_tasks)',
         },
       },
       required: ['taskId'],
@@ -432,26 +814,32 @@ const TOOLS = [
   {
     name: 'submit_task',
     description:
-      'Submit completed task work. Required: taskId, reasoning, confidenceScore; include output for JSON work or prUrl for code work. Optional campaign measurements are filed as REPORTED on approval; steward verification is separate, and you must never claim reported measurements move campaign dials. Returns the submission record for review.',
+      'Submit completed task work. Required: taskId, reasoning (MINIMUM 100 characters), confidenceScore (MINIMUM 0.3, maximum 1.0 — below 0.3 means do not submit, post a `question` contribution instead); include output for JSON work or prUrl for code work. You must already hold an open claim on the task. Optional campaign measurements are filed as REPORTED on approval; steward verification is separate, and you must never claim reported measurements move campaign dials. Returns the submission record for review.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         taskId: {
-          type: 'number',
+          type: 'integer',
+          minimum: 1,
           description: 'The ID of the task',
         },
         output: {
           type: 'object',
-          description: 'Your structured output (for non-code work)',
+          description:
+            'Your structured output (for non-code work). At least 2 keys as an object, or at least 200 characters if you send a string. Required unless you send prUrl.',
         },
         reasoning: {
           type: 'string',
+          minLength: 100,
           description:
-            'Reviewer-facing rationale: approach, sources, rejected alternatives, caveats, and next steps. Cite concrete ids, links, files, or commands where relevant.',
+            'Reviewer-facing rationale, MINIMUM 100 CHARACTERS: approach, sources, rejected alternatives, caveats, and next steps. Cite concrete ids, links, files, or commands where relevant. Shorter submissions are rejected.',
         },
         confidenceScore: {
           type: 'number',
-          description: 'Your confidence 0.3-1.0',
+          minimum: 0.3,
+          maximum: 1.0,
+          description:
+            'Your confidence in this output, 0.3 to 1.0. The floor is enforced: a value below 0.3 is rejected, because it means you are not confident enough to submit — leave the claim open and post a `question` contribution instead.',
         },
         prUrl: {
           type: 'string',
@@ -515,26 +903,32 @@ const TOOLS = [
   {
     name: 'submit_task_pr',
     description:
-      'Register a pull request for a code-contribution task. Required: taskId, prUrl, reasoning. Optional campaign measurements are filed as REPORTED on approval; steward verification is separate, and you must never claim reported measurements move campaign dials. Returns PR submission status for review.',
+      'Register a pull request for a CODE_CONTRIBUTION task (any other workType is rejected — use submit_task, which also accepts a prUrl). Required: taskId, prUrl, reasoning (MINIMUM 100 characters, maximum 10000). The PR must already exist on GitHub, target the project repo and the task branch, and stay inside the task file scope. Optional campaign measurements are filed as REPORTED on approval; steward verification is separate, and you must never claim reported measurements move campaign dials. Returns PR submission status for review.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         taskId: {
-          type: 'number',
+          type: 'integer',
+          minimum: 1,
           description: 'The ID of the task',
         },
         prUrl: {
           type: 'string',
-          description: 'The GitHub pull request URL',
+          description: 'The GitHub pull request URL, e.g. https://github.com/owner/repo/pull/123',
         },
         reasoning: {
           type: 'string',
+          minLength: 100,
+          maxLength: 10000,
           description:
-            'Reviewer-facing implementation notes: approach, alternatives rejected, edge cases handled, tests, and follow-up watch-outs. Cite files, commands, and ids.',
+            'Reviewer-facing implementation notes, MINIMUM 100 CHARACTERS: approach, alternatives rejected, edge cases handled, tests, and follow-up watch-outs. Cite files, commands, and ids.',
         },
         confidenceScore: {
           type: 'number',
-          description: 'Optional confidence score 0.0-1.0',
+          minimum: 0,
+          maximum: 1.0,
+          description:
+            'Optional confidence score, 0.0 to 1.0. Note this endpoint has NO 0.3 floor (submit_task does) because the PR itself is the reviewable artifact.',
         },
         completionReport: {
           type: 'object',
@@ -618,6 +1012,27 @@ const TOOLS = [
     },
   },
   {
+    name: 'report_campaign_progress',
+    description:
+      'Report evidence against a campaign target. Measurements file as REPORTED pending steward verification; committed targets appear in get_project_context.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        campaignSlug: { type: 'string', description: 'The campaign slug' },
+        targetId: { type: 'integer', minimum: 1, description: 'Campaign target ID' },
+        value: { type: 'number', description: 'Finite reported measurement value' },
+        projectId: {
+          type: 'integer',
+          minimum: 1,
+          description: 'Optional producing project ID (directly enlisted or a one-level child)',
+        },
+        note: { type: 'string', maxLength: 2000 },
+        evidenceUrl: { type: 'string', format: 'uri', maxLength: 500 },
+      },
+      required: ['campaignSlug', 'targetId', 'value'],
+    },
+  },
+  {
     name: 'get_task_pr_status',
     description:
       'Check the PR review status for a task that has a submitted pull request.',
@@ -690,7 +1105,7 @@ const TOOLS = [
   {
     name: 'contribute',
     description:
-      'The canonical way to add findings/observations/hypotheses/messages — make a quick contribution to a project: post a message or share an insight. No claim needed - just share what you\'ve discovered.',
+      'The canonical way to add findings/observations/hypotheses/messages — make a quick contribution to a project: post a message or share an insight. No claim needed - just share what you\'ve discovered. `type` is CASE-INSENSITIVE here and in create_insight, so a value copied between the two tools always works.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -700,8 +1115,18 @@ const TOOLS = [
         },
         type: {
           type: 'string',
-          enum: ['message', 'observation', 'hypothesis', 'question', 'finding', 'suggestion'],
-          description: 'Type of contribution',
+          // Both casings are enumerated on purpose. create_insight's enum is
+          // UPPERCASE and this one's canonical form is lowercase; a cold agent
+          // copying a value from one tool into the other used to hit a schema
+          // violation it had no way to predict. Listing both makes that
+          // impossible rather than merely documented — the server lowercases
+          // before mapping, so the two spellings are the same contribution.
+          enum: [
+            'message', 'observation', 'hypothesis', 'question', 'finding', 'suggestion',
+            'MESSAGE', 'OBSERVATION', 'HYPOTHESIS', 'QUESTION', 'FINDING', 'SUGGESTION',
+          ],
+          description:
+            'Type of contribution. Case-insensitive: `finding` and `FINDING` are the same value (create_insight uses the UPPERCASE spelling for the same concept).',
         },
         content: {
           type: 'string',
@@ -822,7 +1247,7 @@ const TOOLS = [
   {
     name: 'bootstrap_project',
     description:
-      "The fastest cold-start: ONE idempotent call that opens a project AND seeds its brief — create (or reuse an existing same-title project owned by your creator) + an opening page + resources + a handoff/session note. Collapses create_project + upsert_page + add_resource + log_session into a single round-trip. Re-running with the same title reuses the project and applies the writes onto it (no duplicate). Prefer this over the 4 separate calls when starting a project from scratch.",
+      "START HERE if you are new to a project.\nThe fastest cold-start: ONE idempotent call that opens a project AND seeds its brief — create (or reuse an existing same-title project owned by your creator) + an opening page + resources + a handoff/session note. Collapses create_project + upsert_page + add_resource + log_session into a single round-trip. Re-running with the same title reuses the project and applies the writes onto it (no duplicate). Prefer this over the 4 separate calls when starting a project from scratch.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -883,18 +1308,21 @@ const TOOLS = [
   {
     name: 'get_project_context',
     description:
-      'Read one known project. Required: projectId. Defaults to view=brief (handoff + page manifest + protocol); view=full opts into everything (page bodies, tasks, discussions, team); view=spinup is the lean cold-start. Use explore before you know the project, or search_context to find specific nodes by meaning.',
+      'START HERE if you are new to a project.\nRead one known project. Required: projectId. This tool defaults to view=brief (handoff + page manifest + protocol) to protect your context window; view=full opts into everything (page bodies, tasks, discussions, team), with its structured JSON twin capped to an approximate 7,000-token budget; view=spinup is the lean cold-start. NOTE the raw HTTP endpoint GET /api/v1/agents/projects/{id}/context defaults to view=full instead — this tool deliberately differs, and every response echoes the view it served. Use explore before you know the project, or search_context to find specific nodes by meaning.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         projectId: {
-          type: 'number',
+          type: 'integer',
+          minimum: 1,
           description: 'The ID of the project to get context for',
         },
         view: {
           type: 'string',
           enum: ['spinup', 'brief', 'full'],
-          description: "Optional: 'brief' for handoff plus manifests (default), 'full' for everything, 'spinup' for a lean cold-start.",
+          default: 'brief',
+          description:
+            "Optional: 'brief' for handoff plus manifests (THIS TOOL'S DEFAULT), 'full' for everything, 'spinup' for a lean cold-start. The HTTP endpoint's default is 'full' — pass this explicitly if you care.",
         },
       },
       required: ['projectId'],
@@ -988,7 +1416,7 @@ const TOOLS = [
   {
     name: 'upsert_page',
     description:
-      'Add or update one markdown page in a project brief. Required: projectId, title, body. Use a stable slug for updates; use upload_image first for embeddable images. Returns the created/updated page.',
+      'Add or update one markdown page in a project brief. Required: projectId, title, body. Use a stable slug for updates; use upload_image first for embeddable images. Returns the created/updated page. Without EDITOR standing, the write queues as a 202 proposal, signaled by `{queued:true, proposal:{...}}` instead of a `page` result.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1043,7 +1471,7 @@ const TOOLS = [
   {
     name: 'add_resource',
     description:
-      'Attach one resolvable artifact URL to a project. Required: projectId, uri. Auto-detects kind/title when omitted; read_resource pulls content later. Use upsert_page for synthesized notes.',
+      'Attach one resolvable artifact URL to a project. Required: projectId, uri. Auto-detects kind/title when omitted; read_resource pulls content later. Use upsert_page for synthesized notes. Without EDITOR standing, the write queues as a 202 proposal, signaled by `{queued:true, proposal:{...}}` instead of a `resource` result.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1069,7 +1497,7 @@ const TOOLS = [
   {
     name: 'ingest',
     description:
-      "Ingest raw multi-fact text such as a transcript, thread, PR narrative, paper text, or pasted note. Required: projectId, text. Returns reviewable page/resource/signal candidates; nothing is published directly. Use add_resource or upsert_page when you already have one typed item.",
+      "Ingest raw multi-fact text such as a transcript, thread, PR narrative, paper text, or pasted note. Required: projectId, text. Returns reviewable page/resource/signal candidates under `proposed`; nothing is published directly. Use add_resource or upsert_page when you already have one typed item. This front door requires EDITOR standing; without it, send typed items through upsert_page/add_resource, whose 202 `{queued:true, proposal:{...}}` response signals editor review.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1245,7 +1673,7 @@ const TOOLS = [
   {
     name: 'create_insight',
     description:
-      'Legacy single-insight writer — prefer `contribute` for new work. Create an insight for a project. Insights are observations, hypotheses, questions, findings, or suggestions about the research.',
+      'Legacy single-insight writer — prefer `contribute` for new work. Create an insight for a project. Insights are observations, hypotheses, questions, findings, or suggestions about the research. `type` is CASE-INSENSITIVE and accepts the same values as `contribute`.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1255,8 +1683,15 @@ const TOOLS = [
         },
         type: {
           type: 'string',
-          enum: ['OBSERVATION', 'HYPOTHESIS', 'QUESTION', 'FINDING', 'SUGGESTION'],
-          description: 'The type of insight',
+          // Mirror of `contribute`: both casings enumerated so a value copied
+          // between the two tools cannot fail validation. Canonical here is
+          // UPPERCASE; the server upper-cases before POSTing either way.
+          enum: [
+            'OBSERVATION', 'HYPOTHESIS', 'QUESTION', 'FINDING', 'SUGGESTION',
+            'observation', 'hypothesis', 'question', 'finding', 'suggestion',
+          ],
+          description:
+            'The type of insight. Case-insensitive: `FINDING` and `finding` are the same value (contribute uses the lowercase spelling for the same concept). Note `message` is NOT an insight type — use contribute(type: "message", discussionId) for that.',
         },
         content: {
           type: 'string',
@@ -1276,6 +1711,11 @@ const TOOLS = [
           items: { type: 'string' },
           description:
             'Up to 5 http(s) URLs backing the claim (papers, datasets, repos, notebooks). Each becomes a cited project resource in the context graph.',
+        },
+        applicabilityConditions: {
+          type: 'string',
+          description:
+            'Optional: the limits under which this claim holds — material, ranges, instrument, conventions, assumptions. Stated, never inferred; shown with the claim wherever it travels.',
         },
       },
       required: ['projectId', 'type', 'content'],
@@ -1393,7 +1833,7 @@ const TOOLS = [
   {
     name: 'compile_context',
     description:
-      "Use this when you're already inside ONE project and want a budgeted, ready-to-read bundle for a specific task — the context compiler. Give a `task` (a question/goal) to seed it semantically and expand along graph links, or a `page` slug to compile that page's neighborhood. (Not search_context, which discovers hits across the WHOLE lab; not get_project_context, which dumps the fixed spin-up brief.) Returns ranked nodes (title + excerpt) within a token budget.",
+      "Use this when you're already inside ONE project and want a budgeted, ready-to-read bundle for a specific task — the context compiler. Give a `task` (a question/goal) to seed it semantically and expand along graph links, or a `page` slug to compile that page — the seed page's FULL body comes first, then neighbors' full bodies in rank order until tokenBudget is spent, then excerpts. (Not search_context, which discovers hits across the WHOLE lab; not get_project_context, which dumps the fixed spin-up brief; for exactly one known page, read_page is cheaper.)",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1402,7 +1842,7 @@ const TOOLS = [
         page: { type: 'string', description: "Optional: a page slug to compile the neighborhood of (instead of / in addition to a task)." },
         depth: { type: 'number', description: 'Hops to expand (1-3, default 2).' },
         tokenBudget: { type: 'number', description: 'Approx token cap for the bundle (default 4000).' },
-        maxNodes: { type: 'number', description: 'Hard cap on nodes in the bundle (default 30, max 100).' },
+        maxNodes: { type: 'number', description: 'Hard cap on nodes in the bundle (default 40, max 100).' },
       },
       required: ['projectId'],
     },
@@ -1473,7 +1913,7 @@ const TOOLS = [
         page: { type: 'string', description: "Optional: a page slug to compile the neighborhood of (instead of / in addition to a task)." },
         depth: { type: 'number', description: 'Hops to expand (1-3, default 2).' },
         tokenBudget: { type: 'number', description: 'Approx token cap for the bundle (default 4000).' },
-        maxNodes: { type: 'number', description: 'Hard cap on nodes in the bundle (default 30, max 100).' },
+        maxNodes: { type: 'number', description: 'Hard cap on nodes in the bundle (default 40, max 100).' },
       },
       required: ['projectId'],
     },
@@ -1507,7 +1947,7 @@ const TOOLS = [
   {
     name: 'link_context',
     description:
-      'Author a TYPED relation between two context nodes — the scientific layer of the graph: SUPERSEDES, REFUTES, CONTRADICTS, EVIDENCE_FOR, DEPENDS_ON, PART_OF, DUPLICATES, ANSWERS, REPRODUCES. Use when one piece of context invalidates, supports, or replaces another (e.g. a new protocol page supersedes the old one; a result note is evidence for a hypothesis page). Authored edges persist until removed (pass remove: true). Prose alternative: write [[supersedes:slug]] in a page body — that edge lives and dies with the text.',
+      'Author a TYPED relation between two context nodes — the scientific layer of the graph: SUPERSEDES, REFUTES, CONTRADICTS, EVIDENCE_FOR, DEPENDS_ON, PART_OF, DUPLICATES, ANSWERS, REPRODUCES. Use when one piece of context invalidates, supports, or replaces another (e.g. a new protocol page supersedes the old one; a result note is evidence for a hypothesis page). Authored edges persist until removed (pass remove: true). Prose alternative: write [[supersedes:slug]] in a page body — that edge lives and dies with the text. Without EDITOR standing, additions queue as a 202 proposal, signaled by `{queued:true, proposal:{...}}` instead of an `edge` result.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1542,16 +1982,80 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
+      case 'list_open_questions': {
+        const { projectId, status } = args as { projectId: number; status?: string };
+        const params = new URLSearchParams();
+        if (status) params.set('status', status);
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        const result = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/questions${suffix}`,
+        ) as Record<string, unknown>;
+        return {
+          content: [{ type: 'text', text: proseFirst(renderQuestionLedger(result), questionPointers(result)) }],
+        };
+      }
+
+      case 'get_claim_state': {
+        const { signalId } = args as { signalId: number };
+        const result = await apiClient.get(
+          `/api/v1/agents/signals/${signalId}/state`,
+        ) as Record<string, unknown>;
+        return {
+          content: [{ type: 'text', text: proseFirst(renderClaimState(result), claimStatePointers(result)) }],
+        };
+      }
+
+      case 'find_evidence': {
+        const { signalId, stance } = args as { signalId: number; stance?: string };
+        const params = new URLSearchParams();
+        if (stance) params.set('stance', stance);
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        const result = await apiClient.get(
+          `/api/v1/agents/signals/${signalId}/evidence${suffix}`,
+        ) as Record<string, unknown>;
+        const items = Array.isArray(result.evidence) ? result.evidence as ClaimEvidenceItem[] : [];
+        return {
+          content: [{
+            type: 'text',
+            text: proseFirst(renderEvidenceSearch(result), {
+              signalId: result.signalId,
+              stance: result.stance,
+              evidence: items.map((item) => ({
+                kind: item.kind, otherType: item.otherType, otherId: item.otherId,
+              })),
+            }),
+          }],
+        };
+      }
+
+      case 'propose_evidence_link': {
+        const { signalId, kind, targetType, targetId, note } = args as {
+          signalId: number;
+          kind: string;
+          targetType: string;
+          targetId: number;
+          note?: string;
+        };
+        const result = await apiClient.post(
+          `/api/v1/agents/signals/${signalId}/evidence-link`,
+          { kind, targetType, targetId, note },
+        ) as { proposal?: { id?: number } };
+        return {
+          content: [{ type: 'text', text: `Queued evidence-link proposal #${result.proposal?.id ?? 'unknown'} for human review.` }],
+        };
+      }
+
       // ============================================
       // TASK TOOL HANDLERS (Unified Model)
       // ============================================
       case 'get_tasks': {
-        const { projectId, workType, difficulty, limit, query } = args as {
+        const { projectId, workType, difficulty, limit, query, claimable } = args as {
           projectId?: number;
           workType?: string;
           difficulty?: string;
           limit?: number;
           query?: string;
+          claimable?: boolean;
         };
 
         const params = new URLSearchParams();
@@ -1560,6 +2064,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (difficulty) params.set('difficulty', difficulty);
         if (limit) params.set('limit', String(limit));
         if (query) params.set('query', query);
+        if (claimable) params.set('claimable', 'true');
 
         const result = await apiClient.get(
           `/api/v1/agents/tasks?${params.toString()}`
@@ -1567,15 +2072,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const tasks = result.tasks || [];
         const summaries = tasks.map(c => summarizeTask(c as Record<string, unknown>));
+        const claimableTasks = summaries.filter((task) => task.claimable === true);
+        const recommended = result.recommended
+          ? summarizeTask(result.recommended as Record<string, unknown>)
+          : claimableTasks[0] || null;
 
         const experiments = (result as any).experiments || [];
         const response: Record<string, unknown> = {
           tasks: summaries,
-          recommended: result.recommended || summaries[0] || null,
+          recommended,
           total: summaries.length,
-          tip: summaries.length > 0
-            ? `Use claim_task(${(summaries[0] as Record<string, unknown>).id}) to start working.`
-            : 'No tasks available. Try explore() to find projects.',
+          tip: claimableTasks.length > 0
+            ? `Use claim_task(${claimableTasks[0].id}) to start working.`
+            : summaries.length > 0
+              ? 'Visible tasks are blocked for this key; read claimBlockedBy or call get_tasks(claimable: true) later.'
+              : 'No tasks available. Try explore() to find projects.',
         };
 
         if (experiments.length > 0) {
@@ -1596,22 +2107,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
       case 'get_task_context': {
         const { taskId } = args as { taskId: number };
 
-        const result = await apiClient.get(
+        const result = (await apiClient.get(
           `/api/v1/agents/tasks/${taskId}/context`
-        ) as { promptInstructions?: string };
+        )) as Record<string, unknown> & { promptInstructions?: string; preview?: boolean };
 
-        // The brief (promptInstructions) leads with what the task asks of you;
-        // the structured object follows for any field you need to parse.
+        // The brief leads with what the task asks of you; a COMPACT pointer
+        // subset follows for the fields prose can't carry. We do NOT re-echo
+        // the whole response — the old code shipped the task content three
+        // times (prose, raw fields, and promptInstructions inside the fence).
         const text = result.promptInstructions
-          ? proseFirst(result.promptInstructions, result)
-          : JSON.stringify(result, null, 2);
+          ? proseFirst(result.promptInstructions, compactTaskContext(result))
+          : proseFirst(renderTaskPreview(result), compactTaskContext(result));
         return {
           content: [{ type: 'text', text }],
         };
@@ -1646,7 +2159,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -1671,7 +2184,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -1691,7 +2204,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           `/api/campaigns/${encodeURIComponent(campaignSlug)}/tasks${query ? `?${query}` : ''}`
         );
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
+        };
+      }
+
+      case 'report_campaign_progress': {
+        const { campaignSlug, targetId, value, projectId, note, evidenceUrl } = args as {
+          campaignSlug: string;
+          targetId: number;
+          value: number;
+          projectId?: number;
+          note?: string;
+          evidenceUrl?: string;
+        };
+        const result = await apiClient.post(
+          `/api/v1/agents/campaigns/${encodeURIComponent(campaignSlug)}/measurements`,
+          { targetId, value, projectId, note, evidenceUrl }
+        );
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -1703,7 +2234,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -1733,7 +2264,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         });
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -1741,7 +2272,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // args already matches the bootstrap request body shape.
         const result = await apiClient.post('/api/v1/agents/projects/bootstrap', args);
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -1762,7 +2293,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -1782,7 +2313,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         let result: unknown;
 
-        if (type === 'message') {
+        // Case-insensitive: `FINDING` (create_insight's spelling) and `finding`
+        // are the same contribution. See the enum comment on the tool schema.
+        const contributionType = String(type ?? '').toLowerCase();
+
+        if (contributionType === 'message') {
           if (!discussionId) {
             return {
               content: [
@@ -1805,7 +2340,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
           );
         } else {
-          // Map simplified types to insight types
+          // Map simplified types to insight types.
           const insightTypeMap: Record<string, string> = {
             observation: 'OBSERVATION',
             hypothesis: 'HYPOTHESIS',
@@ -1813,7 +2348,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             finding: 'FINDING',
             suggestion: 'SUGGESTION',
           };
-          const insightType = insightTypeMap[type] || 'OBSERVATION';
+          const insightType = insightTypeMap[contributionType];
+          // Previously an unrecognized type silently became an OBSERVATION —
+          // the record ended up mislabeled and nobody was told. Say so instead.
+          if (!insightType) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: false,
+                    error: `Unknown contribution type ${JSON.stringify(type)}. Accepted (case-insensitive): message, observation, hypothesis, question, finding, suggestion.`,
+                    code: 'unsupported_value',
+                    param: 'type',
+                    nextStep:
+                      'Resend with one of the accepted values. Use type: "message" (with discussionId) to post to a discussion.',
+                  }),
+                },
+              ],
+              isError: true,
+            };
+          }
 
           result = await apiClient.post(
             `/api/v1/agents/projects/${projectId}/insights`,
@@ -1835,7 +2390,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: JSON.stringify({
               success: true,
               id: res.id || (res.insight as Record<string, unknown>)?.id || (res.message as Record<string, unknown>)?.id,
-              message: `${type} added to project ${projectId}.`,
+              message: `${contributionType} added to project ${projectId}.`,
             }),
           }],
         };
@@ -1939,7 +2494,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -1950,7 +2505,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(result, null, 2),
+              text: JSON.stringify(result),
             },
           ],
         };
@@ -1973,9 +2528,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // doubled the payload. Below the fence we keep only navigational
         // handles (slugs/uris/ids) and small metadata, with page BODIES dropped
         // (slug+title remain so the agent can read a page on demand).
-        const text = context.promptContext
-          ? proseFirst(context.promptContext, compactProjectContext(context))
-          : JSON.stringify(context, null, 2);
+        const text = proseFirst(
+          context.promptContext || 'Project context loaded.',
+          compactProjectContext(context)
+        );
         return {
           content: [{ type: 'text', text }],
         };
@@ -2001,14 +2557,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const query = typeof limit === 'number' ? `?limit=${limit}` : '';
         const rollup = await apiClient.get(
           `/api/v1/agents/whats-new${query}`
-        ) as { promptContext?: string; feed?: unknown[] };
+        ) as {
+          promptContext?: string;
+          feed?: Array<{
+            projectId?: number;
+            title?: string;
+            name?: string;
+            counts?: unknown;
+            latestAt?: string;
+            delta?: { counts?: unknown; latestAt?: string };
+          }>;
+          [key: string]: unknown;
+        };
         // Read the cross-project digest first (promptContext); the structured
         // feed is appended below for when you need per-project fields.
+        const compactRollup = {
+          metadata: rollup.metadata,
+          feed: (rollup.feed || []).map((entry) => ({
+            projectId: entry.projectId,
+            ...(entry.title !== undefined
+              ? { title: entry.title }
+              : entry.name !== undefined
+                ? { name: entry.name }
+                : {}),
+            counts: entry.counts ?? entry.delta?.counts,
+            latestAt: entry.latestAt ?? entry.delta?.latestAt ?? null,
+          })),
+        };
         const text = rollup.promptContext
-          ? proseFirst(rollup.promptContext, rollup)
+          ? proseFirst(rollup.promptContext, compactRollup)
           : proseFirst(
               'Nothing has changed across your projects since you last read them.',
-              rollup
+              compactRollup
             );
         return {
           content: [{ type: 'text', text }],
@@ -2026,9 +2606,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await apiClient.post(
           `/api/v1/agents/projects/${projectId}/session-notes`,
           { note, nextStep, taskId, handoff }
-        );
+        ) as {
+          sessionNote?: { id?: number; taskId?: number | null };
+          handoffRefreshed?: boolean;
+          hint?: string;
+        };
+        const noteId = result.sessionNote?.id;
+        const brief = `Session note #${noteId ?? '?'} recorded.${
+          result.handoffRefreshed ? ' Handoff refreshed.' : ''
+        }`;
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{
+            type: 'text',
+            text: proseFirst(brief, {
+              ok: true,
+              id: noteId,
+              taskId: result.sessionNote?.taskId,
+              handoffRefreshed: result.handoffRefreshed,
+              ...(result.hint ? { hint: result.hint } : {}),
+            }),
+          }],
         };
       }
 
@@ -2046,9 +2643,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await apiClient.post(
           `/api/v1/agents/projects/${projectId}/pages`,
           { title, body, slug, icon, pinned, agentRead, role }
-        );
+        ) as {
+          queued?: boolean;
+          proposal?: { id?: number; kind?: string; summary?: string };
+          page?: { slug?: string; resolvedAt?: string | null };
+          created?: boolean;
+        };
+        const savedSlug = result.page?.slug ?? slug;
+        const brief = result.queued
+          ? `Page '${savedSlug ?? title}' proposed for review${
+              result.proposal?.id ? ` as proposal #${result.proposal.id}` : ''
+            }.`
+          : `Page '${savedSlug ?? title}' saved.`;
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{
+            type: 'text',
+            text: proseFirst(brief, {
+              ok: true,
+              slug: savedSlug,
+              ...(result.created !== undefined ? { created: result.created } : {}),
+              ...(result.page?.resolvedAt !== undefined
+                ? { resolvedAt: result.page.resolvedAt }
+                : {}),
+              ...(result.queued !== undefined ? { queued: result.queued } : {}),
+              ...(result.proposal ? { proposal: result.proposal } : {}),
+            }),
+          }],
         };
       }
 
@@ -2063,7 +2683,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           { base64, filename }
         );
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -2075,7 +2695,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           `/api/v1/agents/projects/${projectId}/resources`,
           { uri, title, kind, summary, accessNote, role, isWorkSurface }
         );
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       }
 
       case 'ingest': {
@@ -2137,7 +2757,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'list_resources': {
         const { projectId } = args as { projectId: number };
         const result = await apiClient.get(`/api/v1/agents/projects/${projectId}/resources`);
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       }
 
       case 'read_resource': {
@@ -2151,7 +2771,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await apiClient.get(
           `/api/v1/agents/projects/${projectId}/resources/${resourceId}${suffix}`
         );
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       }
 
       // search_context (find_context = deprecated alias)
@@ -2160,9 +2780,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { query, projectId, limit } = args as { query: string; projectId?: number; limit?: number };
         const result = await apiClient.post('/api/v1/agents/find-context', { query, projectId, limit }) as {
           results?: ContextHit[];
+          tip?: string;
         };
-        // Render hits as a short labeled list; keep the raw JSON below for fields.
-        const text = proseFirst(renderContextHits(result.results || []), result);
+        // Render hits as a short labeled list; keep only navigation/ranking fields below.
+        const text = proseFirst(renderContextHits(result.results || []), {
+          results: (result.results || []).map((hit) => ({
+            type: hit.type ?? hit.entityType,
+            id: hit.id ?? hit.ref,
+            title: hit.title,
+            projectId: hit.projectId,
+            score: hit.score,
+          })),
+          tip: result.tip,
+        });
         return {
           content: [{ type: 'text', text: withDeprecationNote(name, text) }],
         };
@@ -2177,9 +2807,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await apiClient.post(
           `/api/v1/agents/projects/${projectId}/gather-context`,
           { task, page, depth, tokenBudget, maxNodes }
-        ) as { mode?: string; nodes?: GatherNode[]; tokenEstimate?: number; edgesWalked?: number };
-        // Render the bundle as a ranked, readable list; raw JSON below.
-        const text = proseFirst(renderGatherBundle(result), result);
+        ) as {
+          mode?: string;
+          nodes?: GatherNode[];
+          tokenEstimate?: number;
+          edgesWalked?: number;
+          omitted?: number;
+          [key: string]: unknown;
+        };
+        // Full bodies + excerpts live in the prose render above the fence;
+        // the JSON twin carries ranked node handles (slug → read_page).
+        const { nodes, ...bundleMetadata } = result;
+        const text = proseFirst(renderGatherBundle(result), {
+          ...bundleMetadata,
+          omitted: result?.omitted,
+          nodes: (nodes || []).map((node) => ({
+            type: node.type,
+            id: node.id,
+            title: node.title,
+            slug: node.slug,
+            fullBodyIncluded: typeof node.body === 'string' ? true : undefined,
+            score: node.score,
+            taskSim: node.taskSim,
+            hop: node.hop,
+            viaKinds: node.viaKinds,
+            projectId: node.projectId,
+          })),
+        });
         return {
           content: [{ type: 'text', text: withDeprecationNote(name, text) }],
         };
@@ -2237,21 +2891,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await apiClient.get(
           `/api/v1/agents/projects/${projectId}/graph?page=${encodeURIComponent(page)}`
         );
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       }
 
       case 'read_page': {
         const { projectId, slug } = args as { projectId: number; slug: string };
         const result = await apiClient.get(
           `/api/v1/agents/projects/${projectId}/pages/${encodeURIComponent(slug)}`
-        ) as { page?: { slug?: string; title?: string; body?: string; agentRead?: boolean; pinned?: boolean } };
+        ) as {
+          page?: {
+            slug?: string;
+            title?: string;
+            body?: string;
+            role?: string;
+            pinned?: boolean;
+            agentRead?: boolean;
+            updatedAt?: string;
+          };
+        };
         // Prose-first: lead with the page's title + full markdown body, then the
-        // structured object below the fence for any field you need to parse.
+        // metadata below the fence for fields that are not already in the prose.
         const pg = result.page;
         const brief = pg
           ? `# ${pg.title || pg.slug || slug}\n\n${pg.body || '(empty page)'}`
           : `No page found for slug "${slug}" in project ${projectId}.`;
-        return { content: [{ type: 'text', text: proseFirst(brief, result) }] };
+        return {
+          content: [{
+            type: 'text',
+            text: proseFirst(brief, {
+              slug: pg?.slug,
+              title: pg?.title,
+              role: pg?.role,
+              pinned: pg?.pinned,
+              agentRead: pg?.agentRead,
+              updatedAt: pg?.updatedAt,
+            }),
+          }],
+        };
       }
 
       case 'link_context': {
@@ -2266,7 +2942,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           note,
           remove,
         });
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       }
 
       // import_context (build_context = deprecated alias) — a WRITE tool.
@@ -2291,7 +2967,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(context.recentDiscussions || [], null, 2),
+              text: JSON.stringify(context.recentDiscussions || []),
             },
           ],
         };
@@ -2315,7 +2991,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(result, null, 2),
+              text: JSON.stringify(result),
             },
           ],
         };
@@ -2344,37 +3020,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(result, null, 2),
+              text: JSON.stringify(result),
             },
           ],
         };
       }
 
       case 'create_insight': {
-        const { projectId, type, content, confidence, supportingEvidence, evidenceLinks } = args as {
+        const {
+          projectId,
+          type,
+          content,
+          confidence,
+          supportingEvidence,
+          evidenceLinks,
+          applicabilityConditions,
+        } = args as {
           projectId: number;
           type: string;
           content: string;
           confidence?: number;
           supportingEvidence?: string;
           evidenceLinks?: string[];
+          applicabilityConditions?: string;
         };
 
+        // Case-insensitive, mirroring `contribute` — the API wants UPPERCASE.
         const result = await apiClient.post(
           `/api/v1/agents/projects/${projectId}/insights`,
           {
-            type,
+            type: String(type ?? '').toUpperCase(),
             content,
             confidence,
             supportingEvidence,
             evidenceLinks,
+            applicabilityConditions,
           }
         );
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(result, null, 2),
+              text: JSON.stringify(result),
             },
           ],
         };
@@ -2387,7 +3074,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await apiClient.get('/api/v1/agents/experiments');
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -2399,7 +3086,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -2436,7 +3123,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -2448,7 +3135,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
@@ -2471,11 +3158,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Handle list resources (for project context as resources)
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  return { resources: [] };
+  return {
+    resources: [{
+      uri: START_HERE_URI,
+      name: 'Moment start here',
+      description: 'Cold-agent orientation: first calls, error recovery, and write tiers.',
+      mimeType: 'text/markdown',
+    }],
+  };
 });
 
-server.setRequestHandler(ReadResourceRequestSchema, async () => {
-  return { contents: [] };
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  if (request.params.uri !== START_HERE_URI) {
+    throw new Error(`Unknown resource: ${request.params.uri}`);
+  }
+  return {
+    contents: [{
+      uri: START_HERE_URI,
+      mimeType: 'text/markdown',
+      text: START_HERE_TEXT,
+    }],
+  };
 });
 
 // Start server

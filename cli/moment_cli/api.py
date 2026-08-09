@@ -173,6 +173,13 @@ class MomentApiClient:
         """Full page bodies (the context endpoint only returns excerpts for non-agentRead pages)."""
         return self.get(f"/api/v1/agents/projects/{project_id}/pages")
 
+    def read_page(self, project_id: int, slug: str) -> dict:
+        """One page's full markdown body by slug — the read twin of upsert_page."""
+        from urllib.parse import quote
+
+        slug_q = quote(slug, safe="")
+        return self.get(f"/api/v1/agents/projects/{project_id}/pages/{slug_q}")
+
     def log_session(self, project_id: int, payload: dict) -> dict:
         return self.post(f"/api/v1/agents/projects/{project_id}/session-notes", payload)
 
@@ -198,6 +205,23 @@ class MomentApiClient:
     def gather_context(self, project_id: int, payload: dict) -> dict:
         """Compile a budgeted bundle of related context for a task/page (the context compiler)."""
         return self.post(f"/api/v1/agents/projects/{project_id}/gather-context", payload)
+
+    def compile_packet(self, project_id: int, payload: dict) -> dict:
+        """Compile a Research Context Packet — inspectable, budgeted evidence for one question."""
+        return self.post(f"/api/v1/agents/projects/{project_id}/packet", payload)
+
+    def save_packet(self, project_id: int, packet: dict) -> dict:
+        """Freeze a compiled packet as an immutable snapshot (needs edit access). Returns its metadata."""
+        return self.post(f"/api/v1/agents/projects/{project_id}/packets", {"packet": packet})
+
+    def list_packets(self, project_id: int, limit: Optional[int] = None) -> dict:
+        """Saved packet snapshots for one project, newest first."""
+        qs = f"?limit={limit}" if limit is not None else ""
+        return self.get(f"/api/v1/agents/projects/{project_id}/packets{qs}")
+
+    def get_packet(self, project_id: int, packet_id: int) -> dict:
+        """One saved snapshot, including its frozen evidence."""
+        return self.get(f"/api/v1/agents/projects/{project_id}/packets/{packet_id}")
 
     def get_page_graph(self, project_id: int, page: str) -> dict:
         """A page's typed context-graph edges — backlinks + forward links."""
