@@ -122,10 +122,10 @@ def case1_no_binding() -> None:
     # one — auth needs a resolved key + a reachable API; project needs a bound
     # projectId. api-key and api-reach are each independently evaluated (a key
     # can resolve from env/home with no .moment.json at all; api-reach always
-    # probes *some* URL, defaulting to localhost:3000 when nothing else is
+    # probes *some* URL, defaulting to the cloud API when nothing else is
     # configured). So with no .moment.json AND an env key present: binding fails,
     # api-key still resolves (ok), api-reach still runs (against an explicit
-    # unused-port override here, so it never touches the real localhost:3000 dev
+    # unused-port override here, so it never touches the real cloud API
     # server) and fails, and only auth/project — the two checks with a real
     # prerequisite — skip.
     cwd, home = _mkdirs("nocfg")

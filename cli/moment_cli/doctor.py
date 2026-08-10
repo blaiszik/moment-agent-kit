@@ -112,7 +112,7 @@ def run_doctor(
         results.append(CheckResult("api-key", "fail", f"config error: {exc}"))
 
     # Effective URL for reachability: resolved cfg wins, else override / binding / default.
-    probe_url = (cfg.api_url if cfg else None) or api_url_override or binding_url or "http://localhost:3000"
+    probe_url = (cfg.api_url if cfg else None) or api_url_override or binding_url or "https://www.scientific-intelligence.com"
     probe_url = probe_url.rstrip("/")
 
     # --- 3. api-reach: GET the API root with a short timeout. ---

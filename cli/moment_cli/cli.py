@@ -176,7 +176,7 @@ def _default_api_url(api_url: Optional[str] = None) -> str:
         or _state.get("api_url")
         or os.environ.get("MOMENT_API_URL")
         or os.environ.get("MOMENT_MCP_API_URL")
-        or "http://localhost:3000"
+        or "https://www.scientific-intelligence.com"
     ).rstrip("/")
 
 

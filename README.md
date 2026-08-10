@@ -131,7 +131,7 @@ moment-agent-kit/
 | What | Where it goes |
 |------|----------------|
 | API key (secret) | `~/.moment.json` (`moment auth login`), or `MOMENT_API_KEY`, or `--api-key` flag |
-| API base URL | `MOMENT_API_URL` / `--api-url` (CLI default: `http://localhost:3000`; MCP default: `https://www.scientific-intelligence.com`) |
+| API base URL | `MOMENT_API_URL` / `--api-url` (default: `https://www.scientific-intelligence.com`) |
 | Per-repo project binding (non-secret) | a committed `.moment.json` → `{ "projectId": N, "apiUrl": "…" }` |
 
 **Never commit a secret.** `.moment.json` is for the non-secret `projectId`/`apiUrl` binding
@@ -140,13 +140,13 @@ only; the key lives in `~/.moment.json` or the environment. The CLI warns if it 
 
 ## Cloud vs local
 
-The MCP server defaults to the cloud instance (`https://www.scientific-intelligence.com`),
-but the CLI defaults to a local dev server (`http://localhost:3000`). Set `MOMENT_API_URL` or
-pass `--api-url` whenever the CLI should use the other environment:
+Both the MCP server and CLI default to the cloud instance
+(`https://www.scientific-intelligence.com`). Set `MOMENT_API_URL` or pass `--api-url` explicitly
+for local development:
 
 | Transport | Use cloud | Use local |
 |-----------|-----------|-----------|
-| **CLI** | `export MOMENT_API_URL=https://www.scientific-intelligence.com` | `moment --api-url http://localhost:3000 …`, or `export MOMENT_API_URL=http://localhost:3000` |
+| **CLI** | `moment …` | `moment --api-url http://localhost:3000 …`, or `export MOMENT_API_URL=http://localhost:3000` |
 | **MCP** | call the `moment` server | call the `moment-local` server (both are in `.mcp.json.example`, each with its own `--api-url`) |
 | **Skill** | `/moment`, `/burn` | same skills — they inherit whichever transport/env you configured above |
 

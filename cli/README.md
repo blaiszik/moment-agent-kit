@@ -25,16 +25,16 @@ moment auth login --key YOUR_MOMENT_API_KEY   # writes ~/.moment.json (secret)
 moment auth whoami                            # confirm the key resolves
 ```
 
-With no explicit target, the CLI falls back to `http://localhost:3000` (a local dev
-server). To target the cloud instance, set `MOMENT_API_URL=https://www.scientific-intelligence.com`
-or pass the global `--api-url` flag.
+With no explicit target, the CLI uses the cloud instance
+`https://www.scientific-intelligence.com`. For local development, explicitly set
+`MOMENT_API_URL=http://localhost:3000` or pass the global `--api-url` flag.
 
 ### Cloud vs local
 
 ```bash
-moment --api-url https://www.scientific-intelligence.com activity   # one-off against the cloud
-moment -p 42 orient                                                 # localhost:3000 fallback
-export MOMENT_API_URL=https://www.scientific-intelligence.com       # or make it sticky for the shell session
+moment activity                                                     # cloud fallback
+moment --api-url http://localhost:3000 -p 42 orient                # one-off against local development
+export MOMENT_API_URL=http://localhost:3000                        # or make local development sticky for the shell session
 ```
 
 An explicit `--api-url` wins over the environment. Your local server has its own seeded

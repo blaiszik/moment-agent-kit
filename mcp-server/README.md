@@ -177,7 +177,7 @@ npm run dev
 # Build
 npm run build
 
-# Run directly
+# Run directly against a local development server (explicit override)
 node dist/index.js --api-key your-key --api-url http://localhost:3000
 ```
 
