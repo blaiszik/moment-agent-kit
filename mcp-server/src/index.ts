@@ -1331,7 +1331,7 @@ const TOOLS = [
   {
     name: 'get_team_context',
     description:
-      'Read a persistent Team (a standing group of researchers). Required: team (the team slug). Returns a ready-to-read brief — who is on the team, its mission, what projects it works on (with handoff highlights for projects you can access), what skills it needs, and recent record activity; the structured JSON follows below it. Use get_project_context to read one of the team\'s projects in full.',
+      'Read a persistent Team (a standing group of researchers). Required: team (the team slug). Returns a ready-to-read brief — who is on the team, its mission, what projects it works on (with handoff highlights for projects you can access), what skills it needs, and recent record activity; the structured JSON follows below it. For a FOUNDING team (vs the simpler default CREW kind) the brief and structured JSON also carry its charter (thesis, stage, commitment, links), open roles it is looking to fill, milestone progress (next due + done/total), and its most recent recorded decisions. Use get_project_context to read one of the team\'s projects in full, or list_team_open_roles to search for open roles across teams.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1341,6 +1341,29 @@ const TOOLS = [
         },
       },
       required: ['team'],
+    },
+  },
+  {
+    name: 'list_team_open_roles',
+    description:
+      "Discover open roles on public teams — the groups actively recruiting co-founders, leads, members, advisors, or mentors. Leave every argument off to browse the whole seat map; pass team to scope to one team's roles, skill to filter by a skill token, or kind to see only FOUNDING teams (the ones building toward something durable, with a charter) or only CREW teams (the simpler default kind). Each result carries the team's slug/name/stage, the role's title/kind/commitment/skills/description, and a joinUrl (/teams/<slug>) to hand a human who wants to apply.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        team: {
+          type: 'string',
+          description: 'Optional: scope to one team by slug.',
+        },
+        skill: {
+          type: 'string',
+          description: 'Optional: filter to roles matching this skill (normalized token match, e.g. "python" or "ml").',
+        },
+        kind: {
+          type: 'string',
+          enum: ['CREW', 'FOUNDING', 'ALL'],
+          description: 'Optional: restrict to one team kind. ALL (the default) covers the whole seat map.',
+        },
+      },
     },
   },
   {
@@ -2549,6 +2572,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           : proseFirst(context.brief ?? '', context.structured ?? context);
         return {
           content: [{ type: 'text', text }],
+        };
+      }
+
+      case 'list_team_open_roles': {
+        const { team, skill, kind } = args as { team?: string; skill?: string; kind?: string };
+        const params = new URLSearchParams();
+        if (team) params.set('slug', team);
+        if (skill) params.set('skill', skill);
+        if (kind) params.set('kind', kind);
+        const query = params.toString();
+        const result = await apiClient.get(
+          `/api/v1/agents/teams/open-roles${query ? `?${query}` : ''}`
+        );
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result) }],
         };
       }
 
