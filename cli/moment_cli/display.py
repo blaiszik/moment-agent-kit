@@ -377,7 +377,7 @@ def render_brief(payload: dict, quiet: bool = False) -> None:
     if quiet:
         return
 
-    # Must read — pinned / agentRead pages with clamped bodies (§S2).
+    # Must read — pinned pages with clamped bodies (§S2).
     must_read = payload.get("mustRead") or []
     if must_read:
         mr_items: list[Any] = []
@@ -420,7 +420,7 @@ def render_brief(payload: dict, quiet: bool = False) -> None:
         table.add_column("Must-read", justify="center")
         for pg in pages:
             table.add_row(pg.get("slug", ""), pg.get("title", ""),
-                          "✓" if pg.get("agentRead") else "")
+                          "✓" if pg.get("pinned") else "")
         console.print(table)
 
     # 6. Resources manifest (ids feed `moment read-resource`).

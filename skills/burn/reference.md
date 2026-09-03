@@ -57,7 +57,7 @@ Enrich the context graph:
 
 ```text
 add_resource(projectId, uri, title?, kind?, summary?, role?) -> attach one resolvable artifact
-upsert_page(projectId, title, body, slug?, icon?, pinned?, agentRead?) -> add/update a markdown page
+upsert_page(projectId, title, body, slug?, icon?, pinned?) -> add/update a markdown page
 upload_image(projectId, base64, filename?) -> host an image and return an embed URL
 import_context(projectId, source?) -> write tool that seeds a thin repo-linked project from a repo/README
 ```
@@ -124,7 +124,7 @@ REST fallback is a last resort. Read `.mcp.json` for `--api-key=` and send `Auth
 
 4. Enrich the context graph.
    - `add_resource` every load-bearing artifact you used or discovered: paper, dataset, repo, doc.
-   - `upsert_page` lasting reference you produced: findings, architecture, runbook. Use `agentRead:true` for
+   - `upsert_page` lasting reference you produced: findings, architecture, runbook. Use `pinned:true` for
      must-know material. Embed plots with `upload_image` then `![](url)`.
    - `import_context(projectId)` when a linked repo has little or no project context yet. It mutates the project.
 
@@ -137,7 +137,7 @@ REST fallback is a last resort. Read `.mcp.json` for `--api-key=` and send `Auth
 6. Close out.
    - Always send `note` and `taskId`.
    - Send a `handoff` patch only when project state or next step changed.
-   - Durable gotchas or conventions belong in an `agentRead` page, not only in a session note.
+   - Durable gotchas or conventions belong in a `pinned` (must-read) page, not only in a session note.
 
 7. Continue or exit.
    - `--loop` or remaining count: repeat from get work. Otherwise exit with a summary.
@@ -194,7 +194,7 @@ handoff: {
 - Need to read an artifact: `read_resource(projectId, resourceId)` returns full text by default; use
   `fidelity:"preview"` or `section` for less.
 - Used or found an artifact: `add_resource` it. Resources are pointers, not copies, and dedup into the graph.
-- Produced lasting reference: `upsert_page` it; `agentRead:true` for must-know material. Use `upload_image` for plots.
+- Produced lasting reference: `upsert_page` it; `pinned:true` for must-know material. Use `upload_image` for plots.
 - Thin linked repo brief: `import_context(projectId)` to auto-populate from the repo.
 
 ## Work Type Handlers

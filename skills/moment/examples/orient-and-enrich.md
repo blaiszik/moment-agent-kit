@@ -21,7 +21,7 @@ compile_context(projectId: 15, task: "retraction lint design")   # budgeted neig
 add_resource(projectId: 15, uri: "https://github.com/owner/retraction-db",
              summary: "Authoritative retraction list used by the lint")
 upsert_page(projectId: 15, title: "Retraction-lint design",
-            slug: "retraction-lint-design", agentRead: true,
+            slug: "retraction-lint-design", pinned: true,
             body: "## Approach\n...\n![plot](<url from upload_image>)")
 link_context(projectId: 15, srcType: "PAGE", srcRef: "retraction-lint-design",
              dstType: "PAGE", dstRef: "old-lint-notes", kind: "SUPERSEDES")

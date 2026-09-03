@@ -207,7 +207,7 @@ function compactProjectContext(ctx: Record<string, unknown>): Record<string, unk
   const asArray = (v: unknown): Record<string, unknown>[] =>
     Array.isArray(v) ? (v as Record<string, unknown>[]) : [];
   const pages = asArray(ctx.pages).map((p) => ({
-    slug: p.slug, title: p.title, agentRead: p.agentRead, pinned: p.pinned,
+    slug: p.slug, title: p.title, pinned: p.pinned,
     ...(typeof p.body === 'string' && p.body.length > 0
       ? { truncated: true, bodyTruncated: true }
       : {}),
@@ -1691,7 +1691,7 @@ const TOOLS = [
             title: { type: 'string' },
             body: { type: 'string', description: 'Inline markdown (supports ![](url) and YouTube)' },
             slug: { type: 'string', description: 'Stable slug to update in place later' },
-            agentRead: { type: 'boolean', description: 'Pull into every agent\'s context (must-read)' },
+            pinned: { type: 'boolean', description: 'Must-read: top of the human nav and pulled in full into every agent\'s orient' },
           },
           required: ['title', 'body'],
         },
@@ -1909,11 +1909,10 @@ const TOOLS = [
           type: 'string',
           description: 'Optional lucide icon name (e.g. "book", "wrench", "flask-conical")',
         },
-        pinned: { type: 'boolean', description: 'Pin the page to the top of the human nav' },
-        agentRead: {
+        pinned: {
           type: 'boolean',
           description:
-            "Make this a page agents always read in full — it's pulled into every agent's project context (use for architecture, conventions, must-know constraints).",
+            "Make this the must-read page: it sits at the top of the human nav AND is pulled in full into every agent's orient (use for architecture, conventions, must-know constraints).",
         },
         role: {
           type: 'string',
@@ -3310,19 +3309,18 @@ async function dispatchTool(
       }
 
       case 'upsert_page': {
-        const { projectId, title, body, slug, icon, pinned, agentRead, role } = args as {
+        const { projectId, title, body, slug, icon, pinned, role } = args as {
           projectId: number;
           title: string;
           body: string;
           slug?: string;
           icon?: string;
           pinned?: boolean;
-          agentRead?: boolean;
           role?: string;
         };
         const result = await apiClient.post(
           `/api/v1/agents/projects/${projectId}/pages`,
-          { title, body, slug, icon, pinned, agentRead, role }
+          { title, body, slug, icon, pinned, role }
         ) as {
           queued?: boolean;
           proposal?: { id?: number; kind?: string; summary?: string };
@@ -3704,7 +3702,6 @@ async function dispatchTool(
             body?: string;
             role?: string;
             pinned?: boolean;
-            agentRead?: boolean;
             updatedAt?: string;
           };
         };
@@ -3720,7 +3717,6 @@ async function dispatchTool(
             title: pg?.title,
             role: pg?.role,
             pinned: pg?.pinned,
-            agentRead: pg?.agentRead,
             updatedAt: pg?.updatedAt,
           }),
         );

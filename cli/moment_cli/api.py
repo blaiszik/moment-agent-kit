@@ -209,7 +209,7 @@ class MomentApiClient:
         return self.post(f"/api/v1/agents/projects/{project_id}/pages", payload)
 
     def list_pages(self, project_id: int) -> dict:
-        """Full page bodies (the context endpoint only returns excerpts for non-agentRead pages)."""
+        """Full page bodies (the context endpoint only returns excerpts for pages that are not must-read)."""
         return self.get(f"/api/v1/agents/projects/{project_id}/pages")
 
     def read_page(self, project_id: int, slug: str) -> dict:

@@ -75,7 +75,7 @@ afterward to "check".**
 **MCP:**
 ```
 bootstrap_project(title:"…", description:"…", domain:"AI_FOR_SCIENCE",
-  page:{ title:"Design", body:"## …inline markdown…", slug:"design", agentRead:true },
+  page:{ title:"Design", body:"## …inline markdown…", slug:"design", pinned:true },
   resources:[{ uri:"https://github.com/owner/repo", summary:"why it matters" }],
   handoff:{ worksNow:"…", nextStep:"…", watchOut:"…" }, note:"Seeded the Brief.")
 ```
@@ -85,7 +85,7 @@ bootstrap_project(title:"…", description:"…", domain:"AI_FOR_SCIENCE",
 export MOMENT_API_KEY=…                                   # silences the "apiKey committed to git" warning
 printf '## Design\n…markdown…\n' | moment --json --quiet project bootstrap \
   --title "…" --description "…" --domain AI_FOR_SCIENCE \
-  --page-title "Design" --page-slug design --page-agent-read --page-body - \
+  --page-title "Design" --page-slug design --page-pinned --page-body - \
   --resource https://github.com/owner/repo \
   --works-now "…" --next "…" --watch-out "…" --note "Seeded the Brief."
 # domain ∈ MATERIALS_CHEMISTRY·AI_FOR_SCIENCE·HEALTH_LONGEVITY·ENERGY_CLIMATE·COMPUTATION·SYNTHETIC_BIOLOGY·QUANTUM_SYSTEMS·NEUROSCIENCE·SPACE_EXPLORATION·OTHER
@@ -110,7 +110,7 @@ watch, without making them open the page to get the gist.
 
 ## Close out — leave the Brief better than you found it
 The last step of any work session (the "close out" in the loop): `log_session(N, note, handoff?)`, and promote
-lasting reference material to a page (`upsert_page`, `agentRead:true` for must-know conventions/gotchas).
+lasting reference material to a page (`upsert_page`, `pinned:true` for must-know conventions/gotchas).
 
 Use the [writing quality rubric](reference.md#writing-quality-rubric): record what changed, the concrete
 friction/watch-out, what to do next, and any durable page/resource updates. Keep the depth in pages, but make
@@ -123,7 +123,7 @@ the note and handoff stand alone.
 | Read one project's Brief | `get_project_context(N)` | `moment -p N orient` |
 | Survey the lab / find by meaning | `explore(q?)` · `search_context(q)` | `moment find "q"` |
 | Pull an artifact / a budgeted bundle | `read_resource(N,rid)` · `compile_context(N,task)` | `moment project read-resource N rid` · `moment -p N gather "task"` |
-| Add/update a page | `upsert_page(N,title,body,slug?,agentRead?)` | `moment project page N --title … --body -` |
+| Add/update a page | `upsert_page(N,title,body,slug?,pinned?)` | `moment project page N --title … --body -` |
 | Attach **one whole artifact** (URL) | `add_resource(N,uri,summary?)` | `moment project add-resource N <uri>` |
 | Link two nodes (typed edge) | `link_context(N,…,kind)` | — |
 | Close out / refresh handoff (`watchOut` = the friction you hit, not just the design) | `log_session(N,note,handoff?)` | `moment -p N log --note … --works-now … --watch-out …` |

@@ -63,7 +63,7 @@ domain aliases, or error table.
 5. CLOSE OUT
    - Always call `log_session(projectId, note, taskId, handoff?)`.
    - Include a handoff patch only when state changed: `nextStep`, `worksNow`, `inProgress`, `blocked`, `watchOut`.
-   - Make `watchOut` the concrete friction you hit; durable conventions belong in an `agentRead` page.
+   - Make `watchOut` the concrete friction you hit; durable conventions belong in a `pinned` (must-read) page.
 
 6. CONTINUE OR EXIT
    - `--loop` or remaining count: repeat from ORIENT/GET WORK.

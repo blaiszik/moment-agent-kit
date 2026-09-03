@@ -515,14 +515,13 @@ def project_page(
     body_file: Optional[str] = typer.Option(None, "--body-file", help="Path to a markdown file for the page body."),
     slug: Optional[str] = typer.Option(None, "--slug", help="Stable slug to update an existing page."),
     icon: Optional[str] = typer.Option(None, "--icon"),
-    pinned: bool = typer.Option(False, "--pinned"),
-    agent_read: bool = typer.Option(False, "--agent-read", help="Pull the full page into every agent's context."),
+    pinned: bool = typer.Option(False, "--pinned", help="Must-read: top of the human nav and pulled in full into every agent's orient."),
     role: Optional[str] = typer.Option(None, "--role", help="BRIEF|SPEC|PLAN|DECISION|REPORT|REFERENCE|NOTE (inferred from slug/title when omitted)."),
 ) -> None:
     """Add or update a freeform markdown page."""
     _upsert_page(
         project_id, title=title, body=body, body_file=body_file,
-        slug=slug, icon=icon, pinned=pinned, agent_read=agent_read, role=role,
+        slug=slug, icon=icon, pinned=pinned, role=role,
     )
 
 
@@ -535,14 +534,13 @@ def _upsert_page(
     slug: Optional[str],
     icon: Optional[str],
     pinned: bool,
-    agent_read: bool,
     role: Optional[str] = None,
 ) -> None:
     """Shared page-upsert body for `project page` (explicit id) and `page` (bound id)."""
     if bool(body) == bool(body_file):
         raise typer.BadParameter("Provide exactly one of --body or --body-file.")
     body_text = sys.stdin.read() if body == "-" else (body if body is not None else _read_file(body_file))  # type: ignore[arg-type]
-    payload: dict = {"title": title, "body": body_text, "pinned": pinned, "agentRead": agent_read}
+    payload: dict = {"title": title, "body": body_text, "pinned": pinned}
     if slug:
         payload["slug"] = slug
     if icon:
@@ -840,8 +838,7 @@ def page(
     body_file: Optional[str] = typer.Option(None, "--body-file", help="Path to a markdown file for the page body."),
     slug: Optional[str] = typer.Option(None, "--slug", help="Stable slug to update an existing page."),
     icon: Optional[str] = typer.Option(None, "--icon"),
-    pinned: bool = typer.Option(False, "--pinned"),
-    agent_read: bool = typer.Option(False, "--agent-read", help="Pull the full page into every agent's context."),
+    pinned: bool = typer.Option(False, "--pinned", help="Must-read: top of the human nav and pulled in full into every agent's orient."),
     role: Optional[str] = typer.Option(None, "--role", help="BRIEF|SPEC|PLAN|DECISION|REPORT|REFERENCE|NOTE (inferred from slug/title when omitted)."),
 ) -> None:
     """Add or update a page on the bound project (--project / .moment.json). Same as `project page` without the id."""
@@ -853,7 +850,7 @@ def page(
         return
     _upsert_page(
         pid, title=title, body=body, body_file=body_file,
-        slug=slug, icon=icon, pinned=pinned, agent_read=agent_read, role=role,
+        slug=slug, icon=icon, pinned=pinned, role=role,
     )
 
 
@@ -2399,7 +2396,7 @@ def _readme_page_payload(readme_path: Optional[Path], readme_text: Optional[str]
         "title": readme_path.name,
         "body": readme_text,
         "slug": "readme",
-        "agentRead": True,
+        "pinned": True,
     }
 
 
@@ -3211,7 +3208,7 @@ def project_bootstrap(
     page_body: Optional[str] = typer.Option(None, "--page-body", help="Inline page body (pass '-' for stdin)."),
     page_body_file: Optional[str] = typer.Option(None, "--page-body-file", help="Read page body from a file."),
     page_slug: Optional[str] = typer.Option(None, "--page-slug", help="Stable page slug."),
-    page_agent_read: bool = typer.Option(False, "--page-agent-read", help="Make the page must-read for agents."),
+    page_pinned: bool = typer.Option(False, "--page-pinned", help="Make the page must-read (top of the nav, in full into every orient)."),
     resource: list[str] = typer.Option(None, "--resource", help="Resource URL (repeatable)."),
     works_now: Optional[str] = typer.Option(None, "--works-now", help="Handoff: what works now."),
     in_progress: Optional[str] = typer.Option(None, "--in-progress", help="Handoff: in progress."),
@@ -3242,8 +3239,8 @@ def project_bootstrap(
             page: dict = {"title": page_title or "Overview", "body": body}
             if page_slug:
                 page["slug"] = page_slug
-            if page_agent_read:
-                page["agentRead"] = True
+            if page_pinned:
+                page["pinned"] = True
             payload["page"] = page
         # Resources
         if resource:
