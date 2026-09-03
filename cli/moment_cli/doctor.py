@@ -9,12 +9,12 @@ and says exactly which one is wrong.
 
 Checks, in dependency order (later checks may be SKIPped when earlier ones
 fail):
-  1. binding      — .moment.json found walking up from cwd; projectId parses.
+  1. binding      — .moment.json has an alias-keyed projects map and valid default.
   2. api-key      — an API key resolves (env / config chain), without printing it.
   3. api-reach    — GET the API root/health with a short timeout; reports
                     HTTP status or connection error verbatim.
   4. auth         — an authenticated whoami-grade call succeeds (key valid).
-  5. project      — the bound projectId is readable with this key.
+  5. project      — the selected default project is readable with this key.
   6. mcp-config   — every .mcp.json / MCP config discoverable for this repo
                     that names a moment server agrees with .moment.json's
                     apiUrl (the :3010 drift check). SKIP when none found.
@@ -32,10 +32,23 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
 
-from moment_cli.config import _extract_mcp_config, _find_up, resolve_config
+from moment_cli.config import (
+    _extract_mcp_config,
+    _find_up,
+    read_repo_bindings,
+    resolve_config,
+)
 
 # api-reach must not hang the diagnosis.
 _REACH_TIMEOUT = 5.0
+
+
+def _legacy_binding_id(data: dict) -> Optional[int]:
+    """The legacy `{"projectId": N}` binding, via the shared reader. Never raises."""
+    try:
+        return read_repo_bindings(data).legacy_project_id
+    except SystemExit:
+        return None
 
 
 @dataclass
@@ -71,7 +84,7 @@ def run_doctor(
     results: list[CheckResult] = []
     cwd = os.getcwd()
 
-    # --- 1. binding: .moment.json found walking up; projectId parses. ---
+    # --- 1. binding: .moment.json has projects + a resolvable default. ---
     binding_path = config_path or _find_up(cwd, ".moment.json")
     project_id: Optional[int] = None
     binding_url: Optional[str] = None
@@ -85,17 +98,49 @@ def run_doctor(
             results.append(CheckResult("binding", "fail", f"{binding_path}: unreadable ({exc})"))
             data = None
         if isinstance(data, dict):
-            raw_pid = data.get("projectId")
             binding_url = data.get("apiUrl") if isinstance(data.get("apiUrl"), str) else None
+            projects = data.get("projects")
+            default_alias = data.get("defaultProject")
+            default_entry = projects.get(default_alias) if isinstance(projects, dict) and isinstance(default_alias, str) else None
+            raw_pid = default_entry.get("id") if isinstance(default_entry, dict) else None
             try:
-                project_id = int(raw_pid) if raw_pid is not None else None
+                project_id = int(raw_pid) if raw_pid is not None and not isinstance(raw_pid, bool) else None
             except (TypeError, ValueError):
                 project_id = None
-            if project_id is None:
-                results.append(CheckResult("binding", "fail", f"{binding_path}: no valid projectId"))
+            valid_entries = [
+                alias for alias, entry in projects.items()
+                if isinstance(alias, str)
+                and isinstance(entry, dict)
+                and isinstance(entry.get("id"), int)
+                and not isinstance(entry.get("id"), bool)
+                and entry["id"] > 0
+            ] if isinstance(projects, dict) else []
+            legacy_id = _legacy_binding_id(data)
+            if not valid_entries and legacy_id is not None:
+                # Pre-registry shape: {"projectId": N}. resolve_config honours it,
+                # so the repo works — doctor must not call it broken. Suggest the
+                # migration instead.
+                binding_ok = True
+                project_id = legacy_id
+                results.append(CheckResult(
+                    "binding",
+                    "ok",
+                    f"legacy projectId binding (#{legacy_id}) · {binding_path} · "
+                    f"migrate with `moment init --project {legacy_id} --alias NAME`",
+                ))
+            elif not valid_entries:
+                results.append(CheckResult("binding", "fail", f"{binding_path}: no valid projects map"))
+            elif project_id is None or project_id <= 0:
+                results.append(CheckResult("binding", "fail", f"{binding_path}: defaultProject does not name a valid project"))
+            elif len(valid_entries) != len(projects):
+                results.append(CheckResult("binding", "fail", f"{binding_path}: one or more project entries are invalid"))
             else:
                 binding_ok = True
-                results.append(CheckResult("binding", "ok", f"project #{project_id} · {binding_path}"))
+                results.append(CheckResult(
+                    "binding",
+                    "ok",
+                    f"{len(valid_entries)} attached · default {default_alias} (#{project_id}) · {binding_path}",
+                ))
         elif data is not None:
             results.append(CheckResult("binding", "fail", f"{binding_path}: not a JSON object"))
 
@@ -146,7 +191,7 @@ def run_doctor(
             detail = f"HTTP {status}: {exc}" if status else str(exc)
             results.append(CheckResult("auth", "fail", detail))
 
-    # --- 5. project: the bound projectId is readable with this key. ---
+    # --- 5. project: the selected default is readable with this key. ---
     if not binding_ok or project_id is None:
         results.append(CheckResult("project", "skip", "no bound project to read"))
     elif not auth_ok:

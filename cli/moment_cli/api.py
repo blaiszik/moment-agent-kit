@@ -122,14 +122,32 @@ class MomentApiClient:
 
     # --- Project endpoints ---
 
-    def get_project_context(self, project_id: int) -> dict:
-        return self.get(f"/api/v1/agents/projects/{project_id}/context")
+    def get_project_context(
+        self, project_id: int, view: Optional[str] = None
+    ) -> dict:
+        suffix = f"?view={view}" if view else ""
+        return self.get(f"/api/v1/agents/projects/{project_id}/context{suffix}")
 
     def create_insight(self, project_id: int, payload: dict) -> dict:
         return self.post(f"/api/v1/agents/projects/{project_id}/insights", payload)
 
     def create_message(self, project_id: int, payload: dict) -> dict:
         return self.post(f"/api/v1/agents/projects/{project_id}/messages", payload)
+
+    # --- Claim ledger: falsifiers ---
+
+    def get_claim_falsifiers(self, signal_id: int) -> dict:
+        """A claim's falsifiers (open first, capped) plus its structural stake."""
+        return self.get(f"/api/v1/agents/signals/{signal_id}/falsifiers")
+
+    def add_claim_falsifier(
+        self, signal_id: int, title: str, body: Optional[str] = None
+    ) -> dict:
+        """Author a falsifier on a claim — a QUESTION signal TESTS-edged to it."""
+        payload: dict[str, Any] = {"title": title}
+        if body:
+            payload["body"] = body
+        return self.post(f"/api/v1/agents/signals/{signal_id}/falsifiers", payload)
 
     # --- Context graph: resources, retrieval, pages, close-out, extraction ---
 
@@ -157,14 +175,35 @@ class MomentApiClient:
         )
 
     def find_context(
-        self, query: str, project_id: Optional[int] = None, limit: Optional[int] = None
+        self,
+        query: str,
+        project_id: Optional[int] = None,
+        limit: Optional[int] = None,
+        team: Optional[str] = None,
+        types: Optional[str] = None,
+        since: Optional[str] = None,
     ) -> dict:
         body: dict = {"query": query}
         if project_id is not None:
             body["projectId"] = project_id
         if limit is not None:
             body["limit"] = limit
-        return self.post("/api/v1/agents/find-context", body)
+        if team is not None:
+            body["team"] = team
+        if types is not None:
+            body["types"] = types
+        if since is not None:
+            body["since"] = since
+
+        qs = []
+        if team is not None:
+            qs.append(f"team={team}")
+        if types is not None:
+            qs.append(f"types={types}")
+        if since is not None:
+            qs.append(f"since={since}")
+        suffix = ("?" + "&".join(qs)) if qs else ""
+        return self.post(f"/api/v1/agents/find-context{suffix}", body)
 
     def upsert_page(self, project_id: int, payload: dict) -> dict:
         return self.post(f"/api/v1/agents/projects/{project_id}/pages", payload)

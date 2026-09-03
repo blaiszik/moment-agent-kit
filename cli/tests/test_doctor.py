@@ -114,6 +114,14 @@ def _write_mcp_config(cwd: Path, port: int) -> None:
     }))
 
 
+def _repo_binding(api_url: str) -> dict:
+    return {
+        "apiUrl": api_url,
+        "defaultProject": "core",
+        "projects": {"core": {"id": 42, "title": "Moment"}},
+    }
+
+
 # --- case 1: no .moment.json anywhere -------------------------------------------
 
 def case1_no_binding() -> None:
@@ -178,10 +186,7 @@ def case2_unreachable_api() -> None:
     cwd, home = _mkdirs("unreach")
     try:
         port = get_unused_port()
-        (cwd / ".moment.json").write_text(json.dumps({
-            "projectId": 42,
-            "apiUrl": f"http://127.0.0.1:{port}",
-        }))
+        (cwd / ".moment.json").write_text(json.dumps(_repo_binding(f"http://127.0.0.1:{port}")))
 
         with sandboxed(cwd, home, {"MOMENT_API_KEY": "mk_test_unreach_0002"}):
             status, val = call_expect(run_doctor)
@@ -230,7 +235,7 @@ def case3_mcp_config_agreement() -> None:
         port_b = get_unused_port()
         while port_b == port_a:
             port_b = get_unused_port()
-        (cwd / ".moment.json").write_text(json.dumps({"projectId": 42, "apiUrl": f"http://localhost:{port_a}"}))
+        (cwd / ".moment.json").write_text(json.dumps(_repo_binding(f"http://localhost:{port_a}")))
         _write_mcp_config(cwd, port_b)
 
         with sandboxed(cwd, home, {"MOMENT_API_KEY": "mk_test_mcp_0003"}):
@@ -258,7 +263,7 @@ def case3_mcp_config_agreement() -> None:
     cwd, home = _mkdirs("mcp-match")
     try:
         port = get_unused_port()
-        (cwd / ".moment.json").write_text(json.dumps({"projectId": 42, "apiUrl": f"http://localhost:{port}"}))
+        (cwd / ".moment.json").write_text(json.dumps(_repo_binding(f"http://localhost:{port}")))
         _write_mcp_config(cwd, port)
 
         with sandboxed(cwd, home, {"MOMENT_API_KEY": "mk_test_mcp_0004"}):
@@ -280,7 +285,7 @@ def case3_mcp_config_agreement() -> None:
     cwd, home = _mkdirs("mcp-none")
     try:
         port = get_unused_port()
-        (cwd / ".moment.json").write_text(json.dumps({"projectId": 42, "apiUrl": f"http://localhost:{port}"}))
+        (cwd / ".moment.json").write_text(json.dumps(_repo_binding(f"http://localhost:{port}")))
 
         with sandboxed(cwd, home, {"MOMENT_API_KEY": "mk_test_mcp_0005"}):
             status, val = call_expect(run_doctor)
@@ -304,10 +309,7 @@ def case4_secret_hygiene() -> None:
     cwd, home = _mkdirs("secret")
     try:
         port = get_unused_port()
-        (cwd / ".moment.json").write_text(json.dumps({
-            "projectId": 42,
-            "apiUrl": f"http://127.0.0.1:{port}",
-        }))
+        (cwd / ".moment.json").write_text(json.dumps(_repo_binding(f"http://127.0.0.1:{port}")))
 
         with sandboxed(cwd, home, {"MOMENT_API_KEY": "mk_live_supersecret123"}):
             status, val = call_expect(run_doctor)
@@ -330,11 +332,69 @@ def case4_secret_hygiene() -> None:
         shutil.rmtree(home, ignore_errors=True)
 
 
+# --- case 5: legacy {"projectId": N} binding is valid, not broken ----------------
+
+def case5_legacy_binding() -> None:
+    # The pre-registry shape still resolves in config.resolve_config, so doctor
+    # must report the repo as bound (it used to say "no valid projects map" on a
+    # perfectly working repo) and point at the migration.
+    cwd, home = _mkdirs("legacy")
+    try:
+        port = get_unused_port()
+        (cwd / ".moment.json").write_text(json.dumps({
+            "projectId": 42,
+            "apiUrl": f"http://127.0.0.1:{port}",
+        }))
+
+        with sandboxed(cwd, home, {"MOMENT_API_KEY": "mk_test_legacy_0006"}):
+            status, val = call_expect(run_doctor)
+
+        if status == "pending":
+            pending("case 5: legacy projectId binding (doctor stub not implemented)")
+            return
+        if status == "raised":
+            check("case 5: run_doctor never raises", False)
+            print(f"      raised: {val!r}")
+            return
+
+        binding = by_name(val, "binding")
+        check("case 5: binding -> ok (legacy shape recognized)", binding is not None and binding.status == "ok")
+        if binding is not None:
+            detail = (binding.detail or "").lower()
+            check("case 5: detail names the project id", "42" in detail)
+            check("case 5: detail suggests migrating", "migrate" in detail)
+    finally:
+        shutil.rmtree(cwd, ignore_errors=True)
+        shutil.rmtree(home, ignore_errors=True)
+
+    # 5b: an empty binding file is still a failure.
+    cwd, home = _mkdirs("legacy-empty")
+    try:
+        port = get_unused_port()
+        (cwd / ".moment.json").write_text(json.dumps({"apiUrl": f"http://127.0.0.1:{port}"}))
+
+        with sandboxed(cwd, home, {"MOMENT_API_KEY": "mk_test_legacy_0007"}):
+            status, val = call_expect(run_doctor)
+
+        if status == "pending":
+            pending("case 5b: unbound binding file (doctor stub not implemented)")
+        elif status == "raised":
+            check("case 5b: run_doctor never raises", False)
+            print(f"      raised: {val!r}")
+        else:
+            binding = by_name(val, "binding")
+            check("case 5b: binding -> fail (no projects, no legacy id)", binding is not None and binding.status == "fail")
+    finally:
+        shutil.rmtree(cwd, ignore_errors=True)
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def main() -> int:
     case1_no_binding()
     case2_unreachable_api()
     case3_mcp_config_agreement()
     case4_secret_hygiene()
+    case5_legacy_binding()
 
     print()
     if _pending:

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import sys
 from typing import Any, Optional
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
@@ -22,6 +24,77 @@ SPARK = "#ffd166"
 GLOW = "#8ce99a"
 ROSE = "#ff8fab"
 READ_NOW_COUNT = 3
+SAME_WRITE_SLACK_MS = 5_000
+_SENTINEL = object()
+
+
+def _parse_timestamp(val: Any) -> Optional[datetime]:
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    if not isinstance(val, str):
+        return None
+    s = val.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def raw_markdown_is_stale(
+    updated_at: Any,
+    raw_markdown_updated_at: Any = _SENTINEL,
+) -> bool:
+    """Port of server rawMarkdownIsStale from app/lib/handoff-freshness.ts.
+
+    Returns True when rawMarkdownUpdatedAt is older than updatedAt (beyond the
+    same-write slack). A missing stamp is a legacy row and is NOT stale.
+    Can be called with (handoff_dict) or (updated_at, raw_markdown_updated_at).
+    """
+    if raw_markdown_updated_at is _SENTINEL:
+        if isinstance(updated_at, dict):
+            handoff = updated_at
+            updated_at = handoff.get("updatedAt")
+            raw_markdown_updated_at = handoff.get("rawMarkdownUpdatedAt")
+        else:
+            raw_markdown_updated_at = None
+
+    # No stamp = legacy row (pre-backfill) — keep today's behavior (server parity).
+    if not updated_at or not raw_markdown_updated_at:
+        return False
+
+    u_dt = _parse_timestamp(updated_at)
+    r_dt = _parse_timestamp(raw_markdown_updated_at)
+    if u_dt is None or r_dt is None:
+        return False
+    return (u_dt - r_dt).total_seconds() > (SAME_WRITE_SLACK_MS / 1000.0)
+
+
+def format_structured_handoff(handoff: dict) -> list[str]:
+    """Format structured handoff fields into Rich markup lines."""
+    hl = []
+    if handoff.get("nextStep"):
+        hl.append(f"[bold {GLOW}]→ Next:[/] {handoff['nextStep']}")
+    for label, key in (
+        ("Works now", "worksNow"),
+        ("In progress", "inProgress"),
+        ("Blocked", "blocked"),
+        ("Watch out", "watchOut"),
+    ):
+        if handoff.get(key):
+            hl.append(kv(label, handoff[key]))
+    for r in handoff.get("readFirst") or []:
+        line = f"  • {r.get('label', '')}"
+        if r.get("why"):
+            line += f" [dim]— {r['why']}[/]"
+        hl.append(line)
+    return hl
 
 
 def print_json(data: Any) -> None:
@@ -263,28 +336,37 @@ def render_brief(payload: dict, quiet: bool = False) -> None:
             footer += f" · {str(handoff['updatedAt'])[:10]}"
         if handoff.get("updatedBy"):
             footer += f" · {handoff['updatedBy']}"
+        if handoff.get("rawMarkdownUpdatedAt"):
+            footer += f" · brief stamped {str(handoff['rawMarkdownUpdatedAt'])[:10]}"
         raw = (handoff.get("rawMarkdown") or "").strip()
         if raw:
-            # The full handoff is the real thing — render it as markdown.
-            console.print(Panel(Markdown(raw), title="Handoff", border_style=GLOW,
-                                subtitle=f"[dim]{footer}[/]"))
+            if not raw_markdown_is_stale(handoff):
+                # The full handoff is the real thing — render it as markdown.
+                console.print(
+                    Panel(
+                        Markdown(raw),
+                        title="Handoff",
+                        border_style=GLOW,
+                        subtitle=f"[dim]{footer}[/]",
+                    )
+                )
+            else:
+                hl = format_structured_handoff(handoff)
+                items: list[Any] = []
+                if hl:
+                    items.append(console.render_str("\n".join(hl)))
+                items.append(Rule("Earlier brief (superseded by the patches above)", style="dim"))
+                items.append(Markdown(raw))
+                console.print(
+                    Panel(
+                        Group(*items),
+                        title="Handoff",
+                        border_style=GLOW,
+                        subtitle=f"[dim]{footer}[/]",
+                    )
+                )
         else:
-            hl = []
-            if handoff.get("nextStep"):
-                hl.append(f"[bold {GLOW}]→ Next:[/] {handoff['nextStep']}")
-            for label, key in (
-                ("Works now", "worksNow"),
-                ("In progress", "inProgress"),
-                ("Blocked", "blocked"),
-                ("Watch out", "watchOut"),
-            ):
-                if handoff.get(key):
-                    hl.append(kv(label, handoff[key]))
-            for r in handoff.get("readFirst") or []:
-                line = f"  • {r.get('label', '')}"
-                if r.get("why"):
-                    line += f" [dim]— {r['why']}[/]"
-                hl.append(line)
+            hl = format_structured_handoff(handoff)
             hl += ["", f"[dim]{footer}[/]"]
             console.print(Panel("\n".join(hl), title="Handoff", border_style=GLOW))
     else:
@@ -294,6 +376,23 @@ def render_brief(payload: dict, quiet: bool = False) -> None:
 
     if quiet:
         return
+
+    # Must read — pinned / agentRead pages with clamped bodies (§S2).
+    must_read = payload.get("mustRead") or []
+    if must_read:
+        mr_items: list[Any] = []
+        for i, pg in enumerate(must_read):
+            slug = pg.get("slug", "")
+            title = pg.get("title", "")
+            body = (pg.get("body") or "").strip()
+            if len(body) > 3000:
+                body = body[:3000] + f"\n\n… (moment page-read {slug} for the rest)"
+            if i > 0:
+                mr_items.append(Text(""))
+            mr_items.append(Text(f"{title} ({slug})", style="bold"))
+            if body:
+                mr_items.append(Markdown(body))
+        console.print(Panel(Group(*mr_items), title="Must read", border_style=ACCENT))
 
     # 4. Read order — the assembler's own prioritization.
     read_order = (payload.get("protocol") or {}).get("readOrder") or []
@@ -345,10 +444,28 @@ def render_brief(payload: dict, quiet: bool = False) -> None:
                       for t in tasks[:10]),
             title=f"Active tasks ({len(tasks)})", border_style=ACCENT_STRONG))
 
+    # Doors — OPEN, unclaimed tasks (§S2).
+    door_tasks = payload.get("doorTasks") or []
+    if door_tasks:
+        door_lines = []
+        for t in door_tasks:
+            tid = t.get("id", "?")
+            title = t.get("title", "")
+            ttype = t.get("type", "")
+            est = t.get("estimatedMinutes")
+            est_str = str(est) if est is not None else "—"
+            door_lines.append(f"#{tid} {title} · {ttype} · {est_str} min")
+        console.print(Panel(Text("\n".join(door_lines)), title="Doors", border_style=ACCENT_STRONG))
+
     console.print(
         f"[dim]~{meta.get('tokenEstimate', '?')} tokens · "
         "`moment orient --prompt` for the agent-ready brief · "
         "`moment sync` to mirror to .continuity/[/]")
+
+    next_calls = payload.get("nextCalls") or []
+    if next_calls:
+        calls_str = " · ".join(str(c) for c in next_calls)
+        console.print(f"[dim]Next: {calls_str}[/]")
 
 
 def render_gather(payload: dict, label: str) -> None:
@@ -509,6 +626,61 @@ def render_graph(payload: dict, page: str) -> None:
             console.print(f"  [{ACCENT}]→[/] {tgt.get('title', '?')} [dim]· {e.get('kind', '')}[/]")
     if not bl and not fw:
         console.print("[dim]No graph edges yet for this page.[/]")
+
+
+def _falsifier_line(ref: dict) -> str:
+    """One falsifier row. An OPEN falsifier is the loud one — it is still owed a test."""
+    title = ref.get("title") or "(untitled)"
+    signal_id = ref.get("signalId")
+    if ref.get("open"):
+        return f"  [{SPARK}]OPEN[/] [dim]#{signal_id}[/] {title}"
+    return f"  [dim]settled #{signal_id}[/] [dim]{title}[/]"
+
+
+def render_falsifiers(payload: dict, signal_id: int) -> None:
+    """A claim's falsifiers — what would change our mind — plus its structural stake."""
+    refs = payload.get("falsifiers") or []
+    total = payload.get("total", len(refs))
+    open_count = payload.get("open", sum(1 for r in refs if r.get("open")))
+    stake = payload.get("structuralStake")
+    header = [
+        kv("Claim", f"#{payload.get('signalId', signal_id)}"),
+        kv("Falsifiers", f"{open_count} open of {total}"),
+    ]
+    if stake is not None:
+        header.append(kv("Structural stake", stake))
+    console.print(Panel("\n".join(header), title="Falsifiers", border_style=ACCENT_STRONG))
+    if not refs:
+        console.print("[dim]Nothing has been named that would change our mind about this claim.[/]")
+        return
+    for ref in refs:
+        console.print(_falsifier_line(ref))
+    if len(refs) < total:
+        console.print(f"[dim]… and {total - len(refs)} more (this list is capped).[/]")
+
+
+def render_falsifier_created(payload: dict, signal_id: int) -> None:
+    """The confirmation for `claim add-falsifier`, followed by the refreshed ledger."""
+    falsifier = payload.get("falsifier") or {}
+    lines = [
+        kv("Falsifier", f"#{falsifier.get('id')}"),
+        kv("Tests claim", f"#{signal_id}"),
+        kv("Title", falsifier.get("title") or ""),
+    ]
+    console.print(Panel("\n".join(lines), title="Falsifier recorded", border_style=GLOW))
+    state = payload.get("claimState") or {}
+    summary = state.get("falsifiers") or {}
+    if summary:
+        render_falsifiers(
+            {
+                "signalId": signal_id,
+                "falsifiers": summary.get("refs") or [],
+                "total": summary.get("total", 0),
+                "open": summary.get("open", 0),
+                "structuralStake": state.get("structuralStake"),
+            },
+            signal_id,
+        )
 
 
 def render_contribution_result(payload: dict) -> None:

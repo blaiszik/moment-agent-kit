@@ -18,7 +18,7 @@ from rich.panel import Panel
 from moment_cli import __version__, close_out, hooks as hooks_mod
 from moment_cli import doctor as doctor_mod
 from moment_cli.api import ApiError, MomentApiClient
-from moment_cli.config import resolve_config
+from moment_cli.config import read_repo_bindings, resolve_config
 from moment_cli.display import (
     GLOW,
     ROSE,
@@ -35,6 +35,8 @@ from moment_cli.display import (
     render_bootstrap,
     render_contribution_result,
     render_create_project,
+    render_falsifier_created,
+    render_falsifiers,
     render_gather,
     render_graph,
     render_github_sync_summary,
@@ -72,6 +74,10 @@ app = typer.Typer(
 auth_app = typer.Typer(help="Authentication commands.", no_args_is_help=True)
 work_app = typer.Typer(help="Work discovery, claiming, and submission.", no_args_is_help=True)
 project_app = typer.Typer(help="Project context and contributions.", no_args_is_help=True)
+claim_app = typer.Typer(
+    help="Claim ledger — falsifiers: what would change our mind about a claim.",
+    no_args_is_help=True,
+)
 stats_app = typer.Typer(help="Agent statistics.", no_args_is_help=True)
 hooks_app = typer.Typer(help="Install ambient capture hooks across agent runtimes.", no_args_is_help=True)
 github_app = typer.Typer(help="GitHub sync — pull PR/issue discussion into Moment context.", no_args_is_help=True)
@@ -79,6 +85,7 @@ github_app = typer.Typer(help="GitHub sync — pull PR/issue discussion into Mom
 app.add_typer(auth_app, name="auth")
 app.add_typer(work_app, name="work")
 app.add_typer(project_app, name="project")
+app.add_typer(claim_app, name="claim")
 app.add_typer(stats_app, name="stats")
 app.add_typer(hooks_app, name="hooks")
 app.add_typer(github_app, name="github")
@@ -100,7 +107,7 @@ def main(
     api_key: Optional[str] = typer.Option(None, "--api-key", help="Override API key."),
     api_url: Optional[str] = typer.Option(None, "--api-url", help="Override API base URL."),
     config: Optional[str] = typer.Option(None, "--config", help="Path to JSON config file."),
-    project: Optional[int] = typer.Option(None, "--project", "-p", help="Project ID (overrides MOMENT_PROJECT_ID and .moment.json)."),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Project ID or repository alias."),
     json_mode: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
     quiet: bool = typer.Option(False, "--quiet", help="Suppress banners and extra text."),
     version: Optional[bool] = typer.Option(None, "--version", callback=_version_callback, is_eager=True, help="Show version."),
@@ -116,7 +123,8 @@ def main(
 
 def _resolve_cli_config(
     *,
-    project: Optional[int] = None,
+    project: Optional[int | str] = None,
+    hint: Optional[str] = None,
     require_api_key: bool = True,
 ):
     api_key = _state.get("api_key")
@@ -127,14 +135,15 @@ def _resolve_cli_config(
         api_url=_state.get("api_url"),
         config_path=_state.get("config"),
         project_id=project if project is not None else _state.get("project"),
+        project_hint=hint,
         quiet=bool(_state.get("quiet")),
     )
     _state["_config"] = cfg
     return cfg
 
 
-def _get_client(project: Optional[int] = None) -> MomentApiClient:
-    cfg = _resolve_cli_config(project=project)
+def _get_client(project: Optional[int | str] = None, *, hint: Optional[str] = None) -> MomentApiClient:
+    cfg = _resolve_cli_config(project=project, hint=hint)
     return MomentApiClient(cfg)
 
 
@@ -147,8 +156,9 @@ def _resolve_project_id() -> int:
     pid = cfg.project_id if cfg else None
     if pid is None:
         raise typer.BadParameter(
-            "No project bound. Pass --project N, set MOMENT_PROJECT_ID, "
-            'or add "projectId" to .moment.json (run `moment init --project N`).'
+            "No project could be selected. Pass --project <id-or-alias>, set "
+            "MOMENT_PROJECT, or configure defaultProject / matching metadata in "
+            ".moment.json. Run `moment projects` to inspect the repository bindings."
         )
     return pid
 
@@ -580,10 +590,13 @@ def find(
     query: str = typer.Argument(help="Natural-language query."),
     project: Optional[int] = typer.Option(None, "--project", "-p", help="Scope to one project."),
     limit: Optional[int] = typer.Option(None, "--limit", "-n"),
+    team: Optional[str] = typer.Option(None, "--team", help="Scope to a team slug."),
+    types: Optional[str] = typer.Option(None, "--types", help="Filter by entity types (e.g. PAGE,RESOURCE)."),
+    since: Optional[str] = typer.Option(None, "--since", help="Filter by update recency (e.g. 30d or ISO date)."),
 ) -> None:
     """Semantically search the context graph across projects (find_context)."""
     try:
-        print_json(_get_client().find_context(query, project, limit))
+        print_json(_get_client().find_context(query, project, limit, team=team, types=types, since=since))
     except Exception as exc:
         _handle_error(exc)
 
@@ -591,15 +604,86 @@ def find(
 # --- Context round-trip (binding-aware: project from --project/.moment.json) ---
 
 
+@app.command("projects")
+def projects(
+    for_task: Optional[str] = typer.Option(None, "--for", help="Show which project would be selected for this task."),
+) -> None:
+    """List this repository's attached projects and explain the active choice."""
+    try:
+        cfg = _resolve_cli_config(hint=for_task, require_api_key=False)
+        selected = cfg.project_id
+        # `alias` is a contract: whatever appears there must work as
+        # `moment -p <alias>`. A legacy {"projectId": N} binding has no alias,
+        # so it reports null there and carries the display name in `label`.
+        payload = {
+            "selected": {
+                "id": selected,
+                "alias": cfg.project_alias,
+                "label": cfg.project_label,
+                "reason": cfg.project_source,
+            } if selected is not None else None,
+            "projects": [
+                {
+                    "alias": item.alias,
+                    "label": item.label,
+                    "id": item.project_id,
+                    "title": item.title,
+                    "description": item.description,
+                    "keywords": list(item.keywords),
+                    "paths": list(item.paths),
+                }
+                for item in cfg.project_bindings
+            ],
+            "legacy": cfg.project_legacy,
+            "config": cfg.config_path,
+        }
+        if _state.get("json"):
+            print_json(payload)
+            return
+        if not cfg.project_bindings:
+            console.print(
+                f"[{ROSE}]No repository projects configured.[/] "
+                "Run `moment init --project N --alias NAME --default`."
+            )
+            return
+        for item in cfg.project_bindings:
+            marker = "*" if item.project_id == selected else " "
+            title = f" · {item.title}" if item.title else ""
+            console.print(f"[{GLOW if marker == '*' else 'dim'}]{marker} {item.label}[/]  #{item.project_id}{title}")
+            details = []
+            if item.keywords:
+                details.append("keywords: " + ", ".join(item.keywords))
+            if item.paths:
+                details.append("paths: " + ", ".join(item.paths))
+            if details:
+                console.print("    [dim]" + " · ".join(details) + "[/]")
+        if cfg.project_legacy:
+            console.print(
+                f"[dim]Legacy `projectId` binding — no alias to address it with. "
+                f"Run `moment init --project {cfg.project_bindings[0].project_id} --alias NAME` to migrate.[/]"
+            )
+        if selected is not None:
+            console.print(f"\nSelected [bold]{cfg.project_label or ('#' + str(selected))}[/bold] — {cfg.project_source}.")
+        else:
+            console.print(
+                f"\n[{ROSE}]Ambiguous.[/] Pass `--project <alias>` or set `defaultProject` in .moment.json."
+            )
+    except Exception as exc:
+        _handle_error(exc)
+
+
 @app.command("orient")
 def orient(
     prompt: bool = typer.Option(False, "--prompt", help="Print the agent-ready promptContext verbatim."),
+    for_task: Optional[str] = typer.Option(None, "--for", help="Select the most relevant attached project for this task."),
+    full: bool = typer.Option(False, "--full", help="Load the full brief (pages, discussions, tasks); default is the lean brief."),
 ) -> None:
     """Print the project brief — orient before you edit (the spin-up ritual)."""
     try:
-        client = _get_client()
+        client = _get_client(hint=for_task)
         pid = _resolve_project_id()
-        result = client.get_project_context(pid)
+        view = "full" if full else None
+        result = client.get_project_context(pid, view=view)
         if prompt:
             sys.stdout.write((result.get("promptContext") or "") + "\n")
             return
@@ -622,7 +706,7 @@ def gather(
     try:
         if not task and not page:
             raise typer.BadParameter("Provide a task (a question/topic) or --page.")
-        client = _get_client()
+        client = _get_client(hint=task or page)
         pid = _resolve_project_id()
         payload: dict = {}
         if task:
@@ -659,7 +743,7 @@ def packet(
 ) -> None:
     """Compile a Research Context Packet — inspectable evidence for one question, each item carrying authority, freshness, locator, and why it matched."""
     try:
-        client = _get_client()
+        client = _get_client(hint=question)
         pid = _resolve_project_id()
         payload: dict = {"question": question}
         if budget is not None:
@@ -2084,23 +2168,157 @@ def _read_repo_binding(root: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _repo_binding_api_url(root: Path, override: Optional[str] = None) -> str:
+    """Preserve a repository's server unless the user explicitly replaces it."""
+    existing = _read_repo_binding(root).get("apiUrl")
+    repo_url = existing if isinstance(existing, str) and existing.strip() else None
+    return _default_api_url(override or repo_url)
+
+
+def _repo_bindings(root: Path):
+    """Bindings for this repo — registry or legacy — via the shared reader."""
+    try:
+        return read_repo_bindings(_read_repo_binding(root))
+    except SystemExit:
+        # A malformed value (e.g. projectId: "forty-two") is "not bound" for the
+        # purposes of the callers here; resolve_config still reports it loudly.
+        return read_repo_bindings({})
+
+
 def _bound_project_id(root: Path) -> Optional[int]:
-    raw = _read_repo_binding(root).get("projectId")
-    if isinstance(raw, bool) or raw is None:
+    """The project a bare command would use — legacy bindings included.
+
+    `onboard` gates on this: miss the legacy shape and it treats an attached
+    repo as fresh and bootstraps a duplicate remote project.
+    """
+    found = _repo_bindings(root)
+    if not found.bindings:
+        return None
+    if found.default_alias:
+        entry = next(
+            (
+                item for item in found.bindings
+                if item.alias and item.alias.casefold() == found.default_alias.casefold()
+            ),
+            None,
+        )
+        if entry is not None:
+            return entry.project_id
+    if len(found.bindings) == 1:
+        return found.bindings[0].project_id
+    return None
+
+
+def _binding_alias(value: Optional[str], project_id: int) -> str:
+    alias = re.sub(r"[^a-z0-9]+", "-", (value or "").casefold()).strip("-")
+    return alias or f"project-{project_id}"
+
+
+def _entry_project_id(raw: object) -> Optional[int]:
+    value = raw.get("id") if isinstance(raw, dict) else raw
+    if value is None or isinstance(value, bool):
         return None
     try:
-        return int(raw)
+        parsed = int(value)
     except (TypeError, ValueError):
         return None
+    return parsed if parsed > 0 else None
 
 
-def _write_repo_binding(root: Path, project_id: int, api_url: str) -> tuple[Path, bool]:
+def _legacy_alias_migration(data: dict, projects: dict, project_id: int) -> Optional[str]:
+    """Move a legacy `{"projectId": N}` binding into the projects registry.
+
+    Called before the new binding is added: attaching a second project used to
+    silently drop the legacy one (`data.pop("projectId")` with nothing written
+    in its place), losing a working attachment.
+    """
+    try:
+        legacy_id = read_repo_bindings(data).legacy_project_id
+    except SystemExit:
+        return None  # unusable value; the pop below is a cleanup, not a loss
+    if legacy_id is None or legacy_id == project_id:
+        return None
+    if any(_entry_project_id(raw) == legacy_id for raw in projects.values()):
+        return None
+    alias = _binding_alias(None, legacy_id)
+    while alias in projects:
+        alias = f"{alias}-legacy"
+    projects[alias] = {"id": legacy_id}
+    if not isinstance(data.get("defaultProject"), str):
+        # The legacy binding WAS the repository default; keep it that way unless
+        # the caller explicitly promotes the new project.
+        data["defaultProject"] = alias
+    return alias
+
+
+def _write_repo_binding(
+    root: Path,
+    project_id: int,
+    api_url: str,
+    *,
+    alias: Optional[str] = None,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    keywords: Optional[list[str]] = None,
+    paths: Optional[list[str]] = None,
+    make_default: bool = False,
+    rebind: bool = False,
+) -> tuple[Path, bool]:
     moment_json = _repo_binding_path(root)
     data = _read_repo_binding(root)
     had_key = isinstance(data.get("apiKey"), str)
     data.pop("apiKey", None)  # never store a secret in the committed binding file
-    data["projectId"] = project_id
+
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        projects = {}
+    binding_alias = _binding_alias(alias or title, project_id)
+    _legacy_alias_migration(data, projects, project_id)
+    data.pop("projectId", None)
     data["apiUrl"] = api_url
+
+    # An alias is a name the user types; quietly repointing it at another
+    # project (and moving defaultProject with it) is how you end up writing to
+    # the wrong project. Make it an explicit choice.
+    existing = projects.get(binding_alias)
+    existing_id = _entry_project_id(existing)
+    if existing_id is not None and existing_id != project_id and not rebind:
+        raise SystemExit(
+            f"Alias {binding_alias!r} is already attached to project #{existing_id}. "
+            f"Choose a different --alias, or pass --rebind to point {binding_alias!r} "
+            f"at project #{project_id} instead."
+        )
+
+    # One project id has one local alias. Re-attaching it under a new alias is a
+    # rename, not a duplicate association.
+    for existing_alias, raw in list(projects.items()):
+        if existing_alias == binding_alias:
+            continue
+        if _entry_project_id(raw) == project_id:
+            projects.pop(existing_alias)
+            if data.get("defaultProject") == existing_alias:
+                data["defaultProject"] = binding_alias
+
+    # On a rebind the old entry describes a different project — don't inherit
+    # its title/keywords/paths.
+    entry = dict(existing) if isinstance(existing, dict) and existing_id == project_id else {}
+    entry["id"] = project_id
+    if title:
+        entry["title"] = title.strip()
+    if description:
+        entry["description"] = description.strip()
+    if keywords:
+        entry["keywords"] = list(dict.fromkeys(item.strip() for item in keywords if item.strip()))
+    if paths:
+        entry["paths"] = list(dict.fromkeys(
+            item.replace("\\", "/").strip().removeprefix("./").rstrip("/") or "."
+            for item in paths if item.strip()
+        ))
+    projects[binding_alias] = entry
+    data["projects"] = projects
+    if make_default or not isinstance(data.get("defaultProject"), str):
+        data["defaultProject"] = binding_alias
+
     moment_json.write_text(json.dumps(data, indent=2) + "\n")
     return moment_json, had_key
 
@@ -2322,15 +2540,44 @@ CLAUDE_END = "<!-- moment:autostart:end -->"
 @app.command("init")
 def init(
     project: int = typer.Option(..., "--project", "-p", help="Project ID to bind this repo to."),
+    alias: Optional[str] = typer.Option(None, "--alias", help="Memorable local name (default: project-N)."),
+    title: Optional[str] = typer.Option(None, "--title", help="Human-readable project title used for matching."),
+    description: Optional[str] = typer.Option(None, "--description", help="Short note describing when this project is relevant."),
+    keyword: Optional[list[str]] = typer.Option(None, "--keyword", help="Matching keyword; repeat for several."),
+    path: Optional[list[str]] = typer.Option(None, "--path", help="Repo-relative path owned by this project; repeat for several."),
+    default: bool = typer.Option(False, "--default", help="Make this the repository fallback."),
+    rebind: bool = typer.Option(
+        False,
+        "--rebind",
+        help="Allow --alias to be repointed when it already names a different project (otherwise that's an error).",
+    ),
     api_url: Optional[str] = typer.Option(None, "--api-url", help="API URL to bind (default: resolved / localhost)."),
     no_claude: bool = typer.Option(False, "--no-claude", help="Don't touch CLAUDE.md."),
     no_hooks: bool = typer.Option(False, "--no-hooks", help="Don't install capture hooks for detected runtimes (ambient capture)."),
 ) -> None:
-    """Bind this repo to a Moment project. For guided first-run setup, use `moment onboard`."""
+    """Attach this repo to a Moment project. Repeat to attach more than one."""
     root = _repo_root()
-    url = _default_api_url(api_url)
-    moment_json, had_key = _write_repo_binding(root, project, url)
-    console.print(f"[{GLOW}]Bound[/] {moment_json} → project #{project} @ {url}")
+    url = _repo_binding_api_url(root, api_url)
+    binding_alias = _binding_alias(alias or title, project)
+    legacy_before = _repo_bindings(root).legacy_project_id
+    moment_json, had_key = _write_repo_binding(
+        root,
+        project,
+        url,
+        alias=binding_alias,
+        title=title,
+        description=description,
+        keywords=keyword,
+        paths=path,
+        make_default=default,
+        rebind=rebind,
+    )
+    if legacy_before is not None and legacy_before != project:
+        console.print(
+            f"[{GLOW}]Migrated[/] legacy projectId #{legacy_before} → alias "
+            f"{_binding_alias(None, legacy_before)} [dim](still the repository default unless --default)[/]"
+        )
+    console.print(f"[{GLOW}]Attached[/] {binding_alias} → project #{project} in {moment_json}")
     if had_key:
         console.print(
             f"[{ROSE}]Removed apiKey from {moment_json.name}[/] — keep keys in "
@@ -2339,14 +2586,14 @@ def init(
 
     if not no_claude:
         path = root / "CLAUDE.md"
-        _upsert_claude_block(path, _claude_block(project))
+        _upsert_claude_block(path, _claude_block())
         console.print(f"[{GLOW}]Updated[/] {path} [dim](autostart block)[/]")
 
     if not no_hooks:
         _install_capture_hooks()
 
     console.print(
-        "[dim]Next: `moment orient` to read the brief · `moment sync` to mirror it to .continuity/ · `moment onboard` for guided setup[/]"
+        "[dim]Next: `moment projects` to inspect matching · `moment orient --for \"your task\"` to read the likely brief[/]"
     )
 
 
@@ -2395,21 +2642,22 @@ def _repo_root() -> Path:
     return Path.cwd()
 
 
-def _claude_block(project_id: int) -> str:
+def _claude_block() -> str:
     return (
         f"{CLAUDE_START}\n"
-        f"## Moment context (project #{project_id})\n\n"
-        f"This repo is **Moment project #{project_id}**. Moment is the single source of truth "
+        f"## Moment context\n\n"
+        f"This repo is attached to one or more Moment projects. Moment is the single source of truth "
         f"for context; `.continuity/` is a generated, read-only mirror — never hand-edit it.\n\n"
-        f"**Orient first** (before editing): run `moment orient` (or, via MCP, "
-        f"`get_project_context({project_id})`). Read the handoff → next step → watch-out.\n\n"
+        f"**Orient first** (before editing): run `moment orient --for \"<the current task>\"`. "
+        f"The local binding ranks aliases, path scopes, keywords, and the repository default; "
+        f"read the selected handoff → next step → watch-out.\n\n"
         f'**Close out** (end of session): `moment log --note "…" --next "…"` — refresh the '
         f"handoff with `--works-now/--in-progress/--blocked/--watch-out` as needed, then "
         f"`moment sync` to regenerate `.continuity/` (or `moment log --sync` to do both).\n\n"
         f"**Ambient capture**: a Claude Code Stop hook runs `moment capture --hook` so git "
         f"drift is logged automatically — a deliberate `moment log` close-out is still better "
         f"when you have judgment to record.\n\n"
-        f"Binding lives in `.moment.json` (`projectId`, `apiUrl`). The API key comes from the "
+        f"Bindings live in `.moment.json` (`defaultProject`, `projects`, `apiUrl`). The API key comes from the "
         f"environment / `.mcp.json` — never commit a key in `.moment.json`.\n"
         f"{CLAUDE_END}"
     )
@@ -2710,6 +2958,7 @@ def _print_onboard_summary(
 @app.command("onboard")
 def onboard(
     project: Optional[int] = typer.Option(None, "--project", "-p", help="Bind to an existing project instead of creating one."),
+    alias: Optional[str] = typer.Option(None, "--alias", help="Local alias when attaching an existing project."),
     title: Optional[str] = typer.Option(None, "--title", help="Project title when creating/bootstrapping."),
     description: Optional[str] = typer.Option(None, "--description", help="Project description when creating/bootstrapping."),
     description_file: Optional[str] = typer.Option(None, "--description-file", help="Read project description from a file."),
@@ -2718,7 +2967,12 @@ def onboard(
     api_url: Optional[str] = typer.Option(None, "--api-url", help="API URL to bind (default: resolved / localhost)."),
     no_claude: bool = typer.Option(False, "--no-claude", help="Don't touch CLAUDE.md."),
     no_hooks: bool = typer.Option(False, "--no-hooks", help="Don't install capture hooks for detected runtimes."),
-    force: bool = typer.Option(False, "--force", help="Rebind even when .moment.json already has a projectId."),
+    default: bool = typer.Option(False, "--default", help="Make an attached existing project the repository fallback."),
+    rebind: bool = typer.Option(
+        False,
+        "--rebind",
+        help="Allow --alias to be repointed when it already names a different project (otherwise that's an error).",
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Accept defaults and do not prompt."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the onboarding plan without network calls or writes."),
 ) -> None:
@@ -2730,7 +2984,7 @@ def onboard(
         repo = _repo_info(root)
         bound_project = _bound_project_id(root)
         binding_path = _repo_binding_path(root)
-        resolved_url = _default_api_url(api_url)
+        resolved_url = _repo_binding_api_url(root, api_url)
 
         readme_path = _find_readme(root)
         readme_text = _read_text_lossy(readme_path) if readme_path else None
@@ -2743,11 +2997,7 @@ def onboard(
         default_title = title or _project_title_from_repo(str(repo["name"]))
         default_description = description or _description_from_readme(readme_text, default_title)
 
-        if bound_project and not force:
-            if project is not None and project != bound_project:
-                raise typer.BadParameter(
-                    f"{binding_path} is already bound to project #{bound_project}; use --force to rebind."
-                )
+        if bound_project and project is None:
             project_action = f"use existing project #{bound_project}"
             binding_action = f"keep {binding_path}"
         elif project is not None:
@@ -2788,7 +3038,7 @@ def onboard(
 
         prompt = not yes and sys.stdin.isatty()
         bootstrap_result: Optional[dict] = None
-        if bound_project and not force:
+        if bound_project and project is None:
             pid = bound_project
             if not _state.get("json"):
                 console.print(f"[{GLOW}]Already bound[/] {binding_path} → project #{pid}; leaving binding unchanged.")
@@ -2804,7 +3054,19 @@ def onboard(
         elif project is not None:
             pid = project
             client = _get_client()
-            moment_json, had_key = _write_repo_binding(root, pid, resolved_url)
+            attach_alias = alias or (str(repo["name"]) if bound_project is None else f"project-{pid}")
+            moment_json, had_key = _write_repo_binding(
+                root,
+                pid,
+                resolved_url,
+                alias=attach_alias,
+                title=default_title,
+                description=default_description,
+                keywords=[str(repo["name"])],
+                paths=["."],
+                make_default=default or bound_project is None,
+                rebind=rebind,
+            )
             if not _state.get("json"):
                 console.print(f"[{GLOW}]Bound[/] {moment_json} → project #{pid} @ {resolved_url}")
                 if had_key:
@@ -2832,7 +3094,17 @@ def onboard(
             ))
             bootstrap_result = result
             pid = _project_id_from_bootstrap(result)
-            moment_json, had_key = _write_repo_binding(root, pid, resolved_url)
+            moment_json, had_key = _write_repo_binding(
+                root,
+                pid,
+                resolved_url,
+                alias=str(repo["name"]),
+                title=default_title,
+                description=default_description,
+                keywords=[str(repo["name"])],
+                paths=["."],
+                make_default=True,
+            )
             if not _state.get("json"):
                 render_bootstrap(result)
                 console.print(f"[{GLOW}]Bound[/] {moment_json} → project #{pid} @ {resolved_url}")
@@ -2846,7 +3118,7 @@ def onboard(
 
         if not no_claude:
             path = root / "CLAUDE.md"
-            _upsert_claude_block(path, _claude_block(pid))
+            _upsert_claude_block(path, _claude_block())
             if not _state.get("json"):
                 console.print(f"[{GLOW}]Updated[/] {path} [dim](autostart block)[/]")
 
@@ -3069,6 +3341,45 @@ def project_propose(
             print_json(result)
             return
         render_propose_result(result)
+    except Exception as exc:
+        _handle_error(exc)
+
+
+# --- Claim ledger (falsifiers) ---
+
+
+@claim_app.command("falsifiers")
+def claim_falsifiers(
+    signal_id: int = typer.Argument(help="Signal ID of the claim."),
+) -> None:
+    """List what would change our mind about a claim — open falsifiers first."""
+    try:
+        client = _get_client()
+        result = client.get_claim_falsifiers(signal_id)
+        if _state.get("json"):
+            print_json(result)
+            return
+        render_falsifiers(result, signal_id)
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@claim_app.command("add-falsifier")
+def claim_add_falsifier(
+    signal_id: int = typer.Argument(help="Signal ID of the claim this falsifier tests."),
+    title: str = typer.Option(..., "--title", help="One sentence naming the result that would change our mind (≤200 chars)."),
+    body: Optional[str] = typer.Option(None, "--body", help="Optional detail: the test, the threshold, the conditions."),
+    body_file: Optional[str] = typer.Option(None, "--body-file", help="Read the detail from a file instead of --body."),
+) -> None:
+    """Record a falsifier on a claim (needs EDITOR access on the claim's project)."""
+    try:
+        client = _get_client()
+        detail = _read_file(body_file) if body_file else body
+        result = client.add_claim_falsifier(signal_id, title, detail)
+        if _state.get("json"):
+            print_json(result)
+            return
+        render_falsifier_created(result, signal_id)
     except Exception as exc:
         _handle_error(exc)
 

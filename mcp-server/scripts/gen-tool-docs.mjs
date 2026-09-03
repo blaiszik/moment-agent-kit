@@ -8,7 +8,7 @@ const MARKER_END = '<!-- END GENERATED TOOL INVENTORY -->';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const serverRoot = path.resolve(scriptDir, '..');
-const sourcePath = path.join(serverRoot, 'src', 'index.ts');
+const sourcePath = path.join(serverRoot, 'src', 'server.ts');
 
 function findMatchingBracket(source, startIndex) {
   let depth = 0;
@@ -75,7 +75,7 @@ function findMatchingBracket(source, startIndex) {
 function extractToolsArray(source) {
   const declaration = source.indexOf('const TOOLS = [');
   if (declaration === -1) {
-    throw new Error('Could not find `const TOOLS = [` in src/index.ts');
+    throw new Error('Could not find `const TOOLS = [` in src/server.ts');
   }
 
   const start = source.indexOf('[', declaration);
@@ -96,45 +96,26 @@ function oneLine(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
-function replacementFor(description) {
-  const match = description.match(/use `([^`]+)` instead/i);
-  return match ? match[1] : '';
-}
-
 function renderInventory(tools) {
-  const rows = tools.map((tool) => {
-    const description = oneLine(tool.description);
-    return {
-      name: String(tool.name),
-      description,
-      deprecated: /^DEPRECATED\b/i.test(description),
-      replacement: replacementFor(description),
-    };
-  });
+  const rows = tools.map((tool) => ({
+    name: String(tool.name),
+    description: oneLine(tool.description),
+  }));
 
-  const visible = rows.filter((row) => !row.deprecated);
-  const deprecated = rows.filter((row) => row.deprecated);
   const lines = [
     MARKER_START,
     '## Tool inventory',
     '',
-    '_Generated from `src/index.ts` with `node scripts/gen-tool-docs.mjs --write README.md`._',
+    '_Generated from `src/server.ts` with `node scripts/gen-tool-docs.mjs --write README.md`._',
     '',
-    `ListTools exposes ${visible.length} tools. Deprecated aliases remain callable for compatibility but are hidden from ListTools.`,
+    `ListTools exposes all ${rows.length} tools. There are no hidden aliases: renamed or retired tools are deleted outright (no compatibility period).`,
     '',
-    '| Tool | Deprecated | Description |',
-    '|------|------------|-------------|',
+    '| Tool | Description |',
+    '|------|-------------|',
   ];
 
-  for (const row of visible) {
-    lines.push(`| \`${row.name}\` | No | ${row.description} |`);
-  }
-
-  if (deprecated.length > 0) {
-    lines.push('', '### Hidden deprecated aliases', '', '| Alias | Replacement | Description |', '|-------|-------------|-------------|');
-    for (const row of deprecated) {
-      lines.push(`| \`${row.name}\` | \`${row.replacement || 'n/a'}\` | ${row.description} |`);
-    }
+  for (const row of rows) {
+    lines.push(`| \`${row.name}\` | ${row.description} |`);
   }
 
   lines.push(MARKER_END);

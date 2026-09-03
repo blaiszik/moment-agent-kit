@@ -22,11 +22,23 @@ import moment_cli.hooks as h  # noqa: E402
 
 _ok = True
 
+# Under pytest, test_claude/test_codex_config's `tmp` argument is resolved as a
+# fixture; standalone execution (__main__) passes a tempdir positionally instead.
+try:
+    import pytest
+
+    @pytest.fixture
+    def tmp(tmp_path: Path) -> Path:
+        return tmp_path
+except ImportError:  # standalone run — pytest genuinely not needed
+    pass
+
 
 def check(name: str, cond: bool) -> None:
     global _ok
     print(("PASS  " if cond else "FAIL  ") + name)
     _ok = _ok and bool(cond)
+    assert cond, name  # real failure under pytest (standalone exits non-zero via _ok)
 
 
 def test_claude(tmp: Path) -> None:

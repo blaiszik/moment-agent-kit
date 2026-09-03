@@ -1,0 +1,4149 @@
+/**
+ * Moment MCP Server — tool registry + dispatcher (transport-free).
+ *
+ * `createMomentMcpServer({ apiUrl, apiKey })` returns an SDK `Server` with every
+ * tool, the ListTools/CallTool handlers, and the `moment://start-here` resource
+ * registered — but NO transport. `src/index.ts` is the stdio bootstrap; the
+ * hosted /api/mcp endpoint can reuse this same factory over streamable HTTP.
+ *
+ * House rule (prose-first): every tool answers with a readable brief FIRST and a
+ * pointer-only JSON fence below it. Fences carry handles (ids, slugs, uris,
+ * machine contracts) — never bodies the prose already delivered.
+ */
+
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
+
+/** Everything the tool layer needs to talk to a Moment deployment. */
+export interface MomentServerOptions {
+  apiUrl: string;
+  apiKey: string;
+  debug?: boolean;
+}
+
+/** A raw HTTP outcome — used where a tool renders 4xx bodies as prose. */
+interface RawResult {
+  ok: boolean;
+  status: number;
+  data: unknown;
+}
+
+class MomentApiClient {
+  constructor(private readonly serverConfig: MomentServerOptions) {}
+
+  async requestRaw(
+    method: string,
+    path: string,
+    body?: unknown
+  ): Promise<RawResult> {
+    const url = `${this.serverConfig.apiUrl}${path}`;
+    const response = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${this.serverConfig.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+
+    const raw = await response.text();
+    const parsed = raw ? safeJsonParse(raw) : undefined;
+
+    if (this.serverConfig.debug) {
+      console.error(
+        `[moment-mcp] ${method} ${path} -> ${response.status}`
+      );
+    }
+
+    return { ok: response.ok, status: response.status, data: parsed };
+  }
+
+  async request(
+    method: string,
+    path: string,
+    body?: unknown
+  ): Promise<unknown> {
+    const { ok, status, data } = await this.requestRaw(method, path, body);
+
+    if (!ok) {
+      const summary =
+        data === undefined
+          ? 'No response body'
+          : typeof data === 'string'
+            ? data
+            : JSON.stringify(data);
+      throw new Error(`API error (${status}): ${summary}`);
+    }
+
+    return data;
+  }
+
+  get(path: string): Promise<unknown> {
+    return this.request('GET', path);
+  }
+
+  post(path: string, body?: unknown): Promise<unknown> {
+    return this.request('POST', path, body);
+  }
+
+  postRaw(path: string, body?: unknown): Promise<RawResult> {
+    return this.requestRaw('POST', path, body);
+  }
+}
+
+function safeJsonParse(payload: string): unknown {
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return payload;
+  }
+}
+
+// Helper to truncate long strings for discovery/browsing responses
+function truncate(str: string | null | undefined, max = 100): string {
+  if (!str) return '';
+  if (str.length <= max) return str;
+  return str.slice(0, max - 3) + '...';
+}
+
+const START_HERE_URI = 'moment://start-here';
+const PROJECT_JSON_TOKEN_BUDGET = 7_000;
+const PROJECT_JSON_CHAR_BUDGET = PROJECT_JSON_TOKEN_BUDGET * 4;
+const START_HERE_TEXT = `# Moment: start here
+
+Recommended flow (four calls to a submitted contribution):
+1. orient(projectId) — the ONE required first call: brief, must-read pages in full, claimable door tasks, what the lab holds, since-you-were-here.
+2. claim_task(taskId) — reserve the work; the response carries the full working set inline.
+3. submit_task(taskId, ...) — submit the requested JSON or PR deliverable.
+4. log_session(projectId, note) — leave the next agent a handoff.
+
+get_task_context(taskId) is for RE-ENTRY (or a pre-claim preview) — you do not need it after claim_task.
+
+Errors are recovery instructions: branch on type/code, then follow nextStep. The legacy error string always equals message. Use GET /api/v1/agents/me to inspect this key's hourly and claim standing.
+
+Write tier: EDITOR keys apply trusted page/resource/edge writes immediately. A VIEWER key queues supported writes as a 202 proposal, signaled by { "queued": true, "proposal": { ... } }; an editor must approve it.`;
+
+// --------------------------------------------------------------------------
+// Prose-first responses (A1)
+// Context-reading tools compose a well-edited brief server-side; the agent
+// should read THAT prose first and only parse JSON when it needs a field. So
+// for those tools we emit the composed string as the primary text content and
+// append the structured object below a clear separator.
+// --------------------------------------------------------------------------
+
+/**
+ * Build a prose-first text payload: the composed brief on top, the full
+ * structured response below a labeled JSON fence (parse only if you need a field).
+ */
+function proseFirst(brief: string, structured: unknown): string {
+  return `${brief.trim()}\n\n--- structured (JSON) ---\n${JSON.stringify(structured)}`;
+}
+
+/** One text block, prose-first. Every dispatcher case ends here. */
+function textResult(text: string, isError = false): ToolResult {
+  return { content: [{ type: 'text', text }], ...(isError ? { isError: true } : {}) };
+}
+
+/** The shape every tool answers with (an MCP CallTool result). */
+interface ToolResult {
+  content: Array<{ type: 'text'; text: string }>;
+  isError?: boolean;
+  [key: string]: unknown;
+}
+
+/**
+ * Searchability ack (S5). A write that says "saved" without saying whether the
+ * lab can FIND it yet teaches the agent nothing; `indexed` closes that loop.
+ */
+function indexedNote(result: Record<string, unknown> | undefined): string {
+  switch (result?.indexed) {
+    case 'done':
+      return ' Searchable now.';
+    case 'pending':
+      return ' Indexing in flight — searchable shortly.';
+    case 'failed':
+      return ' Indexing failed; the reconciler will retry it.';
+    default:
+      return '';
+  }
+}
+
+/** Pass `indexed` through to the fence only when the server sent one. */
+function indexedPointer(result: Record<string, unknown> | undefined): Record<string, unknown> {
+  return result?.indexed !== undefined ? { indexed: result.indexed } : {};
+}
+
+/** A short "· label: value" line, skipping the parts that are absent. */
+function facts(parts: Array<string | false | null | undefined>): string {
+  return parts.filter((part): part is string => typeof part === 'string' && part.length > 0).join(' · ');
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+}
+
+function asArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? (value as Record<string, unknown>[]) : [];
+}
+
+/**
+ * Compact the orient structured echo (P3). The prose brief above
+ * the fence ALREADY carries the full content (handoff text, page bodies,
+ * resource summaries, narrative), so re-dumping the whole API object below it
+ * doubled the payload. Here we keep only NAVIGATIONAL HANDLES and small
+ * metadata — enough to deep-link or read-on-demand — and explicitly DROP:
+ *   • promptContext (it IS the prose above the fence)
+ *   • page bodies     (slug + title remain → read a page when you need it)
+ *   • mustRead BODIES  (the orient prose delivers them in full; slugs remain)
+ *   • the verbose narrative/coreProfile/protocol prose (it's in the brief)
+ * Unknown/extra fields are ignored, so this can't throw on shape drift.
+ */
+function compactProjectContext(ctx: Record<string, unknown>): Record<string, unknown> {
+  const asArray = (v: unknown): Record<string, unknown>[] =>
+    Array.isArray(v) ? (v as Record<string, unknown>[]) : [];
+  const pages = asArray(ctx.pages).map((p) => ({
+    slug: p.slug, title: p.title, agentRead: p.agentRead, pinned: p.pinned,
+    ...(typeof p.body === 'string' && p.body.length > 0
+      ? { truncated: true, bodyTruncated: true }
+      : {}),
+    // Pass the server's self-describing omission through — a page with no
+    // body here was WITHHELD (readWith fetches it), not empty.
+    ...(p.bodyOmitted === true ? { bodyOmitted: true, readWith: p.readWith } : {}),
+  }));
+  const resources = asArray(ctx.resources).map((r) => ({
+    id: r.id, kind: r.kind, title: r.title, uri: r.uri,
+  }));
+  const handoff = ctx.handoff as Record<string, unknown> | null | undefined;
+  const project = (ctx.project ?? {}) as Record<string, unknown>;
+  const pageBodiesElided = pages.filter((page) => page.bodyTruncated).length;
+  const compact: Record<string, unknown> = {
+    // The brief above is the read-first content; below = pointers only.
+    note: 'Compact pointer subset — the full brief is the prose above this fence. Read a page by its slug, or pull a resource with read_resource(id).',
+    project: {
+      id: project.id,
+      title: project.title,
+      domain: project.domain,
+      status: project.status,
+      githubRepo: project.githubRepo,
+      ...(typeof project.description === 'string' && project.description.length > 0
+        ? { truncated: true, descriptionTruncated: true }
+        : {}),
+    },
+    pages,
+    resources,
+    // The one-door keys (S2). Pointers only: the bodies are in the prose, and
+    // nextCalls are literal call strings the agent can issue verbatim.
+    ...(Array.isArray(ctx.mustRead)
+      ? {
+          mustRead: asArray(ctx.mustRead).map((page) => ({
+            slug: page.slug,
+            title: page.title,
+            role: page.role ?? null,
+            ...(page.bodyIsPartial === true
+              ? { bodyIsPartial: true, readWith: `read_page(${String(project.id ?? '?')}, "${String(page.slug ?? '')}")` }
+              : {}),
+          })),
+        }
+      : {}),
+    ...(Array.isArray(ctx.doorTasks)
+      ? {
+          doorTasks: asArray(ctx.doorTasks).map((task) => ({
+            id: task.id,
+            title: task.title,
+            type: task.type,
+            status: task.status,
+            estimatedMinutes: task.estimatedMinutes ?? null,
+            claimable: task.claimable,
+          })),
+        }
+      : {}),
+    ...(Array.isArray(ctx.nextCalls) ? { nextCalls: ctx.nextCalls } : {}),
+    activeTasks: asArray(ctx.activeTasks).map((task) => ({
+      id: task.id,
+      title: task.title,
+      status: task.status,
+      workType: task.workType,
+      difficulty: task.difficulty,
+      projectId: task.projectId,
+    })),
+    handoff: handoff
+      ? { version: handoff.version, updatedAt: handoff.updatedAt, updatedBy: handoff.updatedBy }
+      : null,
+    contextFreshness: ctx.contextFreshness,
+    stats: ctx.stats,
+    sinceYouWereHere: ctx.sinceYouWereHere,
+    metadata: ctx.metadata,
+    ...(pageBodiesElided > 0
+      ? {
+          truncated: true,
+          elisions: { pageBodies: pageBodiesElided },
+          nextStep: 'Call read_page(projectId, slug) for any full page body elided from this structured JSON.',
+        }
+      : {}),
+  };
+  return capProjectContextJson(compact);
+}
+
+function capProjectContextJson(context: Record<string, unknown>): Record<string, unknown> {
+  if (JSON.stringify(context).length <= PROJECT_JSON_CHAR_BUDGET) return context;
+
+  const elisions = {
+    ...((context.elisions ?? {}) as Record<string, number>),
+    pages: 0,
+    resources: 0,
+    activeTasks: 0,
+  };
+  const lists = ['activeTasks', 'resources', 'pages'] as const;
+
+  // Leave headroom for the explicit budget/elision metadata added below.
+  while (JSON.stringify(context).length > PROJECT_JSON_CHAR_BUDGET - 600) {
+    let target: { key: (typeof lists)[number]; index: number; length: number } | undefined;
+    for (const key of lists) {
+      const list = context[key];
+      if (!Array.isArray(list)) continue;
+      list.forEach((item, index) => {
+        const length = JSON.stringify(item).length;
+        if (!target || length > target.length) target = { key, index, length };
+      });
+    }
+    if (!target) break;
+    (context[target.key] as unknown[]).splice(target.index, 1);
+    elisions[target.key] += 1;
+  }
+
+  context.truncated = true;
+  context.elisions = elisions;
+  context.budget = {
+    approximateTokens: PROJECT_JSON_TOKEN_BUDGET,
+    approximation: '4 JSON characters per token',
+  };
+  context.nextStep =
+    'Call read_page(projectId, slug) for full page bodies; use list_resources/read_resource for elided manifest items.';
+  return context;
+}
+
+/**
+ * Compact the get_task_context structured echo — the same treatment
+ * compactProjectContext gives orient, which was never applied here.
+ *
+ * The route sends the SAME task content three times:
+ *   1. as prose, in `promptInstructions`;
+ *   2. as raw task fields (description / instructions / acceptanceCriteria /
+ *      inputData / project description / working-set excerpts);
+ *   3. as `promptInstructions` AGAIN, inside the JSON fence, because the whole
+ *      response object was echoed below the prose that came out of it.
+ *
+ * We keep only what the prose CANNOT carry — machine contracts and
+ * navigational handles — and drop what it already says. Unknown fields are
+ * ignored, so this cannot throw on shape drift.
+ *
+ * KEPT: ids, credits, deliverable, expectedOutputSchema (a machine contract the
+ * prose only paraphrases), the github block (clone/branch/scope handles), claim
+ * ids and timestamps, workSurface urls, approvedSubmissions, nextStep.
+ * DROPPED: promptInstructions (it IS the prose above the fence), the long task
+ * text fields, inputData (rendered verbatim in the prose), the projectContext
+ * narrative/coreProfile prose, and workingSet excerpts (inlined in the prose).
+ */
+function compactTaskContext(ctx: Record<string, unknown>): Record<string, unknown> {
+  const asArray = (v: unknown): Record<string, unknown>[] =>
+    Array.isArray(v) ? (v as Record<string, unknown>[]) : [];
+  const task = (ctx.task ?? {}) as Record<string, unknown>;
+  const project = (ctx.project ?? {}) as Record<string, unknown>;
+
+  return {
+    note: 'Compact pointer subset — the full task brief is the prose above this fence. Parse a field here only when you need the machine value (expectedOutputSchema, github handles, claim id).',
+    success: ctx.success,
+    task: {
+      id: task.id,
+      title: task.title,
+      workType: task.workType,
+      difficulty: task.difficulty,
+      credits: task.credits,
+      estimatedTokens: task.estimatedTokens,
+      timeoutMinutes: task.timeoutMinutes,
+      dueDate: task.dueDate,
+      tags: task.tags,
+      deliverable: task.deliverable,
+    },
+    deliverable: ctx.deliverable,
+    // The output contract. Not in the prose in a machine-checkable form.
+    expectedOutputSchema: ctx.expectedOutputSchema,
+    github: ctx.github,
+    project: { id: project.id, title: project.title, domain: project.domain },
+    claim: ctx.claim,
+    // Titles + handles only; the excerpts are already inlined in the brief.
+    workingSet: asArray(ctx.workingSet).map((n) => ({
+      type: n.type,
+      id: n.id,
+      slug: n.slug,
+      uri: n.uri,
+      title: n.title,
+    })),
+    workSurfaces: ctx.workSurfaces,
+    approvedSubmissions: ctx.approvedSubmissions,
+    nextStep: ctx.nextStep,
+    metadata: ctx.metadata,
+  };
+}
+
+/**
+ * The pre-claim preview has no `promptInstructions`, so before this it fell
+ * back to a raw JSON dump — the one context tool with no prose at all. Render
+ * the "should I claim this?" decision as a short brief instead.
+ */
+function renderTaskPreview(ctx: Record<string, unknown>): string {
+  const task = (ctx.task ?? {}) as Record<string, unknown>;
+  const project = (ctx.project ?? {}) as Record<string, unknown>;
+  const fit = (ctx.fit ?? {}) as Record<string, unknown>;
+  const lines = [
+    `# Task preview: ${task.title ?? '(untitled)'}`,
+    `${task.workType ?? 'TASK'} · ${task.difficulty ?? 'UNKNOWN'} · ${task.credits ?? 0} credits · ~${task.estimatedTokens ?? '?'} tokens`,
+    `Project: ${project.title ?? '?'} (#${project.id ?? '?'}${project.domain ? `, ${String(project.domain).replace(/_/g, ' ')}` : ''})`,
+    '',
+    '## Acceptance criteria',
+    String(task.acceptanceCriteria || '(none specified)'),
+    '',
+    fit.capabilityMatch
+      ? `## Fit\nMatches your declared capabilities${
+          Array.isArray(fit.matchedCapabilities) && fit.matchedCapabilities.length
+            ? `: ${(fit.matchedCapabilities as string[]).join(', ')}`
+            : ' (you are a generalist — no capabilities declared)'
+        }.`
+      : '## Fit\nNo overlap with your declared capabilities — claim only if you can still do the work.',
+    '',
+    `> ${String(ctx.note || 'Preview only — claim this task to get the full working set.')}`,
+    String(ctx.nextStep || ''),
+  ];
+  return lines.filter((l) => l !== null && l !== undefined).join('\n').trim();
+}
+
+/** A single search hit from the context graph (search_context). */
+interface ContextHit {
+  type?: string;
+  entityType?: string;
+  id?: string | number | null;
+  projectId?: number | null;
+  title?: string | null;
+  ref?: string | null;
+  snippet?: string;
+  score?: number;
+  /** S1 literal floor: this hit contains an exact identifier from the query. */
+  literal?: boolean;
+  match?: { literal?: boolean };
+}
+
+/** Did the retrieval layer flag this hit as an exact-identifier match? */
+function isLiteralHit(hit: ContextHit): boolean {
+  return hit.match?.literal === true || hit.literal === true;
+}
+
+/**
+ * Render context-search hits as a short labeled markdown list
+ * (title — type — project — snippet — id) instead of a JSON dump.
+ * A leading `=` marks an exact-identifier (literal) match.
+ */
+function renderContextHits(results: ContextHit[]): string {
+  if (!results || results.length === 0) {
+    return 'No matching context found. Try a broader query, drop the scope (projectId/campaign/user/team), or widen `since`.';
+  }
+  const lines = ['## Context search — most relevant hits', ''];
+  results.forEach((h, i) => {
+    const title = (h.title || '(untitled)').trim();
+    const type = (h.entityType || 'NODE').toLowerCase();
+    const proj = h.projectId != null ? `project #${h.projectId}` : 'global';
+    const id = h.ref ? `ref ${h.ref}` : `project #${h.projectId ?? '?'}`;
+    const snippet = h.snippet ? truncate(h.snippet.replace(/\s+/g, ' ').trim(), 140) : '';
+    const mark = isLiteralHit(h) ? '= ' : '';
+    lines.push(`${i + 1}. ${mark}**${title}** — ${type} — ${proj}${snippet ? ` — ${snippet}` : ''} — _${id}_`);
+  });
+  if (results.some(isLiteralHit)) {
+    lines.push('');
+    lines.push('_`=` marks an exact identifier match (DOI, arXiv id, repo, symbol) — those are floored to the top._');
+  }
+  lines.push('');
+  lines.push(
+    '_Open a project with orient(projectId), read a PAGE hit with read_page(projectId, slug), or pull a resource with read_resource._'
+  );
+  return lines.join('\n');
+}
+
+/** A single inspectable evidence item in a Research Context Packet. */
+interface PacketEvidenceItem {
+  title: string;
+  uri?: string;
+  locator?: { href?: string };
+  authority: string;
+  match: { reason: string };
+}
+
+/** The fields needed to render a Research Context Packet prose-first. */
+interface ContextPacketResponse {
+  question: string;
+  caveats: string[];
+  evidence: PacketEvidenceItem[];
+  tokenEstimate: number;
+  tokenBudget: number;
+}
+
+/** Metadata returned for a persisted Research Context Packet snapshot. */
+interface SavedPacketMeta {
+  id: number;
+  projectId: number;
+  question: string;
+  compilerVersion: string;
+  createdAt: string;
+  createdBy?: { name: string | null } | null;
+  createdByAgent?: { name: string | null } | null;
+  evidenceCount: number;
+}
+
+/** A persisted packet includes its full immutable snapshot. */
+interface SavedPacket extends SavedPacketMeta {
+  packet: ContextPacketResponse;
+}
+
+/** Render the inspectable evidence summary that leads a Research Context Packet. */
+function renderContextPacket(packet: ContextPacketResponse): string {
+  const evidence = packet.evidence || [];
+  const caveats = packet.caveats || [];
+  const lines = [
+    '## Research Context Packet',
+    `Question: ${packet.question}`,
+    `Evidence items: ${evidence.length}`,
+    `Token estimate: ${packet.tokenEstimate} / ${packet.tokenBudget}`,
+    'Caveats:',
+    ...(caveats.length > 0 ? caveats.map((caveat) => `- ${caveat}`) : ['- None']),
+    '',
+  ];
+
+  for (const item of evidence) {
+    const locator = item.locator?.href || item.uri;
+    lines.push(
+      `- [${item.authority}] ${item.title} — ${item.match.reason}${locator ? ` (${locator})` : ''}`
+    );
+  }
+
+  return lines.join('\n');
+}
+
+/** Render the stable handle returned after saving a packet snapshot. */
+function renderSavedPacketMeta(packet: SavedPacketMeta): string {
+  return [
+    '## Research Context Packet saved',
+    `ID: ${packet.id}`,
+    `Question: ${packet.question}`,
+    `Evidence items: ${packet.evidenceCount}`,
+    `Permalink: /projects/${packet.projectId}/packets/${packet.id}`,
+  ].join('\n');
+}
+
+/** Render saved packet metadata as compact, scannable lines. */
+function renderSavedPacketList(packets: SavedPacketMeta[]): string {
+  if (packets.length === 0) {
+    return 'No saved Research Context Packets found for this project.';
+  }
+
+  const lines = [`## Saved Research Context Packets (${packets.length})`, ''];
+  for (const packet of packets) {
+    const author = packet.createdBy?.name || packet.createdByAgent?.name || 'Unknown author';
+    lines.push(
+      `- #${packet.id} — ${packet.question} — ${packet.evidenceCount} evidence item${packet.evidenceCount === 1 ? '' : 's'} — ${packet.createdAt} — ${author}`
+    );
+  }
+  return lines.join('\n');
+}
+
+type ClaimEvidenceItem = {
+  kind?: string;
+  otherType?: string;
+  otherId?: number;
+  title?: string | null;
+};
+
+function renderQuestionLedger(result: Record<string, unknown>): string {
+  const questions = Array.isArray(result.questions)
+    ? result.questions as Record<string, unknown>[]
+    : [];
+  if (!questions.length) return 'No questions match this status in the project.';
+  const lines = [`## Questions (${questions.length}${result.truncated === true ? '+' : ''})`, ''];
+  for (const question of questions) {
+    const children = Array.isArray(question.childIds) ? question.childIds as number[] : [];
+    lines.push(
+      `- #${question.id} · ${question.epistemicStatus} — ${question.content}` +
+      (children.length ? `\n  Decomposes into signal ids: ${children.join(', ')}` : ''),
+    );
+  }
+  if (result.truncated === true) lines.push('', 'More questions exist; this response is capped at 50.');
+  return lines.join('\n');
+}
+
+function questionPointers(result: Record<string, unknown>): Record<string, unknown> {
+  const questions = Array.isArray(result.questions)
+    ? result.questions as Record<string, unknown>[]
+    : [];
+  return {
+    questions: questions.map((question) => ({
+      id: question.id,
+      publicId: question.publicId,
+      epistemicStatus: question.epistemicStatus,
+      childIds: question.childIds,
+      createdAt: question.createdAt,
+      updatedAt: question.updatedAt,
+    })),
+    truncated: result.truncated === true,
+  };
+}
+
+function renderEvidenceItems(items: ClaimEvidenceItem[]): string[] {
+  return items.map((item) =>
+    `- ${item.kind} · ${item.otherType}:${item.otherId}${item.title ? ` — ${item.title}` : ''}`,
+  );
+}
+
+type FalsifierSummary = {
+  total?: number;
+  open?: number;
+  refs?: { signalId?: number; title?: string; open?: boolean }[];
+};
+
+/** Falsifiers live top-level on the state payload and inside derivedState. */
+function falsifierSummary(
+  result: Record<string, unknown>,
+  derived: Record<string, unknown>,
+): FalsifierSummary {
+  const summary = (result.falsifiers ?? derived.falsifiers ?? {}) as FalsifierSummary;
+  return summary;
+}
+
+function renderFalsifiers(summary: FalsifierSummary): string[] {
+  const refs = Array.isArray(summary.refs) ? summary.refs : [];
+  if (!refs.length) return ['- None recorded. Nothing has been named that would change our mind.'];
+  return refs.map((ref) =>
+    `- ${ref.open === false ? 'settled' : 'OPEN'} · #${ref.signalId} — ${ref.title ?? ''}`,
+  );
+}
+
+function renderClaimState(result: Record<string, unknown>): string {
+  const claim = (result.claim ?? {}) as Record<string, unknown>;
+  const derived = (result.derivedState ?? {}) as Record<string, unknown>;
+  const summary = (derived.summary ?? {}) as Record<string, unknown>;
+  const evidence = (result.evidence ?? {}) as Record<string, unknown>;
+  const forItems = Array.isArray(evidence.for) ? evidence.for as ClaimEvidenceItem[] : [];
+  const againstItems = Array.isArray(evidence.against) ? evidence.against as ClaimEvidenceItem[] : [];
+  const review = (claim.review ?? {}) as Record<string, unknown>;
+  const lines = [
+    `## Claim #${claim.id} · ${claim.type}`,
+    '',
+    String(claim.content ?? ''),
+    '',
+    `Stored: ${claim.epistemicStatus ?? 'none'} · Suggested: ${derived.suggestedEpistemicStatus ?? 'none'} · Publication: ${claim.publicationStatus}`,
+    `Review: ${review.state ?? 'unknown'}`,
+    `Evidence structure: ${summary.forCount ?? 0} for, ${summary.againstCount ?? 0} against, ${summary.reproducedCount ?? 0} reproductions.`,
+    String(derived.rationale ?? ''),
+  ];
+  const falsifiers = falsifierSummary(result, derived);
+  const stake = result.structuralStake ?? derived.structuralStake;
+  lines.push(
+    `Falsifiers: ${falsifiers.open ?? 0} open of ${falsifiers.total ?? 0}` +
+    (stake === undefined || stake === null ? '.' : ` · structural stake ${stake}.`),
+  );
+  if (result.note) lines.push(String(result.note));
+  lines.push('', '### For', ...(forItems.length ? renderEvidenceItems(forItems) : ['- None linked.']));
+  lines.push('', '### Against', ...(againstItems.length ? renderEvidenceItems(againstItems) : ['- None linked.']));
+  lines.push('', '### Falsifiers', ...renderFalsifiers(falsifiers));
+  return lines.join('\n');
+}
+
+function claimStatePointers(result: Record<string, unknown>): Record<string, unknown> {
+  const claim = (result.claim ?? {}) as Record<string, unknown>;
+  const derived = (result.derivedState ?? {}) as Record<string, unknown>;
+  const evidence = (result.evidence ?? {}) as Record<string, unknown>;
+  const handles = (items: unknown) => (Array.isArray(items) ? items as ClaimEvidenceItem[] : []).map((item) => ({
+    kind: item.kind, otherType: item.otherType, otherId: item.otherId,
+  }));
+  return {
+    claim: {
+      id: claim.id,
+      publicId: claim.publicId,
+      type: claim.type,
+      epistemicStatus: claim.epistemicStatus,
+      publicationStatus: claim.publicationStatus,
+      review: claim.review,
+    },
+    derivedState: {
+      summary: derived.summary,
+      suggestedEpistemicStatus: derived.suggestedEpistemicStatus,
+      divergesFromStored: derived.divergesFromStored,
+    },
+    evidence: { for: handles(evidence.for), against: handles(evidence.against) },
+    falsifiers: falsifierSummary(result, derived),
+    structuralStake: result.structuralStake ?? derived.structuralStake ?? null,
+  };
+}
+
+function renderEvidenceSearch(result: Record<string, unknown>): string {
+  const evidence = Array.isArray(result.evidence) ? result.evidence as ClaimEvidenceItem[] : [];
+  if (!evidence.length) return `No ${result.stance ?? 'matching'} evidence is linked to signal ${result.signalId}.`;
+  return [
+    `## ${String(result.stance ?? 'all')} evidence for signal ${result.signalId} (${evidence.length})`,
+    '',
+    ...renderEvidenceItems(evidence),
+  ].join('\n');
+}
+
+// Helper to create concise task summary for browsing
+function summarizeTask(c: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: c.id,
+    title: truncate(String(c.title || ''), 80),
+    workType: c.workType,
+    difficulty: c.difficulty,
+    credits: c.credits || c.baseCredits,
+    contributorType: c.contributorType,
+    canAI: c.canAI,
+    projectId: c.project ? (c.project as Record<string, unknown>).id : null,
+    projectTitle: c.project ? truncate(String((c.project as Record<string, unknown>).title || ''), 50) : null,
+    aiScore: c.aiRecommendation ? (c.aiRecommendation as Record<string, unknown>).score : null,
+    claimable: c.claimable,
+    ...(typeof c.claimBlockedBy === 'string' ? { claimBlockedBy: c.claimBlockedBy } : {}),
+  };
+}
+
+// --------------------------------------------------------------------------
+// Prose renderers for the task loop, the writes, and the browse tools (1.3).
+// Each one answers the question the caller actually asked in a line or two;
+// the JSON fence beside it carries only handles.
+// --------------------------------------------------------------------------
+
+/** get_tasks — a claimable-first menu, not a task dump. */
+function renderTaskList(
+  tasks: Record<string, unknown>[],
+  recommended: Record<string, unknown> | null,
+  tip: string,
+  experiments: unknown[],
+): string {
+  if (tasks.length === 0) {
+    return `No AI-eligible tasks match that filter. ${tip}`;
+  }
+  const claimable = tasks.filter((task) => task.claimable === true);
+  const lines = [
+    `## ${tasks.length} task${tasks.length === 1 ? '' : 's'} · ${claimable.length} claimable by this key`,
+    '',
+  ];
+  for (const task of tasks) {
+    const gate = task.claimable === true ? 'claimable' : `blocked: ${String(task.claimBlockedBy ?? 'unknown')}`;
+    lines.push(
+      `- #${task.id} **${task.title}** — ${facts([
+        String(task.workType ?? ''),
+        String(task.difficulty ?? ''),
+        `${task.credits ?? 0} credits`,
+        task.projectTitle ? `project #${task.projectId} ${task.projectTitle}` : '',
+        gate,
+      ])}`,
+    );
+  }
+  if (recommended) lines.push('', `Recommended: #${recommended.id} — ${String(recommended.title ?? '')}.`);
+  lines.push('', tip);
+  if (experiments.length > 0) {
+    lines.push(`${experiments.length} active experiment loop(s) too — list_experiments() to join one.`);
+  }
+  return lines.join('\n');
+}
+
+/** submit_task / submit_task_pr — did it land, and what happens next. */
+function renderSubmission(result: Record<string, unknown>, taskId: number): string {
+  const submission = asRecord(result.submission);
+  const id = submission.id ?? result.submissionId ?? result.id;
+  const status = submission.status ?? result.status ?? 'SUBMITTED';
+  const credits = submission.creditsAwarded ?? result.creditsAwarded;
+  const measurements = asArray(result.campaignMeasurements ?? result.measurements);
+  return facts([
+    `Submission #${id ?? '?'} filed for task #${taskId} — status ${String(status)}.`,
+    credits !== undefined && credits !== null ? `${credits} credits pending review` : '',
+    measurements.length > 0
+      ? `${measurements.length} campaign measurement(s) recorded as REPORTED (steward verification is separate — they do not move dials yet)`
+      : '',
+    String(result.nextStep ?? result.message ?? 'A human reviews it next; get_my_claims(includeRecentlyDecided: true) shows the outcome.'),
+  ]);
+}
+
+/** A submission/claim pointer subset — ids and states, never the reasoning text. */
+function submissionPointers(result: Record<string, unknown>): Record<string, unknown> {
+  const submission = asRecord(result.submission);
+  return {
+    ok: result.success !== false,
+    submissionId: submission.id ?? result.submissionId ?? result.id ?? null,
+    status: submission.status ?? result.status ?? null,
+    taskStatus: asRecord(result.task).status ?? null,
+    ...(result.creditsAwarded !== undefined ? { creditsAwarded: result.creditsAwarded } : {}),
+    ...(result.prUrl !== undefined ? { prUrl: result.prUrl } : {}),
+    ...(result.nextStep !== undefined ? { nextStep: result.nextStep } : {}),
+  };
+}
+
+/** get_my_claims — what this key is holding, and what came back from review. */
+function renderClaims(result: Record<string, unknown>): string {
+  const claims = asArray(result.claims ?? result.activeClaims);
+  const decided = asArray(result.recentlyDecided);
+  const lines: string[] = [];
+  lines.push(
+    claims.length === 0
+      ? 'You hold no open claims. get_tasks(claimable: true) to pick up work.'
+      : `## ${claims.length} open claim${claims.length === 1 ? '' : 's'}`,
+  );
+  for (const claim of claims) {
+    const task = asRecord(claim.task);
+    lines.push(
+      `- task #${task.id ?? claim.taskId} **${String(task.title ?? claim.title ?? '')}** — ${facts([
+        String(claim.status ?? ''),
+        claim.expiresAt ? `expires ${String(claim.expiresAt)}` : '',
+      ])}`,
+    );
+  }
+  if (decided.length > 0) {
+    lines.push('', `## ${decided.length} recently decided`);
+    for (const item of decided) {
+      lines.push(
+        `- task #${item.taskId ?? asRecord(item.task).id} — ${String(item.status ?? '')}${
+          item.reviewFeedback ? ` — ${truncate(String(item.reviewFeedback), 160)}` : ''
+        }`,
+      );
+    }
+  }
+  return lines.join('\n');
+}
+
+/** get_my_stats — the standing of this key in one line. */
+function renderStats(result: Record<string, unknown>): string {
+  const stats = Object.keys(asRecord(result.stats)).length > 0 ? asRecord(result.stats) : result;
+  return facts([
+    `Completed ${String(stats.tasksCompleted ?? stats.completed ?? 0)} tasks`,
+    `${String(stats.creditsEarned ?? stats.credits ?? 0)} credits`,
+    stats.successRate !== undefined ? `${String(stats.successRate)} success rate` : '',
+    stats.activeClaims !== undefined ? `${String(stats.activeClaims)} open claims` : '',
+  ]) + '.';
+}
+
+/** list_team_open_roles — the seat map as a scannable list. */
+function renderOpenRoles(result: Record<string, unknown>): string {
+  const roles = asArray(result.roles ?? result.openRoles);
+  if (roles.length === 0) return 'No open roles match that filter right now.';
+  const lines = [`## ${roles.length} open role${roles.length === 1 ? '' : 's'}`, ''];
+  for (const role of roles) {
+    const team = asRecord(role.team);
+    lines.push(
+      `- **${String(role.title ?? role.kind ?? 'Role')}** — ${facts([
+        String(team.name ?? role.teamName ?? role.teamSlug ?? ''),
+        String(role.kind ?? ''),
+        String(role.commitment ?? ''),
+        Array.isArray(role.skills) && role.skills.length ? (role.skills as string[]).join(', ') : '',
+        String(role.joinUrl ?? (team.slug ? `/teams/${String(team.slug)}` : '')),
+      ])}`,
+    );
+  }
+  return lines.join('\n');
+}
+
+/** list_resources — the manifest, work surfaces first. */
+function renderResourceList(result: Record<string, unknown>): string {
+  const resources = asArray(result.resources ?? result);
+  if (resources.length === 0) return 'This project has no resources yet. add_resource(projectId, uri) attaches one.';
+  const surfaces = resources.filter((r) => r.isWorkSurface === true);
+  const lines = [
+    `## ${resources.length} resource${resources.length === 1 ? '' : 's'}${
+      surfaces.length ? ` · ${surfaces.length} work surface${surfaces.length === 1 ? '' : 's'}` : ''
+    }`,
+    '',
+  ];
+  for (const resource of [...surfaces, ...resources.filter((r) => r.isWorkSurface !== true)]) {
+    lines.push(
+      `- #${resource.id} ${resource.isWorkSurface === true ? '**[work here]** ' : ''}${String(resource.title ?? resource.uri ?? '')} — ${facts([
+        String(resource.kind ?? ''),
+        String(resource.role ?? ''),
+        resource.summary ? truncate(String(resource.summary).replace(/\s+/g, ' '), 140) : '',
+        String(resource.uri ?? ''),
+      ])}`,
+    );
+  }
+  lines.push('', '_read_resource(projectId, id) pulls one into context._');
+  return lines.join('\n');
+}
+
+/** read_resource — the content IS the answer; lead with it. */
+function renderResourceRead(result: Record<string, unknown>): string {
+  const resource = Object.keys(asRecord(result.resource)).length > 0 ? asRecord(result.resource) : result;
+  const content = result.text ?? result.content ?? resource.text ?? resource.content;
+  const header = `# ${String(resource.title ?? resource.uri ?? 'Resource')}\n${facts([
+    String(resource.kind ?? ''),
+    String(resource.uri ?? ''),
+    result.fidelity ? `fidelity ${String(result.fidelity)}` : '',
+    result.section ? `section ${String(result.section)}` : '',
+  ])}`;
+  if (typeof content === 'string' && content.length > 0) return `${header}\n\n${content}`;
+  const summary = resource.summary ?? resource.accessNote;
+  return `${header}\n\n${
+    typeof summary === 'string' && summary.length > 0
+      ? summary
+      : 'No text is available at this fidelity — try fidelity: "text", or open the uri directly.'
+  }`;
+}
+
+/** list_discussions — the threads and where to post. */
+function renderDiscussions(discussions: Record<string, unknown>[]): string {
+  if (discussions.length === 0) {
+    return 'No discussions in this project yet. contribute(type: "message") needs a discussionId, so start one in the web app.';
+  }
+  const lines = [`## ${discussions.length} discussion${discussions.length === 1 ? '' : 's'}`, ''];
+  for (const discussion of discussions) {
+    lines.push(
+      `- #${discussion.id} **${String(discussion.title ?? '(untitled)')}** — ${facts([
+        discussion.messageCount !== undefined ? `${String(discussion.messageCount)} messages` : '',
+        discussion.updatedAt ? `updated ${String(discussion.updatedAt)}` : '',
+      ])}`,
+    );
+  }
+  lines.push('', '_get_discussion_messages(projectId, discussionId) reads one; post_message writes to it._');
+  return lines.join('\n');
+}
+
+/** get_discussion_messages — the thread itself, in order. */
+function renderMessages(result: Record<string, unknown>): string {
+  const messages = asArray(result.messages ?? result);
+  if (messages.length === 0) return 'No messages match that filter.';
+  const lines = [`## ${messages.length} message${messages.length === 1 ? '' : 's'}`, ''];
+  for (const message of messages) {
+    const author = asRecord(message.author ?? message.user ?? message.agent);
+    lines.push(
+      `**${String(author.name ?? author.handle ?? message.authorName ?? 'unknown')}** · ${String(
+        message.createdAt ?? '',
+      )}${message.discussionId !== undefined ? ` · discussion #${String(message.discussionId)}` : ''}`,
+    );
+    lines.push(String(message.content ?? ''));
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+/** get_backlinks — how a page connects, both directions. */
+function renderGraph(result: Record<string, unknown>, page: string): string {
+  const backlinks = asArray(result.backlinks ?? result.incoming);
+  const forward = asArray(result.forwardLinks ?? result.outgoing);
+  const label = (edge: Record<string, unknown>) => {
+    const other = asRecord(edge.other ?? edge.node ?? edge.target ?? edge.source);
+    return `${String(edge.kind ?? 'LINKS')} → ${String(other.type ?? edge.otherType ?? 'NODE')}:${String(
+      other.slug ?? other.uri ?? other.id ?? edge.otherId ?? '?',
+    )}${other.title ? ` (${String(other.title)})` : ''}`;
+  };
+  if (backlinks.length === 0 && forward.length === 0) {
+    return `Page "${page}" has no context-graph edges yet. link_context(projectId, from, to, kind) authors one.`;
+  }
+  return [
+    `## Graph for "${page}" — ${backlinks.length} in, ${forward.length} out`,
+    '',
+    '### Links to this page',
+    ...(backlinks.length ? backlinks.map((edge) => `- ${label(edge)}`) : ['- None.']),
+    '',
+    '### Links from this page',
+    ...(forward.length ? forward.map((edge) => `- ${label(edge)}`) : ['- None.']),
+  ].join('\n');
+}
+
+/** Edge pointers for the graph fence — kinds and handles only. */
+function graphPointers(result: Record<string, unknown>): Record<string, unknown> {
+  const handles = (edges: unknown) =>
+    asArray(edges).map((edge) => {
+      const other = asRecord(edge.other ?? edge.node ?? edge.target ?? edge.source);
+      return {
+        kind: edge.kind,
+        type: other.type ?? edge.otherType ?? null,
+        ref: other.slug ?? other.uri ?? other.id ?? edge.otherId ?? null,
+      };
+    });
+  return {
+    backlinks: handles(result.backlinks ?? result.incoming),
+    forwardLinks: handles(result.forwardLinks ?? result.outgoing),
+  };
+}
+
+/** list_experiments — the open loops. */
+function renderExperiments(result: Record<string, unknown>): string {
+  const experiments = asArray(result.experiments ?? result);
+  if (experiments.length === 0) return 'No active experiment loops right now.';
+  const lines = [`## ${experiments.length} active experiment loop${experiments.length === 1 ? '' : 's'}`, ''];
+  for (const experiment of experiments) {
+    lines.push(
+      `- project #${experiment.projectId ?? asRecord(experiment.project).id} **${String(
+        experiment.title ?? asRecord(experiment.project).title ?? '',
+      )}** — ${facts([
+        experiment.metricName ? `metric ${String(experiment.metricName)}` : '',
+        experiment.bestMetric !== undefined && experiment.bestMetric !== null ? `best ${String(experiment.bestMetric)}` : '',
+        experiment.iterations !== undefined ? `${String(experiment.iterations)} iterations` : '',
+      ])}`,
+    );
+  }
+  lines.push('', '_get_experiment_state(projectId) gives the loop instructions._');
+  return lines.join('\n');
+}
+
+/** get_experiment_state — what to run, and what to beat. */
+function renderExperimentState(result: Record<string, unknown>): string {
+  const experiment = Object.keys(asRecord(result.experiment)).length > 0 ? asRecord(result.experiment) : result;
+  const runs = asArray(result.recentRuns ?? result.runs);
+  const lines = [
+    `## Experiment loop — project #${String(experiment.projectId ?? result.projectId ?? '?')}`,
+    facts([
+      experiment.metricName ? `metric ${String(experiment.metricName)}` : '',
+      experiment.metricDirection ? String(experiment.metricDirection) : '',
+      experiment.bestMetric !== undefined && experiment.bestMetric !== null ? `best so far ${String(experiment.bestMetric)}` : '',
+      experiment.evalCommand ? `eval: ${String(experiment.evalCommand)}` : '',
+      experiment.repoUrl ? String(experiment.repoUrl) : '',
+    ]),
+  ];
+  if (typeof result.instructions === 'string' && result.instructions.length > 0) {
+    lines.push('', String(result.instructions));
+  }
+  if (runs.length > 0) {
+    lines.push('', `### Last ${runs.length} run(s)`);
+    for (const run of runs) {
+      lines.push(
+        `- iter ${String(run.iteration ?? '?')} — ${String(run.metricValue ?? '?')} — ${
+          run.accepted === true ? 'kept' : 'reverted'
+        }${run.description ? ` — ${truncate(String(run.description), 100)}` : ''}`,
+      );
+    }
+  }
+  lines.push('', '_submit_experiment_result(projectId, metricValue, accepted) files one iteration._');
+  return lines.join('\n');
+}
+
+/** get_experiment_leaderboard — the ranking, briefly. */
+function renderLeaderboard(result: Record<string, unknown>): string {
+  const entries = asArray(result.leaderboard ?? result.entries ?? result.topImprovements);
+  const agents = asArray(result.agents ?? result.agentStats);
+  if (entries.length === 0 && agents.length === 0) return 'No experiment results have been submitted for this project yet.';
+  const lines = [`## Experiment leaderboard — project #${String(result.projectId ?? '?')}`, ''];
+  entries.forEach((entry, i) => {
+    lines.push(
+      `${i + 1}. ${String(entry.metricValue ?? entry.metric ?? '?')} — ${facts([
+        String(asRecord(entry.agent).name ?? entry.agentName ?? ''),
+        entry.iteration !== undefined ? `iter ${String(entry.iteration)}` : '',
+        entry.prUrl ? String(entry.prUrl) : '',
+      ])}`,
+    );
+  });
+  if (agents.length > 0) {
+    lines.push('', '### Per-agent');
+    for (const agent of agents) {
+      lines.push(
+        `- ${String(agent.name ?? agent.agentName ?? '?')} — ${facts([
+          agent.iterations !== undefined ? `${String(agent.iterations)} iterations` : '',
+          agent.improvementRate !== undefined ? `${String(agent.improvementRate)} improvement rate` : '',
+        ])}`,
+      );
+    }
+  }
+  return lines.join('\n');
+}
+
+/** Evidence pointers for a packet fence — one handle per item, no bodies. */
+function packetPointers(packet: ContextPacketResponse | undefined): Record<string, unknown> {
+  const evidence = packet?.evidence ?? [];
+  return {
+    question: packet?.question,
+    tokenEstimate: packet?.tokenEstimate,
+    tokenBudget: packet?.tokenBudget,
+    evidence: evidence.map((item) => ({
+      title: item.title,
+      authority: item.authority,
+      uri: item.uri ?? item.locator?.href ?? null,
+    })),
+  };
+}
+
+// Define tools
+const TOOLS = [
+  // ============================================
+  // CLAIM LEDGER TOOLS
+  // ============================================
+  {
+    name: 'list_open_questions',
+    description:
+      'Use when choosing what the project still needs answered or inspecting its question decomposition. Unlike get_claim_state, this scans one project and returns up to 50 published questions with one level of PART_OF children; status defaults to open.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'integer', minimum: 1, description: 'The project whose published questions to list.' },
+        status: { type: 'string', enum: ['open', 'answered', 'all'], description: 'Question state filter (default: open).' },
+      },
+      required: ['projectId'],
+    },
+  },
+  {
+    name: 'get_claim_state',
+    description:
+      'Use when deciding how one claim currently stands before citing, challenging, or extending it. Unlike find_evidence, this returns the claim core, human review state, the full structurally derived epistemic state, and both evidence stances; it never invents falsifiers.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        signalId: { type: 'integer', minimum: 1, description: 'Numeric signal id for the claim.' },
+      },
+      required: ['signalId'],
+    },
+  },
+  {
+    name: 'find_evidence',
+    description:
+      'Use when gathering the authored evidence linked to one claim, optionally narrowed by stance. Unlike get_claim_state, this is the focused evidence lookup: support includes EVIDENCE_FOR, REPRODUCES, and ANSWERS; opposition includes CONTRADICTS and REFUTES.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        signalId: { type: 'integer', minimum: 1, description: 'Numeric signal id for the claim.' },
+        stance: { type: 'string', enum: ['for', 'against', 'all'], description: 'Evidence stance filter (default: all).' },
+      },
+      required: ['signalId'],
+    },
+  },
+  {
+    name: 'propose_evidence_link',
+    description:
+      'Use when you have a concrete typed relation to add to a claim and want a human to attest it. Unlike link_context, this never writes an edge directly: it always queues a PENDING EDGE_ADD proposal after validating the claim-relation vocabulary.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        signalId: { type: 'integer', minimum: 1, description: 'The subject claim or question.' },
+        kind: {
+          type: 'string',
+          enum: ['EVIDENCE_FOR', 'CONTRADICTS', 'REPRODUCES', 'ANSWERS', 'REFUTES', 'SUPERSEDES', 'PART_OF', 'DEPENDS_ON'],
+          description: 'Authored relation kind; orientation follows Moment’s claim vocabulary.',
+        },
+        targetType: {
+          type: 'string',
+          enum: ['PAGE', 'RESOURCE', 'SESSION_NOTE', 'SUBMISSION', 'DISCUSSION', 'SIGNAL'],
+          description: 'Type of the relation’s other endpoint.',
+        },
+        targetId: { type: 'integer', minimum: 1, description: 'Numeric id of the relation’s other endpoint.' },
+        note: { type: 'string', maxLength: 500, description: 'Optional reviewer-facing reason this relation holds.' },
+      },
+      required: ['signalId', 'kind', 'targetType', 'targetId'],
+    },
+  },
+  {
+    name: 'add_falsifier',
+    description:
+      'Use when you can name the result that would change your mind about a claim, and want it standing on the record before the evidence arrives. Unlike propose_evidence_link, this writes immediately rather than queueing: the falsifier becomes a QUESTION signal joined to the claim by a TESTS edge, and the response carries the claim state with the new falsifier counted.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        signalId: { type: 'integer', minimum: 1, description: 'The claim this falsifier tests. A QUESTION cannot host a falsifier.' },
+        title: { type: 'string', maxLength: 200, description: 'One sentence naming the result that would change our mind.' },
+        body: { type: 'string', maxLength: 5000, description: 'Optional detail: the test, the threshold, the conditions under which it counts.' },
+      },
+      required: ['signalId', 'title'],
+    },
+  },
+  // ============================================
+  // TASK TOOLS (Unified Model)
+  // These tools use the unified Task model
+  // which merges previous Tasks + WorkUnits with clear AI eligibility
+  // ============================================
+  {
+    name: 'get_tasks',
+    description:
+      'Get AI-eligible tasks. Prefer claimable=true for work this key can take now; otherwise read each task\'s claimable and claimBlockedBy fields before claim_task. The default remains unfiltered. Optionally pass a query to rank tasks by semantic relevance.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'number',
+          description: 'Optional: Focus on a specific project',
+        },
+        workType: {
+          type: 'string',
+          enum: [
+            'LITERATURE_REVIEW',
+            'HYPOTHESIS_CRITIQUE',
+            'DATA_ANALYSIS',
+            'DISCUSSION_SYNTHESIS',
+            'QUESTION_ANSWER',
+            'CODE_REVIEW',
+            'WRITING_ASSIST',
+            'IDEA_GENERATION',
+            'CODE_CONTRIBUTION',
+            'EXPERIMENT_ITERATION',
+            'RESEARCH_TASK',
+          ],
+          description: 'Optional: Filter by work type',
+        },
+        difficulty: {
+          type: 'string',
+          enum: ['TRIVIAL', 'EASY', 'MEDIUM', 'HARD', 'EXPERT'],
+          description: 'Optional: Filter by difficulty',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max results (default: 10)',
+        },
+        query: {
+          type: 'string',
+          description: 'Optional: natural-language description of what you want to work on; tasks are ranked by semantic relevance instead of credits/priority',
+        },
+        claimable: {
+          type: 'boolean',
+          description: 'Set true to return only tasks this authenticated key can claim now',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'claim_task',
+    description:
+      'Claim a task to start working on it, and get the full working set back in the SAME response — acceptance criteria, instructions, input data, the machine output contract, github handles, and the neighboring context. Use the ID from get_tasks or orient. LIMIT: you may hold at most 20 claims in a rolling 24 hours — over the cap this returns a 429 carrying limit/used/retryAfter, so finish what you hold before claiming more. Claiming needs EDITOR access to the project.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        taskId: {
+          type: 'integer',
+          minimum: 1,
+          description: 'The ID of the task to claim (from get_tasks)',
+        },
+      },
+      required: ['taskId'],
+    },
+  },
+  {
+    name: 'get_task_context',
+    description:
+      'For RE-ENTRY, or for a pre-claim preview — you do NOT need it after claim_task, which already returns the full working set inline. Call it BEFORE claiming to see acceptance criteria + fit and decide whether to claim, or later to reload a task you already hold. (Not orient, which is the whole project; not search_context, which is cross-project discovery.) Returns a ready-to-read brief; the structured JSON follows below it.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        taskId: {
+          type: 'number',
+          description: 'The ID of the task',
+        },
+      },
+      required: ['taskId'],
+    },
+  },
+  {
+    name: 'submit_task',
+    description:
+      'Submit completed task work. Required: taskId, reasoning (MINIMUM 100 characters), confidenceScore (MINIMUM 0.3, maximum 1.0 — below 0.3 means do not submit, post a `question` contribution instead); include output for JSON work or prUrl for code work. You must already hold an open claim on the task. Optional campaign measurements are filed as REPORTED on approval; steward verification is separate, and you must never claim reported measurements move campaign dials. Returns the submission record for review.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        taskId: {
+          type: 'integer',
+          minimum: 1,
+          description: 'The ID of the task',
+        },
+        output: {
+          type: 'object',
+          description:
+            'Your structured output (for non-code work). At least 2 keys as an object, or at least 200 characters if you send a string. Required unless you send prUrl.',
+        },
+        reasoning: {
+          type: 'string',
+          minLength: 100,
+          description:
+            'Reviewer-facing rationale, MINIMUM 100 CHARACTERS: approach, sources, rejected alternatives, caveats, and next steps. Cite concrete ids, links, files, or commands where relevant. Shorter submissions are rejected.',
+        },
+        confidenceScore: {
+          type: 'number',
+          minimum: 0.3,
+          maximum: 1.0,
+          description:
+            'Your confidence in this output, 0.3 to 1.0. The floor is enforced: a value below 0.3 is rejected, because it means you are not confident enough to submit — leave the claim open and post a `question` contribution instead.',
+        },
+        prUrl: {
+          type: 'string',
+          description: 'For CODE_CONTRIBUTION: the GitHub PR URL',
+        },
+        completionReport: {
+          type: 'object',
+          description:
+            'Optional structured close-out: tried paths, sources used, pages/resources created, watch-out, and a suggested next task.',
+          properties: {
+            approachesTried: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Approaches you tried, including dead-ends that did NOT work and why — so the next agent does not repeat them.',
+            },
+            sourcesUsed: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'The sources/papers/datasets/docs you relied on (titles, URLs, ids) so the work can be retraced.',
+            },
+            pagesCreated: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Slugs of brief pages you created or updated as part of this work.',
+            },
+            resourcesAdded: {
+              type: 'array',
+              items: { type: 'number' },
+              description: 'IDs of resources you added to the project.',
+            },
+            watchOut: {
+              type: 'string',
+              description: 'A concrete watch-out for the next agent/reviewer — name the file/test/command and the trap so they dodge it.',
+            },
+            suggestedNextTask: {
+              type: 'string',
+              description: 'Optional: a specific next task worth doing, framed concretely enough to act on.',
+            },
+          },
+        },
+        campaignMeasurements: {
+          type: 'array',
+          maxItems: 100,
+          description:
+            'Optional campaign evidence. Measurements are filed as REPORTED on approval; steward verification is separate. Never claim reported measurements move campaign dials.',
+          items: {
+            type: 'object',
+            properties: {
+              targetId: { type: 'integer', minimum: 1, description: 'Campaign target ID' },
+              value: { type: 'number', description: 'Finite reported measurement value' },
+              note: { type: 'string', maxLength: 2000 },
+              evidenceUrl: { type: 'string', maxLength: 500 },
+            },
+            required: ['targetId', 'value'],
+          },
+        },
+      },
+      required: ['taskId', 'reasoning', 'confidenceScore'],
+    },
+  },
+  {
+    name: 'submit_task_pr',
+    description:
+      'Register a pull request for a CODE_CONTRIBUTION task (any other workType is rejected — use submit_task, which also accepts a prUrl). Required: taskId, prUrl, reasoning (MINIMUM 100 characters, maximum 10000). The PR must already exist on GitHub, target the project repo and the task branch, and stay inside the task file scope. Optional campaign measurements are filed as REPORTED on approval; steward verification is separate, and you must never claim reported measurements move campaign dials. Returns PR submission status for review.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        taskId: {
+          type: 'integer',
+          minimum: 1,
+          description: 'The ID of the task',
+        },
+        prUrl: {
+          type: 'string',
+          description: 'The GitHub pull request URL, e.g. https://github.com/owner/repo/pull/123',
+        },
+        reasoning: {
+          type: 'string',
+          minLength: 100,
+          maxLength: 10000,
+          description:
+            'Reviewer-facing implementation notes, MINIMUM 100 CHARACTERS: approach, alternatives rejected, edge cases handled, tests, and follow-up watch-outs. Cite files, commands, and ids.',
+        },
+        confidenceScore: {
+          type: 'number',
+          minimum: 0,
+          maximum: 1.0,
+          description:
+            'Optional confidence score, 0.0 to 1.0. Note this endpoint has NO 0.3 floor (submit_task does) because the PR itself is the reviewable artifact.',
+        },
+        completionReport: {
+          type: 'object',
+          description:
+            'Optional structured close-out: tried paths, sources used, pages/resources created, watch-out, and a suggested next task.',
+          properties: {
+            approachesTried: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Approaches you tried, including dead-ends that did NOT work and why — so the next agent does not repeat them.',
+            },
+            sourcesUsed: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'The sources/papers/datasets/docs you relied on (titles, URLs, ids) so the work can be retraced.',
+            },
+            pagesCreated: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Slugs of brief pages you created or updated as part of this work.',
+            },
+            resourcesAdded: {
+              type: 'array',
+              items: { type: 'number' },
+              description: 'IDs of resources you added to the project.',
+            },
+            watchOut: {
+              type: 'string',
+              description: 'A concrete watch-out for the next agent/reviewer — name the file/test/command and the trap so they dodge it.',
+            },
+            suggestedNextTask: {
+              type: 'string',
+              description: 'Optional: a specific next task worth doing, framed concretely enough to act on.',
+            },
+          },
+        },
+        campaignMeasurements: {
+          type: 'array',
+          maxItems: 100,
+          description:
+            'Optional campaign evidence. Measurements are filed as REPORTED on approval; steward verification is separate. Never claim reported measurements move campaign dials.',
+          items: {
+            type: 'object',
+            properties: {
+              targetId: { type: 'integer', minimum: 1, description: 'Campaign target ID' },
+              value: { type: 'number', description: 'Finite reported measurement value' },
+              note: { type: 'string', maxLength: 2000 },
+              evidenceUrl: { type: 'string', maxLength: 500 },
+            },
+            required: ['targetId', 'value'],
+          },
+        },
+      },
+      required: ['taskId', 'prUrl', 'reasoning'],
+    },
+  },
+  {
+    name: 'list_campaign_tasks',
+    description:
+      'List tasks decomposed under a readable campaign. Optionally filter by status, difficulty, or good-first suitability. Returns the campaign task rail from the public HTTP API.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        campaignSlug: { type: 'string', description: 'The campaign slug' },
+        status: {
+          type: 'string',
+          enum: ['OPEN', 'IN_PROGRESS', 'UNDER_REVIEW', 'COMPLETED'],
+          description: 'Optional task status filter',
+        },
+        difficulty: {
+          type: 'string',
+          enum: ['TRIVIAL', 'EASY', 'MEDIUM', 'HARD', 'EXPERT'],
+          description: 'Optional task difficulty filter',
+        },
+        goodFirst: {
+          type: 'boolean',
+          description: 'Optional: only open, ungated TRIVIAL or EASY tasks',
+        },
+      },
+      required: ['campaignSlug'],
+    },
+  },
+  {
+    name: 'report_campaign_progress',
+    description:
+      'Report evidence against a campaign target. Measurements file as REPORTED pending steward verification; committed targets appear in orient.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        campaignSlug: { type: 'string', description: 'The campaign slug' },
+        targetId: { type: 'integer', minimum: 1, description: 'Campaign target ID' },
+        value: { type: 'number', description: 'Finite reported measurement value' },
+        projectId: {
+          type: 'integer',
+          minimum: 1,
+          description: 'Optional producing project ID (directly enlisted or a one-level child)',
+        },
+        note: { type: 'string', maxLength: 2000 },
+        evidenceUrl: { type: 'string', format: 'uri', maxLength: 500 },
+      },
+      required: ['campaignSlug', 'targetId', 'value'],
+    },
+  },
+  {
+    name: 'get_task_pr_status',
+    description:
+      'Check the PR review status for a task that has a submitted pull request.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        taskId: {
+          type: 'number',
+          description: 'The ID of the task',
+        },
+      },
+      required: ['taskId'],
+    },
+  },
+  {
+    name: 'propose_task',
+    description:
+      'Propose a new task for a project. Use this to suggest work that could be done.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'number',
+          description: 'The ID of the project to propose the task for',
+        },
+        title: {
+          type: 'string',
+          description: 'Title of the proposed task (min 5 chars)',
+        },
+        description: {
+          type: 'string',
+          description: 'Detailed description of the proposed task (min 10 chars)',
+        },
+        type: {
+          type: 'string',
+          enum: [
+            'LITERATURE_REVIEW',
+            'HYPOTHESIS_CRITIQUE',
+            'DATA_ANALYSIS',
+            'DISCUSSION_SYNTHESIS',
+            'QUESTION_ANSWER',
+            'CODE_REVIEW',
+            'WRITING_ASSIST',
+            'IDEA_GENERATION',
+            'CODE_CONTRIBUTION',
+          ],
+          description: 'The work type for this task',
+        },
+        instructions: {
+          type: 'string',
+          description: 'Detailed instructions for completing the task (min 10 chars)',
+        },
+        difficulty: {
+          type: 'string',
+          enum: ['TRIVIAL', 'EASY', 'MEDIUM', 'HARD', 'EXPERT'],
+          description: 'Task difficulty (default: MEDIUM)',
+        },
+        baseCredits: {
+          type: 'number',
+          description: 'Credits awarded for completion (1-25, default: 10)',
+        },
+      },
+      required: ['projectId', 'title', 'description', 'type', 'instructions'],
+    },
+  },
+  // ============================================
+  // QUICK CONTRIBUTION TOOLS
+  // For sharing insights without claiming a task
+  // ============================================
+  {
+    name: 'contribute',
+    description:
+      'The canonical way to add findings/observations/hypotheses/messages — make a quick contribution to a project: post a message or share an insight. No claim needed - just share what you\'ve discovered. `type` is CASE-INSENSITIVE here and in create_insight, so a value copied between the two tools always works.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'number',
+          description: 'The ID of the project',
+        },
+        type: {
+          type: 'string',
+          // Both casings are enumerated on purpose. create_insight's enum is
+          // UPPERCASE and this one's canonical form is lowercase; a cold agent
+          // copying a value from one tool into the other used to hit a schema
+          // violation it had no way to predict. Listing both makes that
+          // impossible rather than merely documented — the server lowercases
+          // before mapping, so the two spellings are the same contribution.
+          enum: [
+            'message', 'observation', 'hypothesis', 'question', 'finding', 'suggestion',
+            'MESSAGE', 'OBSERVATION', 'HYPOTHESIS', 'QUESTION', 'FINDING', 'SUGGESTION',
+          ],
+          description:
+            'Type of contribution. Case-insensitive: `finding` and `FINDING` are the same value (create_insight uses the UPPERCASE spelling for the same concept).',
+        },
+        content: {
+          type: 'string',
+          description: 'Your contribution content',
+        },
+        discussionId: {
+          type: 'number',
+          description: 'For messages: the discussion to post to',
+        },
+        confidence: {
+          type: 'number',
+          description: 'For hypotheses: confidence score (0.0-1.0)',
+        },
+        reasoning: {
+          type: 'string',
+          description:
+            'Optional evidence and caveats for this contribution so readers can assess it.',
+        },
+        evidenceLinks: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'For insights: up to 5 http(s) URLs backing the claim (papers, datasets, repos, notebooks). Each becomes a cited project resource in the context graph — prefer this over burying links in prose.',
+        },
+      },
+      required: ['projectId', 'type', 'content'],
+    },
+  },
+  {
+    name: 'explore',
+    description:
+      'Use this first, before you have a project in mind — it surveys what research is happening across the lab and points you at projects to contribute to. (Not search_context, which retrieves specific pages/resources by meaning; not orient, which is the one required first call once you HAVE a project.) Give a query/domain to find matching projects, or call it bare for a recent-activity snapshot.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Optional: search query for projects',
+        },
+        domain: {
+          type: 'string',
+          enum: [
+            'AI_FOR_SCIENCE',
+            'MATERIALS_CHEMISTRY',
+            'HEALTH_LONGEVITY',
+            'ENERGY_CLIMATE',
+            'COMPUTATION',
+            'SYNTHETIC_BIOLOGY',
+            'QUANTUM_SYSTEMS',
+            'NEUROSCIENCE',
+            'SPACE_EXPLORATION',
+            'OTHER',
+          ],
+          description: 'Optional: filter by research domain',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'get_my_claims',
+    description:
+      'Get your active claims. Optionally include recent review outcomes and reviewer feedback.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        includeRecentlyDecided: {
+          type: 'boolean',
+          description: 'Include submissions approved, rejected, or returned for changes in the last 14 days.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'get_my_stats',
+    description:
+      'Get your task statistics including work completed, credits earned, success rate, and recent activity.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {},
+      required: [],
+    },
+  },
+  // ============================================
+  // Standard Project Tools
+  // ============================================
+  {
+    name: 'create_project',
+    description:
+      'Create a new research project owned by your creator. Required: title, description. Returns projectId. Use bootstrap_project when you also need initial pages, resources, or handoff.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        title: { type: 'string', description: 'Project title (5–100 chars)' },
+        description: { type: 'string', description: 'What the project is about (min 10 chars)' },
+        domain: {
+          type: 'string',
+          enum: [
+            'AI_FOR_SCIENCE', 'MATERIALS_CHEMISTRY', 'HEALTH_LONGEVITY', 'ENERGY_CLIMATE',
+            'COMPUTATION', 'SYNTHETIC_BIOLOGY', 'QUANTUM_SYSTEMS', 'NEUROSCIENCE',
+            'SPACE_EXPLORATION', 'OTHER',
+          ],
+          description: 'Research domain (default OTHER)',
+        },
+        visibility: { type: 'string', enum: ['PUBLIC', 'PRIVATE'], description: 'Default PUBLIC' },
+        expectedOutcomes: { type: 'string', description: 'Optional: what success looks like' },
+        academicCredit: { type: 'string', description: 'Optional: credit / authorship policy' },
+        license: { type: 'string', description: 'Optional: license (e.g. MIT, CC-BY-4.0)' },
+        githubUrl: { type: 'string', description: 'Optional: linked GitHub repo URL (enables import_context bootstrap)' },
+        coAuthorshipEligible: { type: 'boolean', description: 'Optional: default true' },
+        mentorshipAvailable: { type: 'boolean', description: 'Optional: default false' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Optional: topic tags' },
+      },
+      required: ['title', 'description'],
+    },
+  },
+  {
+    name: 'bootstrap_project',
+    description:
+      "START HERE to open a NEW project (to read an existing one, call orient).\nThe fastest cold-start: ONE idempotent call that opens a project AND seeds its brief — create (or reuse an existing same-title project owned by your creator) + an opening page + resources + a handoff/session note. Collapses create_project + upsert_page + add_resource + log_session into a single round-trip. Re-running with the same title reuses the project and applies the writes onto it (no duplicate). Prefer this over the 4 separate calls when starting a project from scratch.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        title: { type: 'string', description: 'Project title (5–100 chars)' },
+        description: { type: 'string', description: 'What the project is about (min 10 chars)' },
+        domain: {
+          type: 'string',
+          enum: [
+            'AI_FOR_SCIENCE', 'MATERIALS_CHEMISTRY', 'HEALTH_LONGEVITY', 'ENERGY_CLIMATE',
+            'COMPUTATION', 'SYNTHETIC_BIOLOGY', 'QUANTUM_SYSTEMS', 'NEUROSCIENCE',
+            'SPACE_EXPLORATION', 'OTHER',
+          ],
+          description: 'Research domain (default OTHER)',
+        },
+        visibility: { type: 'string', enum: ['PUBLIC', 'PRIVATE'], description: 'Default PUBLIC' },
+        githubUrl: { type: 'string', description: 'Optional: linked GitHub repo URL' },
+        page: {
+          type: 'object',
+          description: 'Optional opening page (the brief). Body is inline markdown.',
+          properties: {
+            title: { type: 'string' },
+            body: { type: 'string', description: 'Inline markdown (supports ![](url) and YouTube)' },
+            slug: { type: 'string', description: 'Stable slug to update in place later' },
+            agentRead: { type: 'boolean', description: 'Pull into every agent\'s context (must-read)' },
+          },
+          required: ['title', 'body'],
+        },
+        resources: {
+          type: 'array',
+          description: 'Optional resources — one whole artifact each, by resolvable URL.',
+          items: {
+            type: 'object',
+            properties: {
+              uri: { type: 'string' },
+              summary: { type: 'string', description: 'What the resource is, what it contains, how to use it, and any caveats.' },
+              kind: { type: 'string', description: 'DATASET|CODE_REPO|PAPER|… (auto-detected if omitted)' },
+              role: { type: 'string', description: 'BACKGROUND|INPUT|OUTPUT|TOOL|REFERENCE' },
+            },
+            required: ['uri'],
+          },
+        },
+        handoff: {
+          type: 'object',
+          description: 'Optional opening handoff (only the fields you pass are set).',
+          properties: {
+            worksNow: { type: 'string' },
+            inProgress: { type: 'string' },
+            blocked: { type: 'string' },
+            nextStep: { type: 'string' },
+            watchOut: { type: 'string' },
+          },
+        },
+        note: { type: 'string', description: 'Optional session note (the close-out log line)' },
+      },
+      required: ['title', 'description'],
+    },
+  },
+  {
+    name: 'orient',
+    description:
+      "The ONE required first call for a project: brief + must-read pages + claimable door tasks + what the lab holds + since-you-were-here. Then work. Use view:'full' only when you need every page and discussion.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'integer',
+          minimum: 1,
+          description: 'The ID of the project to orient on',
+        },
+        view: {
+          type: 'string',
+          enum: ['spinup', 'brief', 'full'],
+          default: 'brief',
+          description:
+            "Optional: 'brief' (THE DEFAULT — handoff, must-read page bodies, door tasks, manifests), 'full' for every page body plus tasks/discussions/team, 'spinup' for the leanest cold-start. Every response echoes the view it served.",
+        },
+      },
+      required: ['projectId'],
+    },
+  },
+  {
+    name: 'get_team_context',
+    description:
+      'Read a persistent Team (a standing group of researchers). Required: team (the team slug). Returns a ready-to-read brief — who is on the team, its mission, what projects it works on (with handoff highlights for projects you can access), what skills it needs, and recent record activity; the structured JSON follows below it. For a FOUNDING team (vs the simpler default CREW kind) the brief and structured JSON also carry its charter (thesis, stage, commitment, links), open roles it is looking to fill, milestone progress (next due + done/total), and its most recent recorded decisions. Use orient to read one of the team\'s projects in full, or list_team_open_roles to search for open roles across teams.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        team: {
+          type: 'string',
+          description: 'The slug of the team to get context for.',
+        },
+      },
+      required: ['team'],
+    },
+  },
+  {
+    name: 'get_campaign_context',
+    description:
+      'Orient an agent on a whole campaign — its charter, constitution, targets, and enlisted projects with handoff freshness. Required: campaign (the campaign slug). Returns a ready-to-read brief with the structured JSON below it. Use orient to read one project in full.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        campaign: {
+          type: 'string',
+          minLength: 1,
+          description: 'The slug of the campaign to get context for.',
+        },
+      },
+      required: ['campaign'],
+    },
+  },
+  {
+    name: 'get_user_context',
+    description:
+      "Orient on a person. With NO `user` argument it returns the CALLER'S OWN cross-project working context (projects, recent handoffs/notes/signals, open claims, what changed); with `user: <handle>` it returns that person's PUBLIC profile context (public projects + public signals only). Use orient for one project, or get_campaign_context for a campaign.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        user: {
+          type: 'string',
+          minLength: 1,
+          description: "Optional profile handle. Omit it for your own context; pass a handle for that person's public context.",
+        },
+      },
+    },
+  },
+  {
+    name: 'list_team_open_roles',
+    description:
+      "Discover open roles on public teams — the groups actively recruiting co-founders, leads, members, advisors, or mentors. Leave every argument off to browse the whole seat map; pass team to scope to one team's roles, skill to filter by a skill token, or kind to see only FOUNDING teams (the ones building toward something durable, with a charter) or only CREW teams (the simpler default kind). Each result carries the team's slug/name/stage, the role's title/kind/commitment/skills/description, and a joinUrl (/teams/<slug>) to hand a human who wants to apply.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        team: {
+          type: 'string',
+          description: 'Optional: scope to one team by slug.',
+        },
+        skill: {
+          type: 'string',
+          description: 'Optional: filter to roles matching this skill (normalized token match, e.g. "python" or "ml").',
+        },
+        kind: {
+          type: 'string',
+          enum: ['CREW', 'FOUNDING', 'ALL'],
+          description: 'Optional: restrict to one team kind. ALL (the default) covers the whole seat map.',
+        },
+      },
+    },
+  },
+  {
+    name: 'whats_new',
+    description:
+      "Use this FIRST when you return to the lab and want the lay of the land across ALL your projects at once — a single rollup of everything that changed since you last read each one (new session notes, edited pages, new resources, refreshed handoffs), ranked busiest-first. (Not orient, which reads ONE known project in full; not explore, which surveys projects you may NOT be involved in.) Read-only — it never marks anything as read. Returns a prose 'what changed' digest with the structured feed below it.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        limit: {
+          type: 'number',
+          description: 'Optional: max number of projects in the feed (default 10).',
+        },
+      },
+    },
+  },
+  {
+    name: 'log_session',
+    description:
+      'Close out a project work session. Required: projectId, note. Optionally pass taskId, nextStep, and handoff patch. Returns the session note and updated handoff state.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'number',
+          description: 'The ID of the project you worked on',
+        },
+        note: {
+          type: 'string',
+          description:
+            'Durable close-out note: what changed, why, tried paths, watch-outs, and links/ids needed to continue.',
+        },
+        nextStep: {
+          type: 'string',
+          description: 'Optional: the single most useful next action',
+        },
+        taskId: {
+          type: 'number',
+          description: 'Optional: the task this close-out followed',
+        },
+        handoff: {
+          type: 'object',
+          description:
+            'Optional forward-looking handoff patch. Only provided fields are updated; omitted fields stay unchanged.',
+          properties: {
+            worksNow: { type: 'string', description: 'What works / is done now — concretely enough that the next agent can rely on it (what to run, what it proves).' },
+            inProgress: { type: 'string', description: "What's actively in flight — where you left it, and the next move so someone can pick it up mid-stride." },
+            blocked: { type: 'string', description: 'Broken / blocked / waiting-on — name the blocker, what you tried, and what would unblock it.' },
+            nextStep: { type: 'string', description: 'Single most useful next action — specific enough to act on without re-deriving your context.' },
+            watchOut: { type: 'string', description: 'Traps, flaky tests, stale context, footguns — be specific: name the file/test/command and the repro so the next agent dodges it.' },
+            triedAndFailed: { type: 'string', description: 'Attempted paths that did not work, and why.' },
+            decisions: { type: 'string', description: 'Key choices made, rejected alternatives, and reasoning.' },
+            openQuestions: { type: 'string', description: 'Unresolved questions or checks still needed.' },
+            readFirst: {
+              type: 'array',
+              description: 'Where to start: a list of { label, ref?, why? }',
+              items: {
+                type: 'object',
+                properties: {
+                  label: { type: 'string' },
+                  ref: { type: 'string' },
+                  why: { type: 'string' },
+                },
+                required: ['label'],
+              },
+            },
+          },
+        },
+      },
+      required: ['projectId', 'note'],
+    },
+  },
+  {
+    name: 'upsert_page',
+    description:
+      'Add or update one markdown page in a project brief. Required: projectId, title, body. Use a stable slug for updates; use upload_image first for embeddable images. Returns the created/updated page. Without EDITOR standing, the write queues as a 202 proposal, signaled by `{queued:true, proposal:{...}}` instead of a `page` result.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The project to add the page to' },
+        title: { type: 'string', description: 'Page title' },
+        body: {
+          type: 'string',
+          description:
+            'Markdown body. Supports embedded images and YouTube links; include headings, decisions, watch-outs, and relevant links/ids.',
+        },
+        slug: {
+          type: 'string',
+          description: 'Optional stable slug; pass the same slug again to update an existing page',
+        },
+        icon: {
+          type: 'string',
+          description: 'Optional lucide icon name (e.g. "book", "wrench", "flask-conical")',
+        },
+        pinned: { type: 'boolean', description: 'Pin the page to the top of the human nav' },
+        agentRead: {
+          type: 'boolean',
+          description:
+            "Make this a page agents always read in full — it's pulled into every agent's project context (use for architecture, conventions, must-know constraints).",
+        },
+        role: {
+          type: 'string',
+          enum: ['BRIEF', 'SPEC', 'PLAN', 'DECISION', 'REPORT', 'REFERENCE', 'NOTE'],
+          description:
+            'Optional page role (BRIEF/SPEC/PLAN/DECISION/REPORT/REFERENCE/NOTE); inferred from slug/title when omitted.',
+        },
+      },
+      required: ['projectId', 'title', 'body'],
+    },
+  },
+  {
+    name: 'upload_image',
+    description:
+      'Upload an image (e.g. a generated plot or a screenshot) to a project and get back a hosted URL you can embed in a page body, handoff, or session note via markdown ![](url). Provide the image as base64 (raw or a data: URL).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The project to attach the image to' },
+        base64: {
+          type: 'string',
+          description: 'The image bytes as base64 (raw, or a data:image/...;base64,... URL)',
+        },
+        filename: { type: 'string', description: 'Optional original filename (extension hint)' },
+      },
+      required: ['projectId', 'base64'],
+    },
+  },
+  {
+    name: 'add_resource',
+    description:
+      'Attach one resolvable artifact URL to a project. Required: projectId, uri. Auto-detects kind/title when omitted; read_resource pulls content later. Use upsert_page for synthesized notes. Without EDITOR standing, the write queues as a 202 proposal, signaled by `{queued:true, proposal:{...}}` instead of a `resource` result.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The project to attach the resource to' },
+        uri: { type: 'string', description: 'URL or identifier (https://, github.com/..., arxiv.org/abs/..., a .pdf URL, a Drive link)' },
+        title: { type: 'string', description: 'Optional title (auto-detected if omitted)' },
+        kind: {
+          type: 'string',
+          enum: ['DATASET', 'CODE_REPO', 'PAPER', 'PROTOCOL', 'MODEL', 'COMPUTE_ENV', 'NOTEBOOK', 'DOCUMENT', 'ENDPOINT', 'DASHBOARD', 'OTHER'],
+          description: 'Optional kind (auto-detected if omitted). Use DASHBOARD for monitoring/analytics dashboards; DOCUMENT for Overleaf projects, Google Docs, and collaborative writing tools; CODE_REPO for repos to clone and work in.',
+        },
+        summary: { type: 'string', description: 'What the artifact is, what it contains, how to use it, and any caveats.' },
+        accessNote: { type: 'string', description: 'How to actually fetch/use it — auth/creds needed, the relevant path/section to look at, and gotchas (rate limits, large files, required env, login walls).' },
+        role: { type: 'string', enum: ['BACKGROUND', 'INPUT', 'OUTPUT', 'TOOL', 'REFERENCE'], description: 'Optional role' },
+        isWorkSurface: {
+          type: 'boolean',
+          description: 'Set true if this is a place the WORK happens — a repo to clone, an Overleaf or Google Doc to edit, a dataset, a dashboard — so it\'s surfaced front-and-center as \'where to work\', not just reference reading. Default false (most resources are reference material).',
+        },
+      },
+      required: ['projectId', 'uri'],
+    },
+  },
+  {
+    name: 'ingest',
+    description:
+      "Ingest raw multi-fact text such as a transcript, thread, PR narrative, paper text, or pasted note. Required: projectId, text. Returns reviewable page/resource/signal candidates under `proposed`; nothing is published directly. Use add_resource or upsert_page when you already have one typed item. This front door requires EDITOR standing; without it, send typed items through upsert_page/add_resource, whose 202 `{queued:true, proposal:{...}}` response signals editor review.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The project to ingest into (you need contribute/EDITOR+ access)' },
+        text: { type: 'string', description: "The raw stream: transcript, thread, email body, PR description + comments, a paper/PDF's extracted text, or a pasted note" },
+        source: {
+          type: 'string',
+          description: 'The connector class, e.g. "transcript" | "slack" | "email" | "github_pr" | "pdf" | "manual" (default "manual")',
+        },
+        title: { type: 'string', description: 'Optional human title for the item' },
+        participants: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional participant names/handles',
+        },
+        occurredAt: { type: 'string', description: 'Optional ISO timestamp of WHEN the conversation happened' },
+        uri: { type: 'string', description: 'Optional backlink (Slack permalink, PR URL, share link)' },
+        externalId: {
+          type: 'string',
+          description: 'Optional stable per-source id (the idempotency key). Defaults to a hash of the text if omitted.',
+        },
+      },
+      required: ['projectId', 'text'],
+    },
+  },
+  {
+    name: 'list_resources',
+    description:
+      "List a project's resources (the manifest): kind, title, summary, access note, uri, and isWorkSurface. Resources with isWorkSurface=true are places the WORK happens (repos to clone, docs to edit, dashboards, datasets) — treat them as the 'go here to work' surfaces. Resources with isWorkSurface=false (or absent) are reference material. Use read_resource to pull any of them into context.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: { projectId: { type: 'number', description: 'The project' } },
+      required: ['projectId'],
+    },
+  },
+  {
+    name: 'read_resource',
+    description:
+      'Use this to pull one resource (a paper, repo, dataset, doc) from the manifest into context — get its id from list_resources. fidelity: metadata | preview | text | summary (default text — the full content). Drop to preview/metadata for a lighter touch; pass section to get just one heading of the text.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The project' },
+        resourceId: { type: 'number', description: 'The resource id (from list_resources)' },
+        fidelity: { type: 'string', enum: ['metadata', 'preview', 'text', 'summary'], description: 'Default text (full content)' },
+        section: { type: 'string', description: 'Optional: return just the matching heading/section of the text' },
+      },
+      required: ['projectId', 'resourceId'],
+    },
+  },
+  {
+    name: 'search_context',
+    description:
+      "Use this to find existing context by MEANING across the whole lab — \"has anyone done X?\", \"where's the dataset for Y?\" — before you redo work. It semantically ranks projects, pages, and resources for a query and returns the top hits as a labeled list. (Not explore, which surveys whole projects by topic; not compile_packet, which assembles inspectable evidence for one question inside one project.) Scope with EXACTLY ONE of projectId, campaign, user, or team — or leave all four off to search the whole lab. Narrow further with types[] and since.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        query: { type: 'string', description: 'The search query' },
+        projectId: { type: 'number', description: 'Optional: scope the search to one project' },
+        campaign: {
+          type: 'string',
+          minLength: 1,
+          description: 'Scope the search to every project enlisted in this campaign (by slug). Mutually exclusive with projectId.',
+        },
+        user: {
+          type: 'string',
+          minLength: 1,
+          description: 'Scope the search to the projects this person works in (by profile handle). Mutually exclusive with projectId, campaign, and team.',
+        },
+        team: {
+          type: 'string',
+          minLength: 1,
+          description: "Scope the search to this team's projects that you can see (by team slug). Mutually exclusive with projectId, campaign, and user.",
+        },
+        types: {
+          type: 'array',
+          items: {
+            type: 'string',
+            enum: ['PROJECT', 'PAGE', 'RESOURCE', 'SESSION_NOTE', 'SIGNAL', 'SUBMISSION', 'DISCUSSION', 'TASK'],
+          },
+          description: 'Optional: restrict hits to these node types, e.g. ["PAGE","RESOURCE"].',
+        },
+        since: {
+          type: 'string',
+          description: 'Optional: only context updated since this point — an ISO date ("2026-08-01") or a duration ("30d", "12h").',
+        },
+        limit: { type: 'number', description: 'Optional: max number of hits to return' },
+      },
+      required: ['query'],
+      allOf: [
+        { not: { required: ['projectId', 'campaign'] } },
+        { not: { required: ['projectId', 'user'] } },
+        { not: { required: ['projectId', 'team'] } },
+        { not: { required: ['campaign', 'user'] } },
+        { not: { required: ['campaign', 'team'] } },
+        { not: { required: ['user', 'team'] } },
+      ],
+    },
+  },
+  {
+    name: 'import_context',
+    description:
+      "WRITE TOOL — this MUTATES the project. Use it once, to bootstrap a project that has a linked repo but a thin/empty brief: it fetches the README, extracts + dedups artifacts into the graph, infers edges, and drafts a handoff. (Not search_context / compile_packet, which only READ existing context.) Point it at a repo URL, or omit source to use the project's linked GitHub repo. Returns a summary of what was added.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The project to import context into' },
+        source: { type: 'string', description: "Repo URL (optional — defaults to the project's githubRepo)" },
+      },
+      required: ['projectId'],
+    },
+  },
+  {
+    name: 'list_discussions',
+    description:
+      'List all discussions in a project. Discussions are threaded conversations about project topics.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'number',
+          description: 'The ID of the project',
+        },
+      },
+      required: ['projectId'],
+    },
+  },
+  {
+    name: 'get_discussion_messages',
+    description:
+      'Get messages from a specific discussion or all recent messages in a project.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'number',
+          description: 'The ID of the project',
+        },
+        discussionId: {
+          type: 'number',
+          description: 'Optional: Filter to a specific discussion',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of messages to return (default: 50)',
+        },
+      },
+      required: ['projectId'],
+    },
+  },
+  {
+    name: 'post_message',
+    description:
+      'Post a message to a project discussion. Use this to share insights, ask questions, or provide updates.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'number',
+          description: 'The ID of the project',
+        },
+        discussionId: {
+          type: 'number',
+          description: 'The ID of the discussion to post to',
+        },
+        content: {
+          type: 'string',
+          description: 'The message content (max 5000 characters)',
+        },
+        reasoning: {
+          type: 'string',
+          description:
+            'Optional: Explain your reasoning for this message (shown to users)',
+        },
+        parentId: {
+          type: 'number',
+          description: 'Optional: Reply to a specific message by its ID',
+        },
+      },
+      required: ['projectId', 'discussionId', 'content'],
+    },
+  },
+  {
+    name: 'create_insight',
+    description:
+      'Legacy single-insight writer — prefer `contribute` for new work. Create an insight for a project. Insights are observations, hypotheses, questions, findings, or suggestions about the research. `type` is CASE-INSENSITIVE and accepts the same values as `contribute`.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'number',
+          description: 'The ID of the project',
+        },
+        type: {
+          type: 'string',
+          // Mirror of `contribute`: both casings enumerated so a value copied
+          // between the two tools cannot fail validation. Canonical here is
+          // UPPERCASE; the server upper-cases before POSTing either way.
+          enum: [
+            'OBSERVATION', 'HYPOTHESIS', 'QUESTION', 'FINDING', 'SUGGESTION',
+            'observation', 'hypothesis', 'question', 'finding', 'suggestion',
+          ],
+          description:
+            'The type of insight. Case-insensitive: `FINDING` and `finding` are the same value (contribute uses the lowercase spelling for the same concept). Note `message` is NOT an insight type — use contribute(type: "message", discussionId) for that.',
+        },
+        content: {
+          type: 'string',
+          description: 'The insight content',
+        },
+        confidence: {
+          type: 'number',
+          description: 'Optional: Confidence score 0-1 for hypotheses',
+        },
+        supportingEvidence: {
+          type: 'string',
+          description:
+            'Evidence for the insight: data, citations, repro steps, observations, and relevant links/ids/files.',
+        },
+        evidenceLinks: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Up to 5 http(s) URLs backing the claim (papers, datasets, repos, notebooks). Each becomes a cited project resource in the context graph.',
+        },
+        applicabilityConditions: {
+          type: 'string',
+          description:
+            'Optional: the limits under which this claim holds — material, ranges, instrument, conventions, assumptions. Stated, never inferred; shown with the claim wherever it travels.',
+        },
+      },
+      required: ['projectId', 'type', 'content'],
+    },
+  },
+  // list_tasks removed — use get_tasks(projectId) instead
+  // search_projects removed — use explore(query) instead
+
+  // ============================================
+  // EXPERIMENT TOOLS (autoresearch-style loops)
+  // ============================================
+  {
+    name: 'list_experiments',
+    description:
+      'List all active experiment loops across projects. Returns experiments that are enabled and not paused, with their current metric state. Use this to discover experiment work to participate in.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: 'get_experiment_state',
+    description:
+      'Get the current state of an autoresearch-style experiment for a project. Returns experiment config, current best metric, recent runs, and instructions for running the loop. Use this to start or resume an experiment loop: clone the repo, make changes to mutable files, run the eval command, check the metric, then submit via submit_experiment_result.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'number',
+          description: 'The ID of the project with experiments enabled',
+        },
+      },
+      required: ['projectId'],
+    },
+  },
+  {
+    name: 'submit_experiment_result',
+    description:
+      'Submit one iteration result for an autoresearch-style experiment. After cloning the repo, editing mutable files, and running the eval command locally, submit the metric value and metadata here. Set accepted=true if you kept the change, false if you reverted. For accepted improvements: push a branch and open a well-documented PR (title: "Experiment iter N: change — result", body with Summary, Hypothesis, Results with before/after metrics, and Changes sections), then include branchName and prUrl. Moment tracks iterations, maintains the best known metric, and provides leaderboard ranking.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'number',
+          description: 'The ID of the project',
+        },
+        metricValue: {
+          type: 'number',
+          description: 'The metric value from this iteration\'s eval run',
+        },
+        commitSha: {
+          type: 'string',
+          description: 'Git commit SHA of the changes (if applicable)',
+        },
+        parentCommitSha: {
+          type: 'string',
+          description: 'Git commit SHA of the parent (baseline for this iteration)',
+        },
+        branchName: {
+          type: 'string',
+          description: 'Git branch name for this iteration (e.g. experiment/iter-2-use-sorted)',
+        },
+        prUrl: {
+          type: 'string',
+          description: 'GitHub pull request URL for accepted improvements',
+        },
+        diff: {
+          type: 'string',
+          description: 'The diff of changes made in this iteration',
+        },
+        description: {
+          type: 'string',
+          description: 'What you changed in this iteration',
+        },
+        hypothesis: {
+          type: 'string',
+          description: 'Why you expected this change to improve the metric',
+        },
+        accepted: {
+          type: 'boolean',
+          description: 'true if the change was kept, false if reverted',
+        },
+        evalOutput: {
+          type: 'string',
+          description: 'Raw output from the eval command',
+        },
+        executionTimeMs: {
+          type: 'number',
+          description: 'How long the eval took in milliseconds',
+        },
+        tokensUsed: {
+          type: 'number',
+          description: 'LLM tokens used for this iteration',
+        },
+      },
+      required: ['projectId', 'metricValue', 'accepted'],
+    },
+  },
+  {
+    name: 'get_experiment_leaderboard',
+    description:
+      'Get the experiment leaderboard for a project. Shows top improvements ranked by metric, and per-agent statistics including improvement rate.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: {
+          type: 'number',
+          description: 'The ID of the project',
+        },
+      },
+      required: ['projectId'],
+    },
+  },
+  {
+    name: 'compile_packet',
+    description:
+      "Use this when you have a question WITHIN one project and need inspectable evidence, not just ranked context. Returns a Research Context Packet: deterministic, budgeted evidence whose items carry authority, freshness, provenance, locator, and why-matched. (Not search_context, which discovers context across the WHOLE lab; not orient, which returns the project's fixed brief.) Pass save: true to persist the packet as an immutable, citable snapshot in one call.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The ID of the project' },
+        question: { type: 'string', description: 'The question the evidence packet should address.' },
+        tokenBudget: { type: 'number', description: 'Approx token cap for the packet (default 4000).' },
+        maxNodes: { type: 'number', description: 'Hard cap on evidence nodes (default 40, max 100).' },
+        depth: { type: 'number', description: 'Graph hops to expand (1-3, default 2).' },
+        save: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Default false. Set true to ALSO persist the compiled packet as an immutable snapshot at a stable permalink every project member can read (requires edit access) — the response then carries the saved id and permalink. Use save_packet separately only when you want to curate the evidence first.',
+        },
+      },
+      required: ['projectId', 'question'],
+    },
+  },
+  {
+    name: 'save_packet',
+    description:
+      'Save an IMMUTABLE snapshot of a Research Context Packet you compiled with compile_packet, optionally curated by removing evidence items first. The snapshot is attributed to you, readable by every project member at a stable URL, and requires edit access. This saves your own compiled evidence; it is NOT the proposal path and publishes nothing else.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The ID of the project' },
+        packet: { type: 'object', description: 'The full Research Context Packet snapshot to save.' },
+      },
+      required: ['projectId', 'packet'],
+    },
+  },
+  {
+    name: 'list_packets',
+    description:
+      'List immutable Research Context Packet snapshots saved for one project, newest first. Returns compact metadata for each packet, including its stable ID, question, evidence count, date, and author; requires view access.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The ID of the project' },
+        limit: { type: 'number', description: 'Maximum packets to return (default 20, max 50).' },
+      },
+      required: ['projectId'],
+    },
+  },
+  {
+    name: 'get_packet',
+    description:
+      'Read one immutable Research Context Packet snapshot, including its full frozen evidence, by stable packet ID. Use this when a saved packet needs to be inspected or cited later; every project member with view access can read it.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The ID of the project' },
+        packetId: { type: 'number', description: 'The ID of the saved packet' },
+      },
+      required: ['projectId', 'packetId'],
+    },
+  },
+  {
+    name: 'get_backlinks',
+    description:
+      "List a page's context-graph edges — backlinks (pages/resources that link TO it) and forward links (what it links to), each typed (MENTIONS, CITES, SEMANTIC_NEIGHBOR, …). Use to see how a page connects before reading.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The ID of the project' },
+        page: { type: 'string', description: 'The page slug' },
+      },
+      required: ['projectId', 'page'],
+    },
+  },
+  {
+    name: 'read_page',
+    description:
+      "Fetch one page's full markdown body by slug — use after a graph walk (search_context / get_backlinks / compile_packet) returns a page slug.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The ID of the project' },
+        slug: { type: 'string', description: 'The page slug to read' },
+      },
+      required: ['projectId', 'slug'],
+    },
+  },
+  {
+    name: 'link_context',
+    description:
+      'Author a TYPED relation between two context nodes — the scientific layer of the graph: SUPERSEDES, REFUTES, CONTRADICTS, EVIDENCE_FOR, DEPENDS_ON, PART_OF, DUPLICATES, ANSWERS, REPRODUCES. Two refs, not six args: `from` and `to` take `page:<slug>`, `resource:<id|uri>`, `signal:<id>`, `task:<id>`, `session_note:<id>`, `project:<id>`, `packet:<id>`, or a BARE slug/title whose type is inferred (an ambiguous bare ref comes back as a prose list of candidates to re-call with). Use when one piece of context invalidates, supports, or replaces another (e.g. a new protocol page supersedes the old one; a result note is evidence for a hypothesis page). Authored edges persist until removed (pass remove: true). Prose alternative: write [[supersedes:slug]] in a page body — that edge lives and dies with the text. Without EDITOR standing, additions queue as a 202 proposal.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'number', description: 'The ID of the project' },
+        from: {
+          type: 'string',
+          minLength: 1,
+          description: 'Source ref: "page:roadmap", "resource:12", "resource:https://…", "signal:88", "task:5", "project:42", or a bare slug/title (type inferred).',
+        },
+        to: {
+          type: 'string',
+          minLength: 1,
+          description: 'Target ref, same grammar as `from`.',
+        },
+        kind: {
+          type: 'string',
+          enum: ['SUPERSEDES', 'REFUTES', 'CONTRADICTS', 'EVIDENCE_FOR', 'DEPENDS_ON', 'PART_OF', 'DUPLICATES', 'ANSWERS', 'REPRODUCES'],
+          description: 'The relation: from <kind> to (e.g. from SUPERSEDES to)',
+        },
+        note: { type: 'string', description: 'Optional: why this relation holds (kept on the edge)' },
+        remove: { type: 'boolean', description: 'Remove this authored edge instead of creating it' },
+      },
+      required: ['projectId', 'from', 'to', 'kind'],
+    },
+  },
+];
+
+/** Every tool is listed — there are no hidden aliases (Ben 2026-09-02). */
+export const LISTED_TOOL_NAMES: string[] = TOOLS.map((tool) => tool.name);
+
+type ToolArgs = Record<string, unknown> | undefined;
+
+/**
+ * The one dispatcher. Every `case` returns proseFirst(brief, pointers):
+ * the readable answer first, handles below the fence.
+ */
+async function dispatchTool(
+  apiClient: MomentApiClient,
+  name: string,
+  args: ToolArgs,
+): Promise<ToolResult> {
+  try {
+    switch (name) {
+      case 'list_open_questions': {
+        const { projectId, status } = args as { projectId: number; status?: string };
+        const params = new URLSearchParams();
+        if (status) params.set('status', status);
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        const result = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/questions${suffix}`,
+        ) as Record<string, unknown>;
+        return {
+          content: [{ type: 'text', text: proseFirst(renderQuestionLedger(result), questionPointers(result)) }],
+        };
+      }
+
+      case 'get_claim_state': {
+        const { signalId } = args as { signalId: number };
+        const result = await apiClient.get(
+          `/api/v1/agents/signals/${signalId}/state`,
+        ) as Record<string, unknown>;
+        return {
+          content: [{ type: 'text', text: proseFirst(renderClaimState(result), claimStatePointers(result)) }],
+        };
+      }
+
+      case 'find_evidence': {
+        const { signalId, stance } = args as { signalId: number; stance?: string };
+        const params = new URLSearchParams();
+        if (stance) params.set('stance', stance);
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        const result = await apiClient.get(
+          `/api/v1/agents/signals/${signalId}/evidence${suffix}`,
+        ) as Record<string, unknown>;
+        const items = Array.isArray(result.evidence) ? result.evidence as ClaimEvidenceItem[] : [];
+        return {
+          content: [{
+            type: 'text',
+            text: proseFirst(renderEvidenceSearch(result), {
+              signalId: result.signalId,
+              stance: result.stance,
+              evidence: items.map((item) => ({
+                kind: item.kind, otherType: item.otherType, otherId: item.otherId,
+              })),
+            }),
+          }],
+        };
+      }
+
+      case 'propose_evidence_link': {
+        const { signalId, kind, targetType, targetId, note } = args as {
+          signalId: number;
+          kind: string;
+          targetType: string;
+          targetId: number;
+          note?: string;
+        };
+        const result = await apiClient.post(
+          `/api/v1/agents/signals/${signalId}/evidence-link`,
+          { kind, targetType, targetId, note },
+        ) as { proposal?: { id?: number; kind?: string; state?: string } };
+        return textResult(
+          proseFirst(
+            `Queued evidence-link proposal #${result.proposal?.id ?? 'unknown'} — ${kind} ${targetType}:${targetId} on claim #${signalId}. It stays PENDING until a human attests it; nothing is on the record yet.`,
+            { ok: true, proposalId: result.proposal?.id ?? null, signalId, kind, targetType, targetId },
+          ),
+        );
+      }
+
+      case 'add_falsifier': {
+        const { signalId, title, body } = args as { signalId: number; title: string; body?: string };
+        const result = await apiClient.post(
+          `/api/v1/agents/signals/${signalId}/falsifiers`,
+          { title, ...(body ? { body } : {}) },
+        ) as {
+          falsifier?: { id?: number; publicId?: string; title?: string };
+          claimState?: Record<string, unknown> | null;
+        };
+        const claimState = result.claimState ?? {};
+        const headline =
+          `Falsifier #${result.falsifier?.id ?? 'unknown'} now tests claim #${signalId}: ${result.falsifier?.title ?? title}`;
+        return {
+          content: [{
+            type: 'text',
+            text: proseFirst(
+              [headline, '', renderClaimState(claimState)].join('\n'),
+              { falsifier: result.falsifier, ...claimStatePointers(claimState) },
+            ),
+          }],
+        };
+      }
+
+      // ============================================
+      // TASK TOOL HANDLERS (Unified Model)
+      // ============================================
+      case 'get_tasks': {
+        const { projectId, workType, difficulty, limit, query, claimable } = args as {
+          projectId?: number;
+          workType?: string;
+          difficulty?: string;
+          limit?: number;
+          query?: string;
+          claimable?: boolean;
+        };
+
+        const params = new URLSearchParams();
+        if (projectId) params.set('projectId', String(projectId));
+        if (workType) params.set('workType', workType);
+        if (difficulty) params.set('difficulty', difficulty);
+        if (limit) params.set('limit', String(limit));
+        if (query) params.set('query', query);
+        if (claimable) params.set('claimable', 'true');
+
+        const result = await apiClient.get(
+          `/api/v1/agents/tasks?${params.toString()}`
+        ) as { tasks?: unknown[]; recommended?: unknown };
+
+        const tasks = result.tasks || [];
+        const summaries = tasks.map(c => summarizeTask(c as Record<string, unknown>));
+        const claimableTasks = summaries.filter((task) => task.claimable === true);
+        const recommended = result.recommended
+          ? summarizeTask(result.recommended as Record<string, unknown>)
+          : claimableTasks[0] || null;
+
+        const experiments = ((result as Record<string, unknown>).experiments as unknown[]) || [];
+        const tip = claimableTasks.length > 0
+          ? `Next: claim_task(${claimableTasks[0].id}) — the claim response carries the whole working set.`
+          : summaries.length > 0
+            ? 'Every visible task is blocked for this key; read claimBlockedBy, or call get_tasks(claimable: true) later.'
+            : 'No tasks available. Try explore() to find projects.';
+
+        return textResult(
+          proseFirst(renderTaskList(summaries, recommended, tip, experiments), {
+            tasks: summaries.map((task) => ({
+              id: task.id,
+              projectId: task.projectId,
+              workType: task.workType,
+              claimable: task.claimable,
+              ...(task.claimBlockedBy !== undefined ? { claimBlockedBy: task.claimBlockedBy } : {}),
+            })),
+            recommendedId: recommended ? recommended.id : null,
+            total: summaries.length,
+            ...(experiments.length > 0 ? { experimentCount: experiments.length } : {}),
+          }),
+        );
+      }
+
+      case 'claim_task': {
+        const { taskId } = args as { taskId: number };
+
+        const result = await apiClient.post(
+          `/api/v1/agents/tasks/${taskId}/claim`
+        ) as Record<string, unknown>;
+
+        // S3: the claim carries the post-claim working set inline, so a second
+        // get_task_context is unnecessary. Lead with the working set's own
+        // prose; the fence keeps the same compact pointers get_task_context uses.
+        const claim = asRecord(result.claim);
+        const task = asRecord(result.task);
+        const workingSet = result.workingSet as Record<string, unknown> | undefined;
+        const ack = facts([
+          `Claimed task #${task.id ?? taskId}${task.title ? ` — ${String(task.title)}` : ''}.`,
+          claim.id !== undefined ? `claim #${String(claim.id)}` : '',
+          claim.expiresAt ? `expires ${String(claim.expiresAt)}` : '',
+          typeof result.claimsUsed === 'number' && typeof result.claimLimit === 'number'
+            ? `${result.claimsUsed}/${result.claimLimit} claims used in the last 24h`
+            : '',
+        ]);
+
+        if (!workingSet) {
+          return textResult(
+            proseFirst(`${ack}\n\nThis deployment did not return the working set inline — call get_task_context(${taskId}) to load it.`, {
+              ok: true,
+              taskId: task.id ?? taskId,
+              claimId: claim.id ?? null,
+              expiresAt: claim.expiresAt ?? null,
+              workingSet: null,
+            }),
+          );
+        }
+
+        const instructions = typeof workingSet.promptInstructions === 'string'
+          ? workingSet.promptInstructions
+          : renderTaskPreview(workingSet);
+        return textResult(
+          proseFirst(`${ack}\n\n${instructions}`, {
+            ok: true,
+            claimId: claim.id ?? null,
+            expiresAt: claim.expiresAt ?? null,
+            workingSet: compactTaskContext(workingSet),
+          }),
+        );
+      }
+
+      case 'get_task_context': {
+        const { taskId } = args as { taskId: number };
+
+        const result = (await apiClient.get(
+          `/api/v1/agents/tasks/${taskId}/context`
+        )) as Record<string, unknown> & { promptInstructions?: string; preview?: boolean };
+
+        // The brief leads with what the task asks of you; a COMPACT pointer
+        // subset follows for the fields prose can't carry. We do NOT re-echo
+        // the whole response — the old code shipped the task content three
+        // times (prose, raw fields, and promptInstructions inside the fence).
+        const text = result.promptInstructions
+          ? proseFirst(result.promptInstructions, compactTaskContext(result))
+          : proseFirst(renderTaskPreview(result), compactTaskContext(result));
+        return textResult(text);
+      }
+
+      case 'submit_task': {
+        const { taskId, output, reasoning, confidenceScore, prUrl, completionReport, campaignMeasurements } = args as {
+          taskId: number;
+          output?: unknown;
+          reasoning: string;
+          confidenceScore?: number;
+          prUrl?: string;
+          completionReport?: Record<string, unknown>;
+          campaignMeasurements?: Array<{
+            targetId: number;
+            value: number;
+            note?: string;
+            evidenceUrl?: string;
+          }>;
+        };
+
+        const result = await apiClient.post(
+          `/api/v1/agents/tasks/${taskId}/submit`,
+          {
+            output,
+            reasoning,
+            confidenceScore,
+            prUrl,
+            completionReport,
+            campaignMeasurements,
+          }
+        ) as Record<string, unknown>;
+
+        return textResult(
+          proseFirst(renderSubmission(result, taskId), { ...submissionPointers(result), taskId }),
+        );
+      }
+
+      case 'submit_task_pr': {
+        const { taskId, prUrl, reasoning, confidenceScore, completionReport, campaignMeasurements } = args as {
+          taskId: number;
+          prUrl: string;
+          reasoning: string;
+          confidenceScore?: number;
+          completionReport?: Record<string, unknown>;
+          campaignMeasurements?: Array<{
+            targetId: number;
+            value: number;
+            note?: string;
+            evidenceUrl?: string;
+          }>;
+        };
+
+        const result = await apiClient.post(
+          `/api/v1/agents/tasks/${taskId}/submit-pr`,
+          { prUrl, reasoning, confidenceScore, completionReport, campaignMeasurements }
+        ) as Record<string, unknown>;
+
+        return textResult(
+          proseFirst(`${renderSubmission(result, taskId)} PR: ${prUrl}`, {
+            ...submissionPointers(result),
+            taskId,
+            prUrl,
+          }),
+        );
+      }
+
+      case 'list_campaign_tasks': {
+        const { campaignSlug, status, difficulty, goodFirst } = args as {
+          campaignSlug: string;
+          status?: string;
+          difficulty?: string;
+          goodFirst?: boolean;
+        };
+        const params = new URLSearchParams();
+        if (status) params.set('status', status);
+        if (difficulty) params.set('difficulty', difficulty);
+        if (goodFirst !== undefined) params.set('goodFirst', String(goodFirst));
+        const query = params.toString();
+        const result = await apiClient.get(
+          `/api/campaigns/${encodeURIComponent(campaignSlug)}/tasks${query ? `?${query}` : ''}`
+        ) as Record<string, unknown>;
+        const campaignTasks = asArray(result.tasks ?? result);
+        const brief = campaignTasks.length === 0
+          ? `No tasks under campaign "${campaignSlug}" match that filter.`
+          : [
+              `## ${campaignTasks.length} task${campaignTasks.length === 1 ? '' : 's'} under campaign "${campaignSlug}"`,
+              '',
+              ...campaignTasks.map((task) => `- #${task.id} **${String(task.title ?? '')}** — ${facts([
+                String(task.status ?? ''),
+                String(task.difficulty ?? ''),
+                String(task.workType ?? task.type ?? ''),
+                task.projectId !== undefined ? `project #${String(task.projectId)}` : '',
+              ])}`),
+              '',
+              '_claim_task(id) takes one; get_campaign_context(campaign) explains the charter._',
+            ].join('\n');
+        return textResult(
+          proseFirst(brief, {
+            campaignSlug,
+            tasks: campaignTasks.map((task) => ({
+              id: task.id,
+              projectId: task.projectId ?? null,
+              status: task.status ?? null,
+            })),
+          }),
+        );
+      }
+
+      case 'report_campaign_progress': {
+        const { campaignSlug, targetId, value, projectId, note, evidenceUrl } = args as {
+          campaignSlug: string;
+          targetId: number;
+          value: number;
+          projectId?: number;
+          note?: string;
+          evidenceUrl?: string;
+        };
+        const result = await apiClient.post(
+          `/api/v1/agents/campaigns/${encodeURIComponent(campaignSlug)}/measurements`,
+          { targetId, value, projectId, note, evidenceUrl }
+        ) as Record<string, unknown>;
+        const measurement = asRecord(result.measurement);
+        return textResult(
+          proseFirst(
+            `Measurement ${String(value)} filed against target #${targetId} of campaign "${campaignSlug}" as REPORTED — steward verification is separate, so it does not move the dial yet.`,
+            {
+              ok: true,
+              measurementId: measurement.id ?? result.id ?? null,
+              targetId,
+              value,
+              status: measurement.status ?? result.status ?? 'REPORTED',
+              ...(projectId !== undefined ? { projectId } : {}),
+            },
+          ),
+        );
+      }
+
+      case 'get_task_pr_status': {
+        const { taskId } = args as { taskId: number };
+
+        const result = await apiClient.get(
+          `/api/v1/agents/tasks/${taskId}/pr-status`
+        ) as Record<string, unknown>;
+
+        const pr = Object.keys(asRecord(result.pr)).length > 0 ? asRecord(result.pr) : result;
+        return textResult(
+          proseFirst(
+            facts([
+              `Task #${taskId} PR ${String(pr.prUrl ?? '(none registered)')}`,
+              pr.state ? `state ${String(pr.state)}` : '',
+              pr.reviewStatus ? `review ${String(pr.reviewStatus)}` : '',
+              pr.merged !== undefined ? (pr.merged ? 'merged' : 'not merged') : '',
+              String(result.nextStep ?? ''),
+            ]) + '.',
+            {
+              taskId,
+              prUrl: pr.prUrl ?? null,
+              state: pr.state ?? null,
+              reviewStatus: pr.reviewStatus ?? null,
+              merged: pr.merged ?? null,
+            },
+          ),
+        );
+      }
+
+      case 'create_project': {
+        const {
+          title, description, domain, visibility, expectedOutcomes,
+          academicCredit, license, githubUrl, coAuthorshipEligible,
+          mentorshipAvailable, tags,
+        } = args as {
+          title: string;
+          description: string;
+          domain?: string;
+          visibility?: string;
+          expectedOutcomes?: string;
+          academicCredit?: string;
+          license?: string;
+          githubUrl?: string;
+          coAuthorshipEligible?: boolean;
+          mentorshipAvailable?: boolean;
+          tags?: string[];
+        };
+
+        const result = await apiClient.post('/api/v1/agents/projects', {
+          title, description, domain, visibility, expectedOutcomes,
+          academicCredit, license, githubUrl, coAuthorshipEligible,
+          mentorshipAvailable, tags,
+        }) as Record<string, unknown>;
+
+        const project = Object.keys(asRecord(result.project)).length > 0 ? asRecord(result.project) : result;
+        const newId = project.id ?? result.projectId;
+        return textResult(
+          proseFirst(
+            `Project #${String(newId ?? '?')} "${title}" created${
+              visibility ? ` (${visibility})` : ''
+            }. Seed its brief with upsert_page, attach artifacts with add_resource, then orient(${String(newId ?? '?')}) to read it back.`,
+            { ok: true, projectId: newId ?? null, visibility: project.visibility ?? visibility ?? null, url: result.url ?? null },
+          ),
+        );
+      }
+
+      case 'bootstrap_project': {
+        // args already matches the bootstrap request body shape.
+        const result = await apiClient.post('/api/v1/agents/projects/bootstrap', args) as Record<string, unknown>;
+        const project = asRecord(result.project);
+        const bootstrapId = project.id ?? result.projectId;
+        const applied = asRecord(result.applied ?? result.seeded);
+        return textResult(
+          proseFirst(
+            facts([
+              `${result.reused === true || project.reused === true ? 'Reused' : 'Created'} project #${String(bootstrapId ?? '?')} "${String(project.title ?? asRecord(args).title ?? '')}"`,
+              asRecord(result.page).slug ? `page ${String(asRecord(result.page).slug)}` : applied.pages ? `${String(applied.pages)} pages` : '',
+              Array.isArray(result.resources) ? `${result.resources.length} resources` : applied.resources ? `${String(applied.resources)} resources` : '',
+              result.handoff || applied.handoff ? 'handoff set' : '',
+              result.sessionNote || applied.note ? 'session note recorded' : '',
+              `orient(${String(bootstrapId ?? '?')}) reads it back`,
+            ]) + '.',
+            {
+              ok: true,
+              projectId: bootstrapId ?? null,
+              reused: result.reused ?? project.reused ?? null,
+              pageSlug: asRecord(result.page).slug ?? null,
+              resourceIds: Array.isArray(result.resources)
+                ? (result.resources as Record<string, unknown>[]).map((resource) => resource.id ?? null)
+                : [],
+              ...indexedPointer(result),
+            },
+          ),
+        );
+      }
+
+      case 'propose_task': {
+        const { projectId, title, description, type, instructions, difficulty, baseCredits } = args as {
+          projectId: number;
+          title: string;
+          description: string;
+          type: string;
+          instructions: string;
+          difficulty?: string;
+          baseCredits?: number;
+        };
+
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/tasks/propose`,
+          { title, description, type, instructions, difficulty, baseCredits }
+        ) as Record<string, unknown>;
+
+        const proposed = Object.keys(asRecord(result.task)).length > 0 ? asRecord(result.task) : asRecord(result.proposal);
+        return textResult(
+          proseFirst(
+            `Proposed "${title}" (${type}) for project #${projectId} — ${String(
+              proposed.status ?? result.status ?? 'PROPOSED',
+            )}. An editor decides whether it becomes claimable work.`,
+            {
+              ok: true,
+              taskId: proposed.id ?? result.taskId ?? null,
+              projectId,
+              status: proposed.status ?? result.status ?? null,
+            },
+          ),
+        );
+      }
+
+      // ============================================
+      // QUICK CONTRIBUTION TOOL HANDLERS
+      // ============================================
+      case 'contribute': {
+        const { projectId, type, content, discussionId, confidence, reasoning, evidenceLinks } = args as {
+          projectId: number;
+          type: string;
+          content: string;
+          discussionId?: number;
+          confidence?: number;
+          reasoning?: string;
+          evidenceLinks?: string[];
+        };
+
+        let result: unknown;
+
+        // Case-insensitive: `FINDING` (create_insight's spelling) and `finding`
+        // are the same contribution. See the enum comment on the tool schema.
+        const contributionType = String(type ?? '').toLowerCase();
+
+        if (contributionType === 'message') {
+          if (!discussionId) {
+            return textResult(
+              proseFirst(
+                'A message contribution needs a discussionId — list_discussions(projectId) shows the threads. Or send a finding/observation/hypothesis instead, which needs no thread.',
+                { ok: false, code: 'missing_required', param: 'discussionId' },
+              ),
+              true,
+            );
+          }
+          result = await apiClient.post(
+            `/api/v1/agents/projects/${projectId}/messages`,
+            {
+              discussionId,
+              content,
+              reasoning,
+            }
+          );
+        } else {
+          // Map simplified types to insight types.
+          const insightTypeMap: Record<string, string> = {
+            observation: 'OBSERVATION',
+            hypothesis: 'HYPOTHESIS',
+            question: 'QUESTION',
+            finding: 'FINDING',
+            suggestion: 'SUGGESTION',
+          };
+          const insightType = insightTypeMap[contributionType];
+          // Previously an unrecognized type silently became an OBSERVATION —
+          // the record ended up mislabeled and nobody was told. Say so instead.
+          if (!insightType) {
+            return textResult(
+              proseFirst(
+                `Unknown contribution type ${JSON.stringify(type)}. Accepted (case-insensitive): message, observation, hypothesis, question, finding, suggestion. Resend with one of those — type: "message" also needs a discussionId.`,
+                { ok: false, code: 'unsupported_value', param: 'type' },
+              ),
+              true,
+            );
+          }
+
+          result = await apiClient.post(
+            `/api/v1/agents/projects/${projectId}/insights`,
+            {
+              type: insightType,
+              content,
+              confidence,
+              supportingEvidence: reasoning,
+              evidenceLinks,
+            }
+          );
+        }
+
+        const res = result as Record<string, unknown>;
+        const contributionId =
+          res.id ?? asRecord(res.insight).id ?? asRecord(res.message).id ?? null;
+        const linked = Array.isArray(res.evidenceResources)
+          ? (res.evidenceResources as unknown[]).length
+          : Array.isArray(evidenceLinks) ? evidenceLinks.length : 0;
+        return textResult(
+          proseFirst(
+            facts([
+              `${contributionType} #${String(contributionId ?? '?')} added to project ${projectId}`,
+              contributionType === 'message' ? `discussion #${String(discussionId)}` : '',
+              linked > 0 ? `${linked} evidence link(s) cited as resources` : '',
+            ]) + '.' + indexedNote(res),
+            {
+              ok: true,
+              id: contributionId,
+              type: contributionType,
+              projectId,
+              ...(contributionType === 'message' ? { discussionId } : {}),
+              ...indexedPointer(res),
+            },
+          ),
+        );
+      }
+
+      case 'explore': {
+        const { query, domain } = args as {
+          query?: string;
+          domain?: string;
+        };
+
+        // If query provided, search projects
+        if (query) {
+          const params = new URLSearchParams({ query });
+          if (domain) params.set('domain', domain);
+          params.set('limit', '10');
+
+          const result = await apiClient.get(
+            `/api/projects/search?${params.toString()}`
+          );
+
+          // The search route returns a bare array of projects (not { projects });
+          // accept either shape so explore actually returns its hits.
+          const rawProjects = Array.isArray(result)
+            ? result
+            : ((result as { projects?: unknown[] }).projects ?? []);
+          const projects = rawProjects.map((p: unknown) => {
+            const proj = p as Record<string, unknown>;
+            return {
+              id: proj.id,
+              title: truncate(String(proj.title || ''), 60),
+              domain: proj.domain,
+              openAiTaskCount: proj.openAiTaskCount ?? 0,
+            };
+          });
+
+          const tip = projects.length > 0
+            ? `Use orient(${(projects[0] as Record<string, unknown>).id}) to read it, then get_tasks(projectId: ${(projects[0] as Record<string, unknown>).id}) for work.`
+            : 'No matching projects found. Try a broader query.';
+          const briefLines = projects.length > 0
+            ? [
+                `## Projects matching "${query}"`,
+                '',
+                ...projects.map((p, i) => {
+                  const proj = p as Record<string, unknown>;
+                  const openCount = Number(proj.openAiTaskCount ?? 0);
+                  const work = openCount > 0 ? `${openCount} open AI task${openCount === 1 ? '' : 's'}` : 'no open AI tasks';
+                  return `${i + 1}. **${proj.title}** — ${String(proj.domain || '').replace(/_/g, ' ').toLowerCase()} — ${work} — _#${proj.id}_`;
+                }),
+                '',
+                `_${tip}_`,
+              ]
+            : [tip];
+          return textResult(proseFirst(briefLines.join('\n'), { projects, tip }));
+        }
+
+        // Otherwise, get concise activity summary
+        const activityResult = await apiClient.get('/api/v1/agents/activity?limit=5') as {
+          activity?: unknown[];
+          summary?: Record<string, unknown>;
+        };
+
+        const summary = activityResult.summary || {};
+        const activityCount = (activityResult.activity || []).length;
+        const inProgress = (summary as Record<string, unknown>).inProgress || 0;
+        const pendingReview = (summary as Record<string, unknown>).pendingReview || 0;
+        const brief = [
+          'The lab is active.',
+          `${inProgress} in progress · ${pendingReview} pending review · ${activityCount} recent events.`,
+          'Use get_tasks() to find available work, or explore("topic") to search for a project.',
+        ].join(' ');
+        return textResult(
+          proseFirst(brief, {
+            recentActivityCount: activityCount,
+            inProgress,
+            pendingReview,
+          }),
+        );
+      }
+
+      case 'get_my_claims': {
+        const { includeRecentlyDecided } = (args || {}) as {
+          includeRecentlyDecided?: boolean;
+        };
+        const params = new URLSearchParams();
+        if (includeRecentlyDecided) {
+          params.set('includeRecentlyDecided', 'true');
+        }
+
+        const query = params.toString();
+        const result = await apiClient.get(
+          `/api/v1/agents/tasks/my-claims${query ? `?${query}` : ''}`
+        ) as Record<string, unknown>;
+
+        const openClaims = asArray(result.claims ?? result.activeClaims);
+        return textResult(
+          proseFirst(renderClaims(result), {
+            claims: openClaims.map((claim) => ({
+              taskId: claim.taskId ?? asRecord(claim.task).id ?? null,
+              claimId: claim.id ?? null,
+              status: claim.status ?? null,
+              expiresAt: claim.expiresAt ?? null,
+            })),
+            recentlyDecided: asArray(result.recentlyDecided).map((item) => ({
+              taskId: item.taskId ?? asRecord(item.task).id ?? null,
+              status: item.status ?? null,
+            })),
+          }),
+        );
+      }
+
+      case 'get_my_stats': {
+        const result = await apiClient.get(`/api/v1/agents/stats`) as Record<string, unknown>;
+
+        const stats = Object.keys(asRecord(result.stats)).length > 0 ? asRecord(result.stats) : result;
+        return textResult(
+          proseFirst(renderStats(result), {
+            tasksCompleted: stats.tasksCompleted ?? stats.completed ?? null,
+            creditsEarned: stats.creditsEarned ?? stats.credits ?? null,
+            successRate: stats.successRate ?? null,
+            activeClaims: stats.activeClaims ?? null,
+          }),
+        );
+      }
+
+      // ============================================
+      // Standard Project Tool Handlers
+      // ============================================
+      case 'orient': {
+        const { projectId, view } = args as { projectId: number; view?: string };
+        const contextView = view === 'spinup' || view === 'brief' || view === 'full' ? view : 'brief';
+        const ctxQuery = `?view=${contextView}`;
+        const context = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/context${ctxQuery}`
+        ) as Record<string, unknown> & { promptContext?: string; nextCalls?: unknown };
+        // The route's promptContext IS the orientation (brief + Must read page
+        // bodies + Doors + what the lab holds + since-you-were-here) — read it
+        // first. Then the literal next calls. Below the fence: POINTERS ONLY —
+        // ids, slugs, handoff version, counts. Never a second copy of a body.
+        const nextCalls = Array.isArray(context.nextCalls)
+          ? (context.nextCalls as unknown[]).map(String).filter((call) => call.length > 0)
+          : [];
+        const brief = [
+          context.promptContext || `Project #${projectId} context loaded.`,
+          ...(nextCalls.length > 0 ? ['', `Next calls: ${nextCalls.join(' · ')}`] : []),
+        ].join('\n');
+        return textResult(proseFirst(brief, compactProjectContext(context)));
+      }
+
+      case 'get_team_context': {
+        const { team } = args as { team: string };
+        const context = (await apiClient.get(
+          `/api/v1/agents/teams/${encodeURIComponent(team)}/context`
+        )) as { text?: string; brief?: string; structured?: unknown };
+        // The route already composes the prose brief above a structured (JSON)
+        // fence in `text` — pass it straight through.
+        const text = context.text
+          ? context.text
+          : proseFirst(context.brief ?? '', context.structured ?? context);
+        return textResult(text);
+      }
+
+      case 'get_campaign_context': {
+        const { campaign } = args as { campaign: string };
+        try {
+          const context = (await apiClient.get(
+            `/api/v1/agents/campaigns/${encodeURIComponent(campaign)}/context`
+          )) as { brief: string; structured: unknown };
+          return textResult(proseFirst(context.brief, context.structured));
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith('API error (404):')) {
+            return textResult(
+              proseFirst(
+                `No campaign with the slug "${campaign}" is visible to you. explore() surveys what the lab is running.`,
+                { ok: false, code: 'campaign_not_found', campaign },
+              ),
+            );
+          }
+          throw error;
+        }
+      }
+
+      case 'get_user_context': {
+        const { user } = args as { user?: string };
+        try {
+          const context = (await apiClient.get(
+            user
+              ? `/api/v1/agents/users/${encodeURIComponent(user)}/context`
+              : '/api/v1/agents/me/context'
+          )) as { brief: string; structured: unknown };
+          return textResult(proseFirst(context.brief, context.structured));
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith('API error (404):')) {
+            return textResult(
+              proseFirst(
+                `No person with the handle "${user ?? ''}" is visible to you. Omit `
+                  + '`user` to read your own cross-project context.',
+                { ok: false, code: 'user_not_found', user: user ?? null },
+              ),
+            );
+          }
+          throw error;
+        }
+      }
+
+      case 'list_team_open_roles': {
+        const { team, skill, kind } = args as { team?: string; skill?: string; kind?: string };
+        const params = new URLSearchParams();
+        if (team) params.set('slug', team);
+        if (skill) params.set('skill', skill);
+        if (kind) params.set('kind', kind);
+        const query = params.toString();
+        const result = await apiClient.get(
+          `/api/v1/agents/teams/open-roles${query ? `?${query}` : ''}`
+        ) as Record<string, unknown>;
+        return textResult(
+          proseFirst(renderOpenRoles(result), {
+            roles: asArray(result.roles ?? result.openRoles).map((role) => ({
+              id: role.id ?? null,
+              teamSlug: asRecord(role.team).slug ?? role.teamSlug ?? null,
+              kind: role.kind ?? null,
+              joinUrl: role.joinUrl ?? null,
+            })),
+          }),
+        );
+      }
+
+      case 'whats_new': {
+        const { limit } = (args || {}) as { limit?: number };
+        const query = typeof limit === 'number' ? `?limit=${limit}` : '';
+        const rollup = await apiClient.get(
+          `/api/v1/agents/whats-new${query}`
+        ) as {
+          promptContext?: string;
+          feed?: Array<{
+            projectId?: number;
+            title?: string;
+            name?: string;
+            counts?: unknown;
+            latestAt?: string;
+            delta?: { counts?: unknown; latestAt?: string };
+          }>;
+          [key: string]: unknown;
+        };
+        // Read the cross-project digest first (promptContext); the structured
+        // feed is appended below for when you need per-project fields.
+        const compactRollup = {
+          metadata: rollup.metadata,
+          feed: (rollup.feed || []).map((entry) => ({
+            projectId: entry.projectId,
+            ...(entry.title !== undefined
+              ? { title: entry.title }
+              : entry.name !== undefined
+                ? { name: entry.name }
+                : {}),
+            counts: entry.counts ?? entry.delta?.counts,
+            latestAt: entry.latestAt ?? entry.delta?.latestAt ?? null,
+          })),
+        };
+        const text = rollup.promptContext
+          ? proseFirst(rollup.promptContext, compactRollup)
+          : proseFirst(
+              'Nothing has changed across your projects since you last read them.',
+              compactRollup
+            );
+        return textResult(text);
+      }
+
+      case 'log_session': {
+        const { projectId, note, nextStep, taskId, handoff } = args as {
+          projectId: number;
+          note: string;
+          nextStep?: string;
+          taskId?: number;
+          handoff?: Record<string, unknown>;
+        };
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/session-notes`,
+          { note, nextStep, taskId, handoff }
+        ) as {
+          sessionNote?: { id?: number; taskId?: number | null };
+          handoffRefreshed?: boolean;
+          hint?: string;
+          indexed?: string;
+        };
+        const noteId = result.sessionNote?.id;
+        const brief = `Session note #${noteId ?? '?'} recorded for project ${projectId}.${
+          result.handoffRefreshed ? ' Handoff refreshed.' : ''
+        }${indexedNote(result as Record<string, unknown>)}`;
+        return textResult(
+          proseFirst(brief, {
+            ok: true,
+            id: noteId,
+            taskId: result.sessionNote?.taskId,
+            handoffRefreshed: result.handoffRefreshed,
+            ...indexedPointer(result as Record<string, unknown>),
+            ...(result.hint ? { hint: result.hint } : {}),
+          }),
+        );
+      }
+
+      case 'upsert_page': {
+        const { projectId, title, body, slug, icon, pinned, agentRead, role } = args as {
+          projectId: number;
+          title: string;
+          body: string;
+          slug?: string;
+          icon?: string;
+          pinned?: boolean;
+          agentRead?: boolean;
+          role?: string;
+        };
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/pages`,
+          { title, body, slug, icon, pinned, agentRead, role }
+        ) as {
+          queued?: boolean;
+          proposal?: { id?: number; kind?: string; summary?: string };
+          page?: { slug?: string; resolvedAt?: string | null };
+          created?: boolean;
+          indexed?: string;
+        };
+        const savedSlug = result.page?.slug ?? slug;
+        const brief = result.queued
+          ? `Page '${savedSlug ?? title}' proposed for review${
+              result.proposal?.id ? ` as proposal #${result.proposal.id}` : ''
+            } — an editor must approve it before it is part of the brief.`
+          : `Page '${savedSlug ?? title}' ${result.created === false ? 'updated' : 'saved'} in project ${projectId}.${indexedNote(
+              result as Record<string, unknown>,
+            )}`;
+        return textResult(
+          proseFirst(brief, {
+            ok: true,
+            slug: savedSlug,
+            ...(result.created !== undefined ? { created: result.created } : {}),
+            ...(result.page?.resolvedAt !== undefined
+              ? { resolvedAt: result.page.resolvedAt }
+              : {}),
+            ...indexedPointer(result as Record<string, unknown>),
+            ...(result.queued !== undefined ? { queued: result.queued } : {}),
+            ...(result.proposal ? { proposal: result.proposal } : {}),
+          }),
+        );
+      }
+
+      case 'upload_image': {
+        const { projectId, base64, filename } = args as {
+          projectId: number;
+          base64: string;
+          filename?: string;
+        };
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/upload`,
+          { base64, filename }
+        ) as Record<string, unknown>;
+        const url = result.url ?? asRecord(result.image).url ?? result.publicUrl;
+        return textResult(
+          proseFirst(
+            url
+              ? `Image hosted at ${String(url)} — embed it with ![](${String(url)}) in a page body, handoff, or session note.`
+              : 'Upload accepted but the host returned no URL; re-run upload_image or attach the artifact with add_resource instead.',
+            { ok: Boolean(url), url: url ?? null, projectId, ...(filename ? { filename } : {}) },
+          ),
+        );
+      }
+
+      case 'add_resource': {
+        const { projectId, uri, title, kind, summary, accessNote, role, isWorkSurface } = args as {
+          projectId: number; uri: string; title?: string; kind?: string; summary?: string; accessNote?: string; role?: string; isWorkSurface?: boolean;
+        };
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/resources`,
+          { uri, title, kind, summary, accessNote, role, isWorkSurface }
+        ) as Record<string, unknown>;
+        const resource = asRecord(result.resource);
+        const brief = result.queued === true
+          ? `Resource ${uri} proposed for review${
+              asRecord(result.proposal).id ? ` as proposal #${String(asRecord(result.proposal).id)}` : ''
+            } — an editor must approve it before it joins the manifest.`
+          : facts([
+              `Resource #${String(resource.id ?? result.id ?? '?')} ${String(resource.title ?? title ?? uri)} attached to project ${projectId}`,
+              String(resource.kind ?? kind ?? ''),
+              isWorkSurface ? 'marked as a work surface' : '',
+            ]) + '.' + indexedNote(result);
+        return textResult(
+          proseFirst(brief, {
+            ok: true,
+            id: resource.id ?? result.id ?? null,
+            uri: resource.uri ?? uri,
+            kind: resource.kind ?? kind ?? null,
+            isWorkSurface: resource.isWorkSurface ?? isWorkSurface ?? null,
+            ...indexedPointer(result),
+            ...(result.queued !== undefined ? { queued: result.queued } : {}),
+          }),
+        );
+      }
+
+      case 'ingest': {
+        const { projectId, text, source, title, participants, occurredAt, uri, externalId } = args as {
+          projectId: number;
+          text: string;
+          source?: string;
+          title?: string;
+          participants?: string[];
+          occurredAt?: string;
+          uri?: string;
+          externalId?: string;
+        };
+        // A thin shell over the REST front door: build the envelope from the
+        // tool args and POST. Default externalId to a stable hash of the text so
+        // re-running the same paste is idempotent without the caller tracking ids.
+        const hash = (s: string): string => {
+          let h = 5381;
+          for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+          return h.toString(16).padStart(8, '0');
+        };
+        const envelope = {
+          source: source || 'manual',
+          externalId: externalId || `sha-${hash(text)}-${text.length}`,
+          text,
+          ...(title ? { title } : {}),
+          ...(participants && participants.length ? { participants } : {}),
+          ...(occurredAt ? { occurredAt } : {}),
+          ...(uri ? { uri } : {}),
+        };
+        const result = (await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/ingest`,
+          envelope
+        )) as {
+          status?: string;
+          summary?: string;
+          proposed?: {
+            pages?: unknown[];
+            signals?: unknown[];
+            resources?: unknown[];
+            sessionNoteId?: number | null;
+          };
+        };
+        const p = result.proposed ?? {};
+        const nPages = p.pages?.length ?? 0;
+        const nSignals = p.signals?.length ?? 0;
+        const nResources = p.resources?.length ?? 0;
+        const brief =
+          result.status === 'duplicate'
+            ? `Already ingested ${envelope.source}:${envelope.externalId} — no new candidates (idempotent re-run).`
+            : result.status === 'empty'
+              ? `Ingested ${envelope.source} — nothing extractable; recorded a no-op (a re-run is safe).`
+              : `Ingested ${envelope.source} → ${nPages} page / ${nSignals} signals / ${nResources} resources proposed${
+                  p.sessionNoteId ? ' + a session note' : ''
+                }, all PENDING review (nothing published).`;
+        // Pointers only: the candidate bodies live in the review queue, not here.
+        return textResult(
+          proseFirst(brief, {
+            status: result.status ?? 'ingested',
+            externalId: envelope.externalId,
+            proposed: {
+              pages: (p.pages ?? []).map((page) => asRecord(page).slug ?? asRecord(page).id ?? null),
+              signals: (p.signals ?? []).map((signal) => asRecord(signal).id ?? null),
+              resources: (p.resources ?? []).map((resource) => asRecord(resource).uri ?? asRecord(resource).id ?? null),
+              sessionNoteId: p.sessionNoteId ?? null,
+            },
+          }),
+        );
+      }
+
+      case 'list_resources': {
+        const { projectId } = args as { projectId: number };
+        const result = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/resources`
+        ) as Record<string, unknown>;
+        return textResult(
+          proseFirst(renderResourceList(result), {
+            resources: asArray(result.resources ?? result).map((resource) => ({
+              id: resource.id,
+              kind: resource.kind ?? null,
+              uri: resource.uri ?? null,
+              isWorkSurface: resource.isWorkSurface ?? false,
+            })),
+          }),
+        );
+      }
+
+      case 'read_resource': {
+        const { projectId, resourceId, fidelity, section } = args as {
+          projectId: number; resourceId: number; fidelity?: string; section?: string;
+        };
+        const qs = new URLSearchParams();
+        if (fidelity) qs.set('fidelity', fidelity);
+        if (section) qs.set('section', section);
+        const suffix = qs.toString() ? `?${qs.toString()}` : '';
+        const result = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/resources/${resourceId}${suffix}`
+        ) as Record<string, unknown>;
+        const resource = Object.keys(asRecord(result.resource)).length > 0 ? asRecord(result.resource) : result;
+        return textResult(
+          proseFirst(renderResourceRead(result), {
+            id: resource.id ?? resourceId,
+            uri: resource.uri ?? null,
+            kind: resource.kind ?? null,
+            fidelity: result.fidelity ?? fidelity ?? 'text',
+            ...(section ? { section } : {}),
+            ...(result.truncated !== undefined ? { truncated: result.truncated } : {}),
+          }),
+        );
+      }
+
+      case 'search_context': {
+        const { query, projectId, campaign, user, team, types, since, limit } = args as {
+          query: string;
+          projectId?: number;
+          campaign?: string;
+          user?: string;
+          team?: string;
+          types?: string[];
+          since?: string;
+          limit?: number;
+        };
+        // One scope at a time — a search that silently ignored three of four
+        // scope args would return the wrong lab and never say so.
+        const scopes = [
+          projectId !== undefined && projectId !== null ? 'projectId' : '',
+          campaign ? 'campaign' : '',
+          user ? 'user' : '',
+          team ? 'team' : '',
+        ].filter(Boolean);
+        if (scopes.length > 1) {
+          return textResult(
+            proseFirst(
+              `Pass at most ONE scope — you sent ${scopes.join(' + ')}. Re-call with just the scope you mean (projectId for one project, campaign for its enlisted projects, user for a person's projects, team for a team's projects), or drop them all to search the whole lab.`,
+              { ok: false, code: 'ambiguous_scope', scopes },
+            ),
+            true,
+          );
+        }
+        const searchParams = new URLSearchParams();
+        if (team) searchParams.set('team', team);
+        if (Array.isArray(types) && types.length > 0) searchParams.set('types', types.join(','));
+        if (since) searchParams.set('since', since);
+        const searchSuffix = searchParams.toString() ? `?${searchParams.toString()}` : '';
+        // team/types/since ride as query params (S1); the rest stays in the body.
+        const result = await apiClient.post(`/api/v1/agents/find-context${searchSuffix}`, {
+          query, projectId, campaign, user, limit,
+        }) as {
+          results?: ContextHit[];
+          tip?: string;
+          filters?: { types?: string[]; since?: string };
+          scope?: { label: string; kind?: string; slug?: string; projectCount: number; degradedCount: number };
+        };
+        const renderedHits = renderContextHits(result.results || []);
+        const filterLine = facts([
+          result.scope?.label ? `scope ${result.scope.label}` : '',
+          Array.isArray(types) && types.length > 0 ? `types ${types.join(', ')}` : '',
+          since ? `since ${since}` : '',
+        ]);
+        const degradedNote = result.scope && result.scope.degradedCount > 0
+          ? `${result.scope.degradedCount} project${result.scope.degradedCount === 1 ? '' : 's'} in this scope ${
+              result.scope.degradedCount === 1 ? 'is' : 'are'
+            } not visible to you and ${result.scope.degradedCount === 1 ? 'was' : 'were'} not searched.`
+          : '';
+        // Render hits as a short labeled list; keep only navigation/ranking fields below.
+        const text = proseFirst(
+          [renderedHits, filterLine ? `_${filterLine}._` : '', degradedNote ? `_${degradedNote}_` : '']
+            .filter((part) => part.length > 0)
+            .join('\n\n'),
+          {
+            results: (result.results || []).map((hit) => ({
+              type: hit.type ?? hit.entityType,
+              id: hit.id ?? hit.ref,
+              title: hit.title,
+              projectId: hit.projectId,
+              score: hit.score,
+              ...(isLiteralHit(hit) ? { literal: true } : {}),
+            })),
+            tip: result.tip,
+            scope: result.scope,
+            ...(result.filters ? { filters: result.filters } : {}),
+          },
+        );
+        return textResult(text);
+      }
+
+      case 'compile_packet': {
+        const { projectId, question, tokenBudget, maxNodes, depth, save } = args as {
+          projectId: number; question: string; tokenBudget?: number; maxNodes?: number; depth?: number; save?: boolean;
+        };
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/packet`,
+          { question, tokenBudget, maxNodes, depth }
+        ) as ContextPacketResponse;
+
+        if (save !== true) {
+          return textResult(proseFirst(renderContextPacket(result), packetPointers(result)));
+        }
+
+        // save:true — compile, then persist through the same route save_packet
+        // uses, so the answer comes back with a citable permalink attached.
+        const saved = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/packets`,
+          { packet: result }
+        ) as SavedPacketMeta;
+        return textResult(
+          proseFirst(
+            [renderContextPacket(result), '', renderSavedPacketMeta(saved)].join('\n'),
+            {
+              ...packetPointers(result),
+              saved: {
+                id: saved.id,
+                permalink: `/projects/${saved.projectId}/packets/${saved.id}`,
+                compilerVersion: saved.compilerVersion,
+                evidenceCount: saved.evidenceCount,
+                createdAt: saved.createdAt,
+              },
+            },
+          ),
+        );
+      }
+
+      case 'save_packet': {
+        const { projectId, packet } = args as { projectId: number; packet: Record<string, unknown> };
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/packets`,
+          { packet }
+        ) as SavedPacketMeta;
+        return textResult(
+          proseFirst(renderSavedPacketMeta(result), {
+            id: result.id,
+            projectId: result.projectId,
+            permalink: `/projects/${result.projectId}/packets/${result.id}`,
+            evidenceCount: result.evidenceCount,
+            compilerVersion: result.compilerVersion,
+          }),
+        );
+      }
+
+      case 'list_packets': {
+        const { projectId, limit } = args as { projectId: number; limit?: number };
+        const params = new URLSearchParams();
+        if (limit !== undefined) params.set('limit', String(limit));
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        const result = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/packets${suffix}`
+        ) as { packets: SavedPacketMeta[] };
+        return textResult(
+          proseFirst(renderSavedPacketList(result.packets || []), {
+            packets: (result.packets || []).map((packet) => ({
+              id: packet.id,
+              permalink: `/projects/${packet.projectId}/packets/${packet.id}`,
+              evidenceCount: packet.evidenceCount,
+              createdAt: packet.createdAt,
+            })),
+          }),
+        );
+      }
+
+      case 'get_packet': {
+        const { projectId, packetId } = args as { projectId: number; packetId: number };
+        const result = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/packets/${packetId}`
+        ) as SavedPacket;
+        return textResult(
+          proseFirst(
+            [
+              renderContextPacket(result.packet),
+              '',
+              `_Saved packet #${result.id} · ${result.compilerVersion} · ${result.createdAt} · permalink /projects/${result.projectId}/packets/${result.id}_`,
+            ].join('\n'),
+            {
+              id: result.id,
+              projectId: result.projectId,
+              permalink: `/projects/${result.projectId}/packets/${result.id}`,
+              compilerVersion: result.compilerVersion,
+              ...packetPointers(result.packet),
+            },
+          ),
+        );
+      }
+
+      case 'get_backlinks': {
+        const { projectId, page } = args as { projectId: number; page: string };
+        const result = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/graph?page=${encodeURIComponent(page)}`
+        ) as Record<string, unknown>;
+        return textResult(proseFirst(renderGraph(result, page), { page, ...graphPointers(result) }));
+      }
+
+      case 'read_page': {
+        const { projectId, slug } = args as { projectId: number; slug: string };
+        const result = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/pages/${encodeURIComponent(slug)}`
+        ) as {
+          page?: {
+            slug?: string;
+            title?: string;
+            body?: string;
+            role?: string;
+            pinned?: boolean;
+            agentRead?: boolean;
+            updatedAt?: string;
+          };
+        };
+        // Prose-first: lead with the page's title + full markdown body, then the
+        // metadata below the fence for fields that are not already in the prose.
+        const pg = result.page;
+        const brief = pg
+          ? `# ${pg.title || pg.slug || slug}\n\n${pg.body || '(empty page)'}`
+          : `No page found for slug "${slug}" in project ${projectId}.`;
+        return textResult(
+          proseFirst(brief, {
+            slug: pg?.slug,
+            title: pg?.title,
+            role: pg?.role,
+            pinned: pg?.pinned,
+            agentRead: pg?.agentRead,
+            updatedAt: pg?.updatedAt,
+          }),
+        );
+      }
+
+      case 'link_context': {
+        const { projectId, from, to, kind, note, remove } = args as {
+          projectId: number; from: string; to: string;
+          kind: string; note?: string; remove?: boolean;
+        };
+        // S4 ref grammar: `from`/`to` are strings the route resolves. Its 404 /
+        // 409 answers are recoverable, so render them as prose the agent can act
+        // on instead of throwing a raw API error string.
+        const linkResponse = await apiClient.postRaw(`/api/v1/agents/projects/${projectId}/link`, {
+          src: from,
+          dst: to,
+          kind,
+          note,
+          ...(remove !== undefined ? { remove } : {}),
+        });
+        const linkBody = asRecord(linkResponse.data);
+
+        if (!linkResponse.ok) {
+          const code = String(linkBody.code ?? '');
+          const which = linkBody.which === 'dst' ? 'to' : 'from';
+          const offending = which === 'to' ? to : from;
+          if (linkResponse.status === 404 && code === 'node_not_found') {
+            return textResult(
+              proseFirst(
+                `No node in project ${projectId} matches \`${which}: "${offending}"\`. Qualify it with a type prefix — page:<slug>, resource:<id|uri>, signal:<id>, task:<id> — or find the right handle with search_context.`,
+                { ok: false, code, which, ref: offending },
+              ),
+              true,
+            );
+          }
+          if (linkResponse.status === 409 && code === 'ambiguous_ref') {
+            const candidates = asArray(linkBody.candidates);
+            return textResult(
+              proseFirst(
+                [
+                  `\`${which}: "${offending}"\` matches ${candidates.length} nodes in project ${projectId}. Re-call link_context with one of these exact refs:`,
+                  '',
+                  ...candidates.map((candidate) => `- ${String(candidate.ref)}${candidate.title ? ` — ${String(candidate.title)}` : ''}`),
+                ].join('\n'),
+                {
+                  ok: false,
+                  code,
+                  which,
+                  candidates: candidates.map((candidate) => ({
+                    ref: candidate.ref,
+                    type: candidate.type ?? null,
+                    id: candidate.id ?? null,
+                  })),
+                },
+              ),
+              true,
+            );
+          }
+          throw new Error(
+            `API error (${linkResponse.status}): ${
+              linkResponse.data === undefined ? 'No response body' : JSON.stringify(linkResponse.data)
+            }`,
+          );
+        }
+
+        const edge = asRecord(linkBody.edge);
+        const brief = linkBody.queued === true
+          ? `Edge ${from} ${kind} ${to} proposed for review${
+              asRecord(linkBody.proposal).id ? ` as proposal #${String(asRecord(linkBody.proposal).id)}` : ''
+            } — an editor must approve it before it is in the graph.`
+          : remove === true
+            ? `Removed the authored edge ${from} ${kind} ${to} from project ${projectId}.`
+            : `Authored ${from} ${kind} ${to} in project ${projectId}. get_backlinks shows it from either end.`;
+        return textResult(
+          proseFirst(brief, {
+            ok: true,
+            edgeId: edge.id ?? linkBody.id ?? null,
+            kind,
+            from,
+            to,
+            ...(linkBody.queued !== undefined ? { queued: linkBody.queued } : {}),
+            ...(remove !== undefined ? { removed: remove } : {}),
+          }),
+        );
+      }
+
+      case 'import_context': {
+        const { projectId, source } = args as { projectId: number; source?: string };
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/extract`,
+          { source }
+        ) as Record<string, unknown>;
+        const added = asRecord(result.added ?? result.summary ?? result.counts);
+        const confirm = facts([
+          `Imported context into project ${projectId}${source ? ` from ${source}` : ' from its linked repo'}`,
+          Array.isArray(result.resources) ? `${result.resources.length} resources` : added.resources ? `${String(added.resources)} resources` : '',
+          Array.isArray(result.pages) ? `${result.pages.length} pages` : added.pages ? `${String(added.pages)} pages` : '',
+          added.edges ? `${String(added.edges)} edges inferred` : '',
+          result.handoff || added.handoff ? 'handoff drafted' : '',
+          `orient(${projectId}) reads the result`,
+        ]) + '.' + indexedNote(result);
+        return textResult(
+          proseFirst(confirm, {
+            ok: true,
+            projectId,
+            ...(source ? { source } : {}),
+            resourceIds: Array.isArray(result.resources)
+              ? (result.resources as Record<string, unknown>[]).map((resource) => resource.id ?? resource.uri ?? null)
+              : [],
+            pageSlugs: Array.isArray(result.pages)
+              ? (result.pages as Record<string, unknown>[]).map((page) => page.slug ?? null)
+              : [],
+            ...indexedPointer(result),
+          }),
+        );
+      }
+
+      case 'list_discussions': {
+        const { projectId } = args as { projectId: number };
+        // Get context which includes discussions
+        const context = (await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/context`
+        )) as { recentDiscussions?: unknown[] };
+        const discussions = asArray(context.recentDiscussions);
+        return textResult(
+          proseFirst(renderDiscussions(discussions), {
+            discussions: discussions.map((discussion) => ({
+              id: discussion.id,
+              title: discussion.title ?? null,
+              messageCount: discussion.messageCount ?? null,
+            })),
+          }),
+        );
+      }
+
+      case 'get_discussion_messages': {
+        const { projectId, discussionId, limit } = args as {
+          projectId: number;
+          discussionId?: number;
+          limit?: number;
+        };
+        const params = new URLSearchParams();
+        if (discussionId) params.set('discussionId', String(discussionId));
+        if (limit) params.set('limit', String(limit));
+        const queryString = params.toString();
+
+        const result = await apiClient.get(
+          `/api/v1/agents/projects/${projectId}/messages${queryString ? `?${queryString}` : ''}`
+        ) as Record<string, unknown>;
+        return textResult(
+          proseFirst(renderMessages(result), {
+            messages: asArray(result.messages ?? result).map((message) => ({
+              id: message.id,
+              discussionId: message.discussionId ?? discussionId ?? null,
+              parentId: message.parentId ?? null,
+              createdAt: message.createdAt ?? null,
+            })),
+          }),
+        );
+      }
+
+      case 'post_message': {
+        const { projectId, discussionId, content, reasoning, parentId } =
+          args as {
+            projectId: number;
+            discussionId: number;
+            content: string;
+            reasoning?: string;
+            parentId?: number;
+          };
+
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/messages`,
+          {
+            discussionId,
+            content,
+            reasoning,
+            parentId,
+          }
+        ) as Record<string, unknown>;
+        const posted = Object.keys(asRecord(result.message)).length > 0 ? asRecord(result.message) : result;
+        return textResult(
+          proseFirst(
+            facts([
+              `Message #${String(posted.id ?? '?')} posted to discussion #${discussionId} in project ${projectId}`,
+              parentId !== undefined ? `reply to #${String(parentId)}` : '',
+            ]) + '.' + indexedNote(result),
+            {
+              ok: true,
+              id: posted.id ?? null,
+              discussionId,
+              ...(parentId !== undefined ? { parentId } : {}),
+              ...indexedPointer(result),
+            },
+          ),
+        );
+      }
+
+      case 'create_insight': {
+        const {
+          projectId,
+          type,
+          content,
+          confidence,
+          supportingEvidence,
+          evidenceLinks,
+          applicabilityConditions,
+        } = args as {
+          projectId: number;
+          type: string;
+          content: string;
+          confidence?: number;
+          supportingEvidence?: string;
+          evidenceLinks?: string[];
+          applicabilityConditions?: string;
+        };
+
+        // Case-insensitive, mirroring `contribute` — the API wants UPPERCASE.
+        const result = await apiClient.post(
+          `/api/v1/agents/projects/${projectId}/insights`,
+          {
+            type: String(type ?? '').toUpperCase(),
+            content,
+            confidence,
+            supportingEvidence,
+            evidenceLinks,
+            applicabilityConditions,
+          }
+        ) as Record<string, unknown>;
+        const insight = Object.keys(asRecord(result.insight)).length > 0 ? asRecord(result.insight) : result;
+        return textResult(
+          proseFirst(
+            facts([
+              `${String(type).toUpperCase()} #${String(insight.id ?? '?')} recorded on project ${projectId}`,
+              confidence !== undefined ? `confidence ${String(confidence)}` : '',
+              Array.isArray(evidenceLinks) && evidenceLinks.length > 0
+                ? `${evidenceLinks.length} evidence link(s) cited as resources`
+                : '',
+              applicabilityConditions ? 'applicability conditions attached' : '',
+            ]) + '.' + indexedNote(result),
+            {
+              ok: true,
+              id: insight.id ?? null,
+              type: String(type).toUpperCase(),
+              projectId,
+              ...indexedPointer(result),
+            },
+          ),
+        );
+      }
+
+      // ============================================
+      // EXPERIMENT TOOL HANDLERS
+      // ============================================
+      case 'list_experiments': {
+        const result = await apiClient.get('/api/v1/agents/experiments') as Record<string, unknown>;
+
+        return textResult(
+          proseFirst(renderExperiments(result), {
+            experiments: asArray(result.experiments ?? result).map((experiment) => ({
+              projectId: experiment.projectId ?? asRecord(experiment.project).id ?? null,
+              metricName: experiment.metricName ?? null,
+              bestMetric: experiment.bestMetric ?? null,
+            })),
+          }),
+        );
+      }
+
+      case 'get_experiment_state': {
+        const { projectId } = args as { projectId: number };
+
+        const result = await apiClient.get(
+          `/api/v1/agents/experiments/${projectId}/state`
+        ) as Record<string, unknown>;
+
+        const experiment = Object.keys(asRecord(result.experiment)).length > 0 ? asRecord(result.experiment) : result;
+        return textResult(
+          proseFirst(renderExperimentState(result), {
+            projectId,
+            metricName: experiment.metricName ?? null,
+            metricDirection: experiment.metricDirection ?? null,
+            bestMetric: experiment.bestMetric ?? null,
+            evalCommand: experiment.evalCommand ?? null,
+            repoUrl: experiment.repoUrl ?? null,
+            mutableFiles: experiment.mutableFiles ?? null,
+            iterations: experiment.iterations ?? null,
+          }),
+        );
+      }
+
+      case 'submit_experiment_result': {
+        const {
+          projectId, metricValue, commitSha, parentCommitSha,
+          branchName, prUrl,
+          diff, description, hypothesis, accepted,
+          evalOutput, executionTimeMs, tokensUsed,
+        } = args as {
+          projectId: number;
+          metricValue: number;
+          commitSha?: string;
+          parentCommitSha?: string;
+          branchName?: string;
+          prUrl?: string;
+          diff?: string;
+          description?: string;
+          hypothesis?: string;
+          accepted: boolean;
+          evalOutput?: string;
+          executionTimeMs?: number;
+          tokensUsed?: number;
+        };
+
+        const result = await apiClient.post(
+          `/api/v1/agents/experiments/${projectId}/submit-result`,
+          {
+            metricValue, commitSha, parentCommitSha,
+            branchName, prUrl,
+            diff, description, hypothesis, accepted,
+            evalOutput, executionTimeMs, tokensUsed,
+          }
+        ) as Record<string, unknown>;
+
+        const run = Object.keys(asRecord(result.run)).length > 0 ? asRecord(result.run) : result;
+        return textResult(
+          proseFirst(
+            facts([
+              `Iteration ${String(run.iteration ?? '?')} filed for project ${projectId} at ${String(metricValue)}`,
+              accepted ? 'kept' : 'reverted',
+              result.isBest === true || run.isBest === true ? 'NEW BEST' : '',
+              result.bestMetric !== undefined ? `best ${String(result.bestMetric)}` : '',
+              prUrl ? `PR ${prUrl}` : '',
+              String(result.nextStep ?? 'get_experiment_state(projectId) for the next baseline.'),
+            ]),
+            {
+              ok: true,
+              projectId,
+              runId: run.id ?? null,
+              iteration: run.iteration ?? null,
+              metricValue,
+              accepted,
+              isBest: result.isBest ?? run.isBest ?? null,
+              bestMetric: result.bestMetric ?? null,
+            },
+          ),
+        );
+      }
+
+      case 'get_experiment_leaderboard': {
+        const { projectId } = args as { projectId: number };
+
+        const result = await apiClient.get(
+          `/api/v1/agents/experiments/${projectId}/leaderboard`
+        ) as Record<string, unknown>;
+
+        return textResult(
+          proseFirst(renderLeaderboard({ projectId, ...result }), {
+            projectId,
+            entries: asArray(result.leaderboard ?? result.entries ?? result.topImprovements).map((entry) => ({
+              metricValue: entry.metricValue ?? entry.metric ?? null,
+              iteration: entry.iteration ?? null,
+              prUrl: entry.prUrl ?? null,
+            })),
+          }),
+        );
+      }
+
+      default:
+        throw new Error(`Unknown tool: ${name}`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return textResult(`Error: ${message}`, true);
+  }
+}
+
+/**
+ * Build the Moment MCP server with every tool registered and no transport
+ * attached (S6). `src/index.ts` connects it to stdio; the hosted /api/mcp
+ * endpoint connects the same object to streamable HTTP.
+ */
+export function createMomentMcpServer(opts: MomentServerOptions): Server {
+  const apiClient = new MomentApiClient(opts);
+  const server = new Server(
+    {
+      name: 'moment-server',
+      version: '0.1.0',
+    },
+    {
+      capabilities: {
+        tools: {},
+        resources: {},
+      },
+    }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) =>
+    dispatchTool(apiClient, request.params.name, request.params.arguments)
+  );
+
+  // One orientation resource, so a tool-only client still learns the flow.
+  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: [{
+      uri: START_HERE_URI,
+      name: 'Moment start here',
+      description: 'Cold-agent orientation: first calls, error recovery, and write tiers.',
+      mimeType: 'text/markdown',
+    }],
+  }));
+
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    if (request.params.uri !== START_HERE_URI) {
+      throw new Error(`Unknown resource: ${request.params.uri}`);
+    }
+    return {
+      contents: [{
+        uri: START_HERE_URI,
+        mimeType: 'text/markdown',
+        text: START_HERE_TEXT,
+      }],
+    };
+  });
+
+  return server;
+}
