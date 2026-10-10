@@ -1,14 +1,29 @@
 [project]
 name = "moment-cli"
-version = "2.4.0"
+version = "2.6.0"
 description = "Moment research agent CLI"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.10"
+keywords = ["research", "agents", "context", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
     "typer>=0.9.0",
     "rich>=13.0.0",
     "httpx>=0.24.0",
     "pypdf>=4.0.0",
 ]
+
+[project.urls]
+Homepage = "https://scientificintelligence.org"
+Documentation = "https://scientificintelligence.org/developers"
 
 [project.scripts]
 moment = "moment_cli.cli:app"

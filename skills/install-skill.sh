@@ -2,9 +2,10 @@
 #
 # install-skill.sh — install Moment's agent skills for local agents.
 #
-# Copies the Moment agent skills that sit next to this script into the global
-# skill directories for Claude (~/.claude/skills) and Codex (~/.codex/skills) so
-# they are available across all your projects.
+# Copies the Moment agent skills that sit next to this script (.claude/skills/ in
+# the Moment repo, skills/ in the agent kit) into the global skill directories
+# for Claude (~/.claude/skills) and Codex (~/.codex/skills) so they are
+# available across all your projects.
 #
 # Skills installed: moment (context hub) and burn (the contribution loop).
 #

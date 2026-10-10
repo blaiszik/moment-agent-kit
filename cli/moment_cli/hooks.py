@@ -36,6 +36,20 @@ from typing import Callable, Optional
 CAPTURE_ARGS = ["capture", "--hook"]
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via a sibling temp file and rename, keeping the old file's mode: a
+    crash mid-write must never leave a truncated settings or config file. A
+    symlinked file (a dotfiles checkout) is written through, not replaced."""
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    os.replace(temp, path)
+
+
 # --------------------------------------------------------------------------- #
 # Resolving the `moment` invocation (hook PATH is often stripped)
 # --------------------------------------------------------------------------- #
@@ -51,6 +65,9 @@ def resolve_moment_command() -> list[str]:
     if found:
         return [found]
     import sys
+
+    if sys.platform.startswith("win"):
+        return ["moment"]
 
     # `python -m moment_cli` is equivalent to the console script.
     return [sys.executable, "-m", "moment_cli"]
@@ -174,8 +191,7 @@ def install_claude(*, command: Optional[str] = None) -> str:
         if not added_any:
             return "present"
 
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_path.write_text(json.dumps(data, indent=2) + "\n")
+        _atomic_write(settings_path, json.dumps(data, indent=2) + "\n")
         # "added": none of our events were present before; "updated": we filled in a
         # missing event alongside one that already existed.
         return "added" if already == 0 else "updated"
@@ -196,7 +212,9 @@ def codex_shim_path() -> Path:
 
 
 def codex_detected() -> bool:
-    return codex_config_path().exists() or shutil.which("codex") is not None
+    import sys
+
+    return sys.platform.startswith("win") or codex_config_path().exists() or shutil.which("codex") is not None
 
 
 # --- TOML notify read/write (targeted, comment-preserving) --------------------
@@ -336,13 +354,13 @@ def main():
     # Capture git drift for the repo the turn ran in (best-effort, non-fatal).
     if event in (None, "agent-turn-complete") and cwd:
         try:
-            subprocess.run(MOMENT_ARGV + ["capture", "--hook"], cwd=cwd, timeout=60)
+            subprocess.run(MOMENT_ARGV + ["capture", "--hook"], cwd=cwd, timeout=10)
         except Exception:
             pass
     # Forward the original argv to the previously-configured notify program.
     if CHAINED:
         try:
-            subprocess.run(list(CHAINED) + sys.argv[1:], timeout=60)
+            subprocess.run(list(CHAINED) + sys.argv[1:], timeout=10)
         except Exception:
             pass
     return 0
@@ -404,6 +422,10 @@ def codex_notify_points_at_shim(notify: Optional[list]) -> bool:
 
 def codex_status() -> str:
     """present | absent | failed | not-detected (read-only)."""
+    import sys
+
+    if sys.platform.startswith("win"):
+        return "unavailable"
     if not codex_detected():
         return "not-detected"
     config_path = codex_config_path()
@@ -428,6 +450,12 @@ def install_codex(*, moment_argv: Optional[list[str]] = None) -> dict:
     (no-op repoint). If it points elsewhere, that program is captured as the chained
     target so it keeps running. The config.toml edit preserves all other keys/comments.
     """
+    import sys
+
+    if sys.platform.startswith("win"):
+        print("Hooks are unavailable on Windows for Codex; `moment log` works.")
+        return {"status": "unavailable", "chained": None, "shim": None}
+
     moment_argv = moment_argv or resolve_moment_command()
     config_path = codex_config_path()
     shim_path = codex_shim_path()
@@ -454,13 +482,11 @@ def install_codex(*, moment_argv: Optional[list[str]] = None) -> dict:
         if already_ours:
             status = "present"
             if not existed:
-                config_path.parent.mkdir(parents=True, exist_ok=True)
-                config_path.write_text(_splice_notify(text, [str(shim_path)]))
+                _atomic_write(config_path, _splice_notify(text, [str(shim_path)]))
                 status = "added"
         else:
             new_text = _splice_notify(text, [str(shim_path)])
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            config_path.write_text(new_text)
+            _atomic_write(config_path, new_text)
             status = "updated" if existed else "added"
 
         return {"status": status, "chained": chained, "shim": str(shim_path)}

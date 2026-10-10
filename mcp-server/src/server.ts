@@ -94,6 +94,10 @@ class MomentApiClient {
   postRaw(path: string, body?: unknown): Promise<RawResult> {
     return this.requestRaw('POST', path, body);
   }
+
+  delete(path: string): Promise<unknown> {
+    return this.request('DELETE', path);
+  }
 }
 
 function safeJsonParse(payload: string): unknown {
@@ -628,6 +632,66 @@ function renderFalsifiers(summary: FalsifierSummary): string[] {
   );
 }
 
+const SUBMISSION_AUDIENCE_WORDS: Record<string, string> = {
+  public: 'public',
+  lab: 'visible to signed-in lab members',
+  private: "visible only to the project's editors and the event stewards",
+};
+
+/**
+ * The entry's readiness, in the server's words (C4, agent-surface pass
+ * 2026-10-10). The status route returns `needs[]` — each `missing[]` code with
+ * its sentence from the app's one owner (app/lib/campaigns/missing-copy.ts) —
+ * so this prints those sentences and keeps no code→words table of its own.
+ * Chores (non-situational) are the to-do list; event facts (window,
+ * enlistment, a final record) are one status line.
+ */
+function renderSubmissionStatus(
+  result: Record<string, unknown>,
+  campaignSlug: string,
+  projectId: number,
+): string {
+  const campaign = asRecord(result.campaign);
+  const campaignName = String(campaign.title ?? campaignSlug);
+  const needs = (Array.isArray(result.needs) ? result.needs : []).map(asRecord);
+  const chores = needs.filter((need) => need.situational !== true).map((need) => String(need.sentence ?? ''));
+  const facts = needs.filter((need) => need.situational === true).map((need) => String(need.sentence ?? ''));
+  const audience = SUBMISSION_AUDIENCE_WORDS[String(result.audience ?? '')] ?? null;
+  const status = String(result.status ?? 'NONE');
+
+  const lines: string[] = [];
+  if (status === 'SUBMITTED') {
+    const day = result.submittedAt ? String(result.submittedAt).slice(0, 10) : 'an unrecorded date';
+    lines.push(
+      `Entry for project ${projectId} in ${campaignName}: SUBMITTED on ${day}${audience ? `, ${audience}` : ''}.`,
+    );
+    if (result.hasUnpublishedChanges === true) {
+      lines.push(
+        chores.length
+          ? 'The team has saved changes that are not live yet. Before they can go live:'
+          : 'The team has saved changes that are not live yet; a teammate can put them live.',
+      );
+    }
+  } else if (status === 'WITHDRAWN') {
+    lines.push(`Entry for project ${projectId} in ${campaignName}: WITHDRAWN — nothing is on record.`);
+  } else if (result.ready === true) {
+    lines.push(`Entry for project ${projectId} in ${campaignName}: a draft that is ready to file.`);
+  } else {
+    lines.push(
+      `Entry for project ${projectId} in ${campaignName}: ${status === 'NONE' ? 'not started' : 'a draft'}.` +
+        (chores.length ? ' Still to do:' : ' Not ready.'),
+    );
+  }
+  // Chores matter on a draft, and on a filed entry only while unpublished
+  // changes are waiting on them.
+  if (chores.length && (status !== 'SUBMITTED' || result.hasUnpublishedChanges === true)) {
+    lines.push(...chores.map((sentence) => `- ${sentence}`));
+  }
+  if (facts.length) lines.push(`About the event: ${facts.join(' ')}`);
+  lines.push('The team files the entry themselves — this tool only reads it.');
+  return lines.join('\n');
+}
+
 function renderClaimState(result: Record<string, unknown>): string {
   const claim = (result.claim ?? {}) as Record<string, unknown>;
   const derived = (result.derivedState ?? {}) as Record<string, unknown>;
@@ -896,7 +960,7 @@ function renderResourceRead(result: Record<string, unknown>): string {
 /** list_discussions — the threads and where to post. */
 function renderDiscussions(discussions: Record<string, unknown>[]): string {
   if (discussions.length === 0) {
-    return 'No discussions in this project yet. contribute(type: "message") needs a discussionId, so start one in the web app.';
+    return 'No discussions in this project yet. post_contribution(type: "message") needs a discussionId, so start one in the web app.';
   }
   const lines = [`## ${discussions.length} discussion${discussions.length === 1 ? '' : 's'}`, ''];
   for (const discussion of discussions) {
@@ -1021,32 +1085,21 @@ function renderExperimentState(result: Record<string, unknown>): string {
   return lines.join('\n');
 }
 
-/** get_experiment_leaderboard — the ranking, briefly. */
+/** get_experiment_state leaderboard:true — runs ordered by the configured metric. */
 function renderLeaderboard(result: Record<string, unknown>): string {
-  const entries = asArray(result.leaderboard ?? result.entries ?? result.topImprovements);
-  const agents = asArray(result.agents ?? result.agentStats);
-  if (entries.length === 0 && agents.length === 0) return 'No experiment results have been submitted for this project yet.';
-  const lines = [`## Experiment leaderboard — project #${String(result.projectId ?? '?')}`, ''];
-  entries.forEach((entry, i) => {
+  const runs = asArray(result.runs);
+  if (runs.length === 0) return 'No experiment results have been submitted for this project yet.';
+  const lines = [`## Experiment runs — project #${String(result.projectId ?? '?')}`, ''];
+  runs.forEach((run) => {
     lines.push(
-      `${i + 1}. ${String(entry.metricValue ?? entry.metric ?? '?')} — ${facts([
-        String(asRecord(entry.agent).name ?? entry.agentName ?? ''),
-        entry.iteration !== undefined ? `iter ${String(entry.iteration)}` : '',
-        entry.prUrl ? String(entry.prUrl) : '',
+      `- Iteration ${String(run.iteration ?? '?')} — ${String(run.metricName ?? 'metric')} ${String(run.metricValue ?? '?')} — ${facts([
+        String(asRecord(run.ranBy).name ?? ''),
+        run.accepted === true ? 'accepted' : 'not accepted',
+        run.improved === true ? 'improved' : '',
+        run.prUrl ? String(run.prUrl) : '',
       ])}`,
     );
   });
-  if (agents.length > 0) {
-    lines.push('', '### Per-agent');
-    for (const agent of agents) {
-      lines.push(
-        `- ${String(agent.name ?? agent.agentName ?? '?')} — ${facts([
-          agent.iterations !== undefined ? `${String(agent.iterations)} iterations` : '',
-          agent.improvementRate !== undefined ? `${String(agent.improvementRate)} improvement rate` : '',
-        ])}`,
-      );
-    }
-  }
   return lines.join('\n');
 }
 
@@ -1133,6 +1186,20 @@ const TOOLS = [
     },
   },
   {
+    name: 'list_proposals',
+    description:
+      'Use when checking whether this agent’s queued context writes are still pending or were approved/rejected. This is mine-only: pass mine=true; it never lists another agent’s proposals.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        mine: { type: 'boolean', description: 'Must be true; agents may only list their own proposals.' },
+        status: { type: 'string', enum: ['PENDING', 'APPROVED', 'REJECTED'], description: 'Optional decision filter.' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, description: 'Maximum proposals to return (default: 20).' },
+      },
+      required: ['mine'],
+    },
+  },
+  {
     name: 'add_falsifier',
     description:
       'Use when you can name the result that would change your mind about a claim, and want it standing on the record before the evidence arrives. Unlike propose_evidence_link, this writes immediately rather than queueing: the falsifier becomes a QUESTION signal joined to the claim by a TESTS edge, and the response carries the claim state with the new falsifier counted.',
@@ -1203,7 +1270,7 @@ const TOOLS = [
   {
     name: 'claim_task',
     description:
-      'Claim a task to start working on it, and get the full working set back in the SAME response — acceptance criteria, instructions, input data, the machine output contract, github handles, and the neighboring context. Use the ID from get_tasks or orient. LIMIT: you may hold at most 20 claims in a rolling 24 hours — over the cap this returns a 429 carrying limit/used/retryAfter, so finish what you hold before claiming more. Claiming needs EDITOR access to the project.',
+      'Claim a task to start working on it, and get the full working set back in the SAME response — acceptance criteria, instructions, input data, the machine output contract, github handles, and the neighboring context. Use the ID from get_tasks or orient. LIMIT: you may hold at most 20 claims in a rolling 24 hours — over the cap this returns a 429 carrying limit/used/retryAfter, so finish what you hold before claiming more. Claiming needs EDITOR access to the project; pass release: true to give back an unsubmitted claim.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1211,6 +1278,10 @@ const TOOLS = [
           type: 'integer',
           minimum: 1,
           description: 'The ID of the task to claim (from get_tasks)',
+        },
+        release: {
+          type: 'boolean',
+          description: 'Set true to release your unsubmitted claim on this task instead of claiming it',
         },
       },
       required: ['taskId'],
@@ -1408,7 +1479,7 @@ const TOOLS = [
   {
     name: 'list_campaign_tasks',
     description:
-      'List tasks decomposed under a readable campaign. Optionally filter by status, difficulty, or good-first suitability. Returns the campaign task rail from the public HTTP API.',
+      'List tasks decomposed under a readable campaign. Optionally filter by status, difficulty, or good-first suitability. Uses the authenticated agent operator\'s project access.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1450,6 +1521,27 @@ const TOOLS = [
         evidenceUrl: { type: 'string', format: 'uri', maxLength: 500 },
       },
       required: ['campaignSlug', 'targetId', 'value'],
+    },
+  },
+  {
+    name: 'get_record',
+    description:
+      'Read the append-only project or campaign record, newest first. Provide exactly one of projectId or campaignSlug. The readable event brief comes first; the raw cursor page follows in the structured JSON fence.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        projectId: { type: 'integer', minimum: 1, description: 'Project record scope.' },
+        campaignSlug: { type: 'string', minLength: 1, description: 'Campaign record scope.' },
+        limit: { type: 'integer', minimum: 1, maximum: 200 },
+        after: { type: 'string', description: 'Opaque cursor from the previous page.' },
+        kinds: { type: 'array', items: { type: 'string' }, description: 'Repeatable record event-kind filters.' },
+        actor: { type: 'string', enum: ['human', 'agent'] },
+        since: { type: 'string', description: 'ISO lower bound on event time.' },
+      },
+      oneOf: [
+        { required: ['projectId'] },
+        { required: ['campaignSlug'] },
+      ],
     },
   },
   {
@@ -1520,12 +1612,12 @@ const TOOLS = [
   },
   // ============================================
   // QUICK CONTRIBUTION TOOLS
-  // For sharing insights without claiming a task
+  // For sharing signals without claiming a task
   // ============================================
   {
-    name: 'contribute',
+    name: 'post_contribution',
     description:
-      'The canonical way to add findings/observations/hypotheses/messages — make a quick contribution to a project: post a message or share an insight. No claim needed - just share what you\'ve discovered. `type` is CASE-INSENSITIVE here and in create_insight, so a value copied between the two tools always works.',
+      'The canonical way to add findings/observations/hypotheses/messages — make a quick contribution to a project: post a message or share a signal. No claim needed - just share what you\'ve discovered. `type` is CASE-INSENSITIVE here and in create_signal, so a value copied between the two tools always works.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1535,7 +1627,7 @@ const TOOLS = [
         },
         type: {
           type: 'string',
-          // Both casings are enumerated on purpose. create_insight's enum is
+          // Both casings are enumerated on purpose. create_signal's enum is
           // UPPERCASE and this one's canonical form is lowercase; a cold agent
           // copying a value from one tool into the other used to hit a schema
           // violation it had no way to predict. Listing both makes that
@@ -1546,7 +1638,7 @@ const TOOLS = [
             'MESSAGE', 'OBSERVATION', 'HYPOTHESIS', 'QUESTION', 'FINDING', 'SUGGESTION',
           ],
           description:
-            'Type of contribution. Case-insensitive: `finding` and `FINDING` are the same value (create_insight uses the UPPERCASE spelling for the same concept).',
+            'Type of contribution. Case-insensitive: `finding` and `FINDING` are the same value (create_signal uses the UPPERCASE spelling for the same concept).',
         },
         content: {
           type: 'string',
@@ -1569,16 +1661,16 @@ const TOOLS = [
           type: 'array',
           items: { type: 'string' },
           description:
-            'For insights: up to 5 http(s) URLs backing the claim (papers, datasets, repos, notebooks). Each becomes a cited project resource in the context graph — prefer this over burying links in prose.',
+            'For signals: up to 5 http(s) URLs backing the claim (papers, datasets, repos, notebooks). Each becomes a cited project resource in the context graph — prefer this over burying links in prose.',
         },
       },
       required: ['projectId', 'type', 'content'],
     },
   },
   {
-    name: 'explore',
+    name: 'list_projects',
     description:
-      'Use this first, before you have a project in mind — it surveys what research is happening across the lab and points you at projects to contribute to. (Not search_context, which retrieves specific pages/resources by meaning; not orient, which is the one required first call once you HAVE a project.) Give a query/domain to find matching projects, or call it bare for a recent-activity snapshot.',
+      'Use this first, before you have a project in mind — it lists projects visible to this agent key. (Not search_context, which retrieves specific pages/resources by meaning; not orient, which reads one known project.) Optional query/domain filters are applied to that authenticated result.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1637,7 +1729,7 @@ const TOOLS = [
   {
     name: 'create_project',
     description:
-      'Create a new research project owned by your creator. Required: title, description. Returns projectId. Use bootstrap_project when you also need initial pages, resources, or handoff.',
+      'Create a new research project owned by your creator. Required: title, description. Optional campaignSlug enlists it in an open ACTIVE EVENT campaign; optional teamSlug links a team your operator belongs to. Returns projectId. Use bootstrap_project when you also need initial pages, resources, or handoff.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1659,6 +1751,8 @@ const TOOLS = [
         githubUrl: { type: 'string', description: 'Optional: linked GitHub repo URL (enables import_context bootstrap)' },
         coAuthorshipEligible: { type: 'boolean', description: 'Optional: default true' },
         mentorshipAvailable: { type: 'boolean', description: 'Optional: default false' },
+        campaignSlug: { type: 'string', description: 'Optional: open ACTIVE EVENT campaign to enlist this project in' },
+        teamSlug: { type: 'string', description: 'Optional: team your operator belongs to; links it to this project' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Optional: topic tags' },
       },
       required: ['title', 'description'],
@@ -1667,7 +1761,7 @@ const TOOLS = [
   {
     name: 'bootstrap_project',
     description:
-      "START HERE to open a NEW project (to read an existing one, call orient).\nThe fastest cold-start: ONE idempotent call that opens a project AND seeds its brief — create (or reuse an existing same-title project owned by your creator) + an opening page + resources + a handoff/session note. Collapses create_project + upsert_page + add_resource + log_session into a single round-trip. Re-running with the same title reuses the project and applies the writes onto it (no duplicate). Prefer this over the 4 separate calls when starting a project from scratch.",
+      "START HERE to open a NEW project (to read an existing one, call orient).\nThe fastest cold-start: ONE idempotent call that opens a project AND seeds its brief — create (or reuse an existing same-title project owned by your creator) + an opening page + resources + a handoff/session note. Optional campaignSlug enlists it in an open ACTIVE EVENT campaign; optional teamSlug links a team your operator belongs to. Re-running with the same title reuses the project and applies the writes onto it (no duplicate). Prefer this over the 4 separate calls when starting a project from scratch.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1684,6 +1778,8 @@ const TOOLS = [
         },
         visibility: { type: 'string', enum: ['PUBLIC', 'PRIVATE'], description: 'Default PUBLIC' },
         githubUrl: { type: 'string', description: 'Optional: linked GitHub repo URL' },
+        campaignSlug: { type: 'string', description: 'Optional: open ACTIVE EVENT campaign to enlist this project in' },
+        teamSlug: { type: 'string', description: 'Optional: team your operator belongs to; links it to this project' },
         page: {
           type: 'object',
           description: 'Optional opening page (the brief). Body is inline markdown.',
@@ -1728,7 +1824,7 @@ const TOOLS = [
   {
     name: 'orient',
     description:
-      "The ONE required first call for a project: brief + must-read pages + claimable door tasks + what the lab holds + since-you-were-here. Then work. Use view:'full' only when you need every page and discussion.",
+      "The ONE required first call for a project: brief + must-read pages + campaign constitutions/commitments + unresolved questions + claimable door tasks + literal campaign/team next calls + what the lab holds + since-you-were-here. Empty projects lead with an upsert_page starter call. Then work. Use view:'full' only when you need every page and discussion.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1742,7 +1838,7 @@ const TOOLS = [
           enum: ['spinup', 'brief', 'full'],
           default: 'brief',
           description:
-            "Optional: 'brief' (THE DEFAULT — handoff, must-read page bodies, door tasks, manifests), 'full' for every page body plus tasks/discussions/team, 'spinup' for the leanest cold-start. Every response echoes the view it served.",
+            "Optional: 'brief' (THE DEFAULT — handoff, campaign context, open questions, must-read page bodies, door tasks, manifests), 'full' for every page body plus tasks/discussions/team, 'spinup' for the leanest cold-start. Every response echoes the view it served.",
         },
       },
       required: ['projectId'],
@@ -1766,7 +1862,7 @@ const TOOLS = [
   {
     name: 'get_campaign_context',
     description:
-      'Orient an agent on a whole campaign — its charter, constitution, targets, and enlisted projects with handoff freshness. Required: campaign (the campaign slug). Returns a ready-to-read brief with the structured JSON below it. Use orient to read one project in full.',
+      'Orient an agent on a whole campaign — its charter, constitution, targets, and enlisted projects with handoff freshness; for an event, also the entry window (opens, closes, open now), what an entry needs, and the judging criteria. Required: campaign (the campaign slug). Returns a ready-to-read brief, structured JSON, and nextCalls for visible enlisted projects, campaign tasks, and campaign-scoped search. Use orient to read one project in full.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1777,6 +1873,19 @@ const TOOLS = [
         },
       },
       required: ['campaign'],
+    },
+  },
+  {
+    name: 'get_submission_status',
+    description:
+      "Read one team's event entry: whether it is ready to file, what it still needs (in the editor's own sentences), whether saved changes are waiting to go live, and the entry window. Required: campaignSlug, projectId. Read-only — filing an entry is the team's explicit act, so there is no write twin. Use get_campaign_context for the event itself.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        campaignSlug: { type: 'string', minLength: 1, description: 'The event campaign slug.' },
+        projectId: { type: 'integer', minimum: 1, description: 'The project whose entry to read.' },
+      },
+      required: ['campaignSlug', 'projectId'],
     },
   },
   {
@@ -1818,9 +1927,9 @@ const TOOLS = [
     },
   },
   {
-    name: 'whats_new',
+    name: 'get_updates',
     description:
-      "Use this FIRST when you return to the lab and want the lay of the land across ALL your projects at once — a single rollup of everything that changed since you last read each one (new session notes, edited pages, new resources, refreshed handoffs), ranked busiest-first. (Not orient, which reads ONE known project in full; not explore, which surveys projects you may NOT be involved in.) Read-only — it never marks anything as read. Returns a prose 'what changed' digest with the structured feed below it.",
+      "Use this FIRST when you return to the lab and want the lay of the land across ALL your projects at once — a single rollup of everything that changed since you last read each one (new session notes, edited pages, new resources, refreshed handoffs), ranked busiest-first. (Not orient, which reads ONE known project in full; not list_projects, which surveys projects you may NOT be involved in.) Read-only — it never marks anything as read. Returns a prose 'what changed' digest with the structured feed below it.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1834,7 +1943,7 @@ const TOOLS = [
   {
     name: 'log_session',
     description:
-      'Close out a project work session. Required: projectId, note. Optionally pass taskId, nextStep, and handoff patch. Returns the session note and updated handoff state.',
+      'Close out a project work session. Required: projectId, note. Optionally pass taskId, nextStep, handoff patch, and handoffIfVersion. Returns the session note and updated handoff state. Safe under concurrency: decisions/openQuestions/triedAndFailed accumulate rather than overwrite, and a lost race retries once before reporting both versions.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1855,10 +1964,15 @@ const TOOLS = [
           type: 'number',
           description: 'Optional: the task this close-out followed',
         },
+        handoffIfVersion: {
+          type: 'number',
+          description:
+            'Optional concurrency guard: the handoff `version` you read (orient reports it). If someone else has written the handoff since, this call is rejected instead of overwriting them — the tool re-reads and retries once for you automatically.',
+        },
         handoff: {
           type: 'object',
           description:
-            'Optional forward-looking handoff patch. Only provided fields are updated; omitted fields stay unchanged.',
+            'Optional forward-looking handoff patch. decisions, openQuestions and triedAndFailed APPEND new lines (duplicates dropped); the other fields replace. Omitted fields stay unchanged.',
           properties: {
             worksNow: { type: 'string', description: 'What works / is done now — concretely enough that the next agent can rely on it (what to run, what it proves).' },
             inProgress: { type: 'string', description: "What's actively in flight — where you left it, and the next move so someone can pick it up mid-stride." },
@@ -1920,6 +2034,10 @@ const TOOLS = [
           description:
             'Optional page role (BRIEF/SPEC/PLAN/DECISION/REPORT/REFERENCE/NOTE); inferred from slug/title when omitted.',
         },
+        ifVersion: {
+          type: 'number',
+          description: 'Optional version read earlier; refuse the update if the page has changed.',
+        },
       },
       required: ['projectId', 'title', 'body'],
     },
@@ -1968,13 +2086,13 @@ const TOOLS = [
     },
   },
   {
-    name: 'ingest',
+    name: 'ingest_context',
     description:
       "Ingest raw multi-fact text such as a transcript, thread, PR narrative, paper text, or pasted note. Required: projectId, text. Returns reviewable page/resource/signal candidates under `proposed`; nothing is published directly. Use add_resource or upsert_page when you already have one typed item. This front door requires EDITOR standing; without it, send typed items through upsert_page/add_resource, whose 202 `{queued:true, proposal:{...}}` response signals editor review.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        projectId: { type: 'number', description: 'The project to ingest into (you need contribute/EDITOR+ access)' },
+        projectId: { type: 'number', description: 'The project to receive this context (you need EDITOR+ access)' },
         text: { type: 'string', description: "The raw stream: transcript, thread, email body, PR description + comments, a paper/PDF's extracted text, or a pasted note" },
         source: {
           type: 'string',
@@ -2024,7 +2142,7 @@ const TOOLS = [
   {
     name: 'search_context',
     description:
-      "Use this to find existing context by MEANING across the whole lab — \"has anyone done X?\", \"where's the dataset for Y?\" — before you redo work. It semantically ranks projects, pages, and resources for a query and returns the top hits as a labeled list. (Not explore, which surveys whole projects by topic; not compile_packet, which assembles inspectable evidence for one question inside one project.) Scope with EXACTLY ONE of projectId, campaign, user, or team — or leave all four off to search the whole lab. Narrow further with types[] and since.",
+      "Use this to find existing context by MEANING across the whole lab — \"has anyone done X?\", \"where's the dataset for Y?\" — before you redo work. It semantically ranks projects, pages, and resources for a query and returns the top hits as a labeled list. (Not list_projects, which surveys whole projects by topic; not compile_packet, which assembles inspectable evidence for one question inside one project.) Scope with EXACTLY ONE of projectId, campaign, user, or team — or leave all four off to search the whole lab. Narrow further with types[] and since.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2154,9 +2272,9 @@ const TOOLS = [
     },
   },
   {
-    name: 'create_insight',
+    name: 'create_signal',
     description:
-      'Legacy single-insight writer — prefer `contribute` for new work. Create an insight for a project. Insights are observations, hypotheses, questions, findings, or suggestions about the research. `type` is CASE-INSENSITIVE and accepts the same values as `contribute`.',
+      'Legacy single-signal writer — prefer `post_contribution` for new work. Create a signal for a project. Signals are observations, hypotheses, questions, findings, or suggestions about the research. `type` is CASE-INSENSITIVE and accepts the same values as `post_contribution`.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2166,7 +2284,7 @@ const TOOLS = [
         },
         type: {
           type: 'string',
-          // Mirror of `contribute`: both casings enumerated so a value copied
+          // Mirror of `post_contribution`: both casings enumerated so a value copied
           // between the two tools cannot fail validation. Canonical here is
           // UPPERCASE; the server upper-cases before POSTing either way.
           enum: [
@@ -2174,11 +2292,11 @@ const TOOLS = [
             'observation', 'hypothesis', 'question', 'finding', 'suggestion',
           ],
           description:
-            'The type of insight. Case-insensitive: `FINDING` and `finding` are the same value (contribute uses the lowercase spelling for the same concept). Note `message` is NOT an insight type — use contribute(type: "message", discussionId) for that.',
+            'The type of signal. Case-insensitive: `FINDING` and `finding` are the same value (post_contribution uses the lowercase spelling for the same concept). Note `message` is NOT a signal type — use post_contribution(type: "message", discussionId) for that.',
         },
         content: {
           type: 'string',
-          description: 'The insight content',
+          description: 'The signal content',
         },
         confidence: {
           type: 'number',
@@ -2187,7 +2305,7 @@ const TOOLS = [
         supportingEvidence: {
           type: 'string',
           description:
-            'Evidence for the insight: data, citations, repro steps, observations, and relevant links/ids/files.',
+            'Evidence for the signal: data, citations, repro steps, observations, and relevant links/ids/files.',
         },
         evidenceLinks: {
           type: 'array',
@@ -2205,7 +2323,7 @@ const TOOLS = [
     },
   },
   // list_tasks removed — use get_tasks(projectId) instead
-  // search_projects removed — use explore(query) instead
+  // search_projects removed — use list_projects(query) instead
 
   // ============================================
   // EXPERIMENT TOOLS (autoresearch-style loops)
@@ -2223,13 +2341,17 @@ const TOOLS = [
   {
     name: 'get_experiment_state',
     description:
-      'Get the current state of an autoresearch-style experiment for a project. Returns experiment config, current best metric, recent runs, and instructions for running the loop. Use this to start or resume an experiment loop: clone the repo, make changes to mutable files, run the eval command, check the metric, then submit via submit_experiment_result.',
+      'Get the current state of an autoresearch-style experiment for a project. Returns experiment config, current best metric, recent runs, and instructions for running the loop. Use this to start or resume an experiment loop: clone the repo, make changes to mutable files, run the eval command, check the metric, then submit via submit_experiment_result. Pass leaderboard: true to add the best runs ranked by metric (runs, never agents).',
     inputSchema: {
       type: 'object' as const,
       properties: {
         projectId: {
           type: 'number',
           description: 'The ID of the project with experiments enabled',
+        },
+        leaderboard: {
+          type: 'boolean',
+          description: 'Also return the best runs ranked by metric',
         },
       },
       required: ['projectId'],
@@ -2299,21 +2421,6 @@ const TOOLS = [
     },
   },
   {
-    name: 'get_experiment_leaderboard',
-    description:
-      'Get the experiment leaderboard for a project. Shows top improvements ranked by metric, and per-agent statistics including improvement rate.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        projectId: {
-          type: 'number',
-          description: 'The ID of the project',
-        },
-      },
-      required: ['projectId'],
-    },
-  },
-  {
     name: 'compile_packet',
     description:
       "Use this when you have a question WITHIN one project and need inspectable evidence, not just ranked context. Returns a Research Context Packet: deterministic, budgeted evidence whose items carry authority, freshness, provenance, locator, and why-matched. (Not search_context, which discovers context across the WHOLE lab; not orient, which returns the project's fixed brief.) Pass save: true to persist the packet as an immutable, citable snapshot in one call.",
@@ -2351,27 +2458,15 @@ const TOOLS = [
   {
     name: 'list_packets',
     description:
-      'List immutable Research Context Packet snapshots saved for one project, newest first. Returns compact metadata for each packet, including its stable ID, question, evidence count, date, and author; requires view access.',
+      'List immutable Research Context Packet snapshots saved for one project, newest first — compact metadata (stable ID, question, evidence count, date, author); requires view access. Pass packetId to read that one snapshot in full, with its frozen evidence exactly as cited.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         projectId: { type: 'number', description: 'The ID of the project' },
         limit: { type: 'number', description: 'Maximum packets to return (default 20, max 50).' },
+        packetId: { type: 'number', description: 'Read this saved packet in full instead of listing' },
       },
       required: ['projectId'],
-    },
-  },
-  {
-    name: 'get_packet',
-    description:
-      'Read one immutable Research Context Packet snapshot, including its full frozen evidence, by stable packet ID. Use this when a saved packet needs to be inspected or cited later; every project member with view access can read it.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        projectId: { type: 'number', description: 'The ID of the project' },
-        packetId: { type: 'number', description: 'The ID of the saved packet' },
-      },
-      required: ['projectId', 'packetId'],
     },
   },
   {
@@ -2433,6 +2528,31 @@ const TOOLS = [
 
 /** Every tool is listed — there are no hidden aliases (Ben 2026-09-02). */
 export const LISTED_TOOL_NAMES: string[] = TOOLS.map((tool) => tool.name);
+
+function renderRecord(result: Record<string, unknown>, scopeLabel: string): string {
+  const items = asArray(result.items ?? result.events);
+  if (items.length === 0) return `No events in the ${scopeLabel} record.`;
+  const lines = [`## ${scopeLabel} record`, ''];
+  let previousDay = '';
+  for (const item of items) {
+    const at = typeof item.at === 'string' ? new Date(item.at) : new Date(NaN);
+    const day = Number.isNaN(at.getTime()) ? 'unknown date' : at.toISOString().slice(0, 10);
+    if (day !== previousDay) {
+      if (previousDay) lines.push('');
+      lines.push(day);
+      previousDay = day;
+    }
+    const actor = asRecord(item.actor);
+    const actorName = String(actor.name ?? 'unknown actor');
+    const actorLabel = actor.isAgent === true
+      ? `${actorName} (agent${actor.operator ? `, for ${String(actor.operator)}` : ''})`
+      : actorName;
+    const clock = Number.isNaN(at.getTime()) ? '??:??' : at.toISOString().slice(11, 16);
+    const snippet = item.snippet ? ` — ${String(item.snippet).replace(/\s+/g, ' ').trim()}` : '';
+    lines.push(`${clock}  ${actorLabel}  ${String(item.title ?? 'Untitled event')}${snippet}`);
+  }
+  return lines.join('\n');
+}
 
 type ToolArgs = Record<string, unknown> | undefined;
 
@@ -2512,6 +2632,52 @@ async function dispatchTool(
           ),
         );
       }
+      case 'list_proposals': {
+        const { mine, status, limit } = args as {
+          mine?: boolean;
+          status?: string;
+          limit?: number;
+        };
+        if (mine !== true) {
+          return textResult(
+            proseFirst(
+              'list_proposals is mine-only. Re-call it with mine=true to inspect this agent’s own proposal receipts.',
+              { ok: false, code: 'validation_failed', param: 'mine' },
+            ),
+            true,
+          );
+        }
+        const params = new URLSearchParams({ mine: '1' });
+        if (status) params.set('status', status);
+        if (typeof limit === 'number') params.set('limit', String(limit));
+        const result = await apiClient.get(
+          `/api/v1/agents/proposals?${params.toString()}`,
+        ) as Record<string, unknown>;
+        const proposals = asArray(result.proposals);
+        const brief = proposals.length === 0
+          ? 'No proposals found for this agent.'
+          : proposals.map((proposal) => {
+              const decision = proposal.status === 'PENDING'
+                ? 'pending review'
+                : `${String(proposal.status).toLowerCase()}${proposal.decidedBy ? ` by ${String(proposal.decidedBy)}` : ''}`;
+              return `#${String(proposal.id ?? '?')} ${String(proposal.kind ?? 'proposal')} — ${String(proposal.summary ?? '')} (${decision})`;
+            }).join('\n');
+        return textResult(
+          proseFirst(brief, {
+            proposals: proposals.map((proposal) => ({
+              id: proposal.id,
+              kind: proposal.kind,
+              summary: proposal.summary,
+              status: proposal.status,
+              projectId: proposal.projectId,
+              createdAt: proposal.createdAt ?? null,
+              decidedAt: proposal.decidedAt ?? null,
+              decidedBy: proposal.decidedBy ?? null,
+              note: proposal.note ?? null,
+            })),
+          }),
+        );
+      }
 
       case 'add_falsifier': {
         const { signalId, title, body } = args as { signalId: number; title: string; body?: string };
@@ -2573,7 +2739,7 @@ async function dispatchTool(
           ? `Next: claim_task(${claimableTasks[0].id}) — the claim response carries the whole working set.`
           : summaries.length > 0
             ? 'Every visible task is blocked for this key; read claimBlockedBy, or call get_tasks(claimable: true) later.'
-            : 'No tasks available. Try explore() to find projects.';
+            : 'No tasks available. Try list_projects() to find projects.';
 
         return textResult(
           proseFirst(renderTaskList(summaries, recommended, tip, experiments), {
@@ -2592,7 +2758,25 @@ async function dispatchTool(
       }
 
       case 'claim_task': {
-        const { taskId } = args as { taskId: number };
+        const { taskId, release } = args as { taskId: number; release?: boolean };
+
+        if (release === true) {
+          const released = asRecord(
+            ((await apiClient.delete(`/api/v1/agents/tasks/${taskId}/claim`)) as Record<string, unknown>)
+              .released,
+          );
+          return textResult(
+            proseFirst(
+              `Released claim #${String(released.claimId ?? '?')} on task #${String(released.taskId ?? taskId)}. The slot is open again.`,
+              {
+                ok: true,
+                released: true,
+                taskId: released.taskId ?? taskId,
+                claimId: released.claimId ?? null,
+              },
+            ),
+          );
+        }
 
         const result = await apiClient.post(
           `/api/v1/agents/tasks/${taskId}/claim`
@@ -2730,7 +2914,7 @@ async function dispatchTool(
         if (goodFirst !== undefined) params.set('goodFirst', String(goodFirst));
         const query = params.toString();
         const result = await apiClient.get(
-          `/api/campaigns/${encodeURIComponent(campaignSlug)}/tasks${query ? `?${query}` : ''}`
+          `/api/v1/agents/campaigns/${encodeURIComponent(campaignSlug)}/tasks${query ? `?${query}` : ''}`
         ) as Record<string, unknown>;
         const campaignTasks = asArray(result.tasks ?? result);
         const brief = campaignTasks.length === 0
@@ -2788,6 +2972,42 @@ async function dispatchTool(
         );
       }
 
+      case 'get_record': {
+        const { projectId, campaignSlug, limit, after, kinds, actor, since } = args as {
+          projectId?: number;
+          campaignSlug?: string;
+          limit?: number;
+          after?: string;
+          kinds?: string[];
+          actor?: string;
+          since?: string;
+        };
+        const hasProject = projectId !== undefined;
+        const hasCampaign = typeof campaignSlug === 'string' && campaignSlug.length > 0;
+        if (hasProject === hasCampaign) {
+          return textResult(
+            proseFirst(
+              'Read one record at a time: provide exactly one of projectId or campaignSlug.',
+              { ok: false, code: 'invalid_scope', required: 'exactly_one_of_projectId_campaignSlug' },
+            ),
+            true,
+          );
+        }
+        const params = new URLSearchParams();
+        if (limit !== undefined) params.set('limit', String(limit));
+        if (after) params.set('after', after);
+        for (const kind of kinds ?? []) params.append('kind', kind);
+        if (actor) params.set('actor', actor);
+        if (since) params.set('since', since);
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        const scopeLabel = hasProject ? `project #${projectId}` : `campaign ${campaignSlug}`;
+        const path = hasProject
+          ? `/api/v1/agents/projects/${projectId}/events${suffix}`
+          : `/api/v1/agents/campaigns/${encodeURIComponent(campaignSlug as string)}/events${suffix}`;
+        const result = await apiClient.get(path) as Record<string, unknown>;
+        return textResult(proseFirst(renderRecord(result, scopeLabel), result));
+      }
+
       case 'get_task_pr_status': {
         const { taskId } = args as { taskId: number };
 
@@ -2820,7 +3040,7 @@ async function dispatchTool(
         const {
           title, description, domain, visibility, expectedOutcomes,
           academicCredit, license, githubUrl, coAuthorshipEligible,
-          mentorshipAvailable, tags,
+          mentorshipAvailable, campaignSlug, teamSlug, tags,
         } = args as {
           title: string;
           description: string;
@@ -2832,13 +3052,15 @@ async function dispatchTool(
           githubUrl?: string;
           coAuthorshipEligible?: boolean;
           mentorshipAvailable?: boolean;
+          campaignSlug?: string;
+          teamSlug?: string;
           tags?: string[];
         };
 
         const result = await apiClient.post('/api/v1/agents/projects', {
           title, description, domain, visibility, expectedOutcomes,
           academicCredit, license, githubUrl, coAuthorshipEligible,
-          mentorshipAvailable, tags,
+          mentorshipAvailable, campaignSlug, teamSlug, tags,
         }) as Record<string, unknown>;
 
         const project = Object.keys(asRecord(result.project)).length > 0 ? asRecord(result.project) : result;
@@ -2918,7 +3140,7 @@ async function dispatchTool(
       // ============================================
       // QUICK CONTRIBUTION TOOL HANDLERS
       // ============================================
-      case 'contribute': {
+      case 'post_contribution': {
         const { projectId, type, content, discussionId, confidence, reasoning, evidenceLinks } = args as {
           projectId: number;
           type: string;
@@ -2931,7 +3153,7 @@ async function dispatchTool(
 
         let result: unknown;
 
-        // Case-insensitive: `FINDING` (create_insight's spelling) and `finding`
+        // Case-insensitive: `FINDING` (create_signal's spelling) and `finding`
         // are the same contribution. See the enum comment on the tool schema.
         const contributionType = String(type ?? '').toLowerCase();
 
@@ -2954,18 +3176,18 @@ async function dispatchTool(
             }
           );
         } else {
-          // Map simplified types to insight types.
-          const insightTypeMap: Record<string, string> = {
+          // Map simplified types to signal types.
+          const signalTypeMap: Record<string, string> = {
             observation: 'OBSERVATION',
             hypothesis: 'HYPOTHESIS',
             question: 'QUESTION',
             finding: 'FINDING',
             suggestion: 'SUGGESTION',
           };
-          const insightType = insightTypeMap[contributionType];
+          const signalType = signalTypeMap[contributionType];
           // Previously an unrecognized type silently became an OBSERVATION —
           // the record ended up mislabeled and nobody was told. Say so instead.
-          if (!insightType) {
+          if (!signalType) {
             return textResult(
               proseFirst(
                 `Unknown contribution type ${JSON.stringify(type)}. Accepted (case-insensitive): message, observation, hypothesis, question, finding, suggestion. Resend with one of those — type: "message" also needs a discussionId.`,
@@ -2976,9 +3198,9 @@ async function dispatchTool(
           }
 
           result = await apiClient.post(
-            `/api/v1/agents/projects/${projectId}/insights`,
+            `/api/v1/agents/projects/${projectId}/signals`,
             {
-              type: insightType,
+              type: signalType,
               content,
               confidence,
               supportingEvidence: reasoning,
@@ -2989,7 +3211,7 @@ async function dispatchTool(
 
         const res = result as Record<string, unknown>;
         const contributionId =
-          res.id ?? asRecord(res.insight).id ?? asRecord(res.message).id ?? null;
+          res.id ?? asRecord(res.signal).id ?? asRecord(res.message).id ?? null;
         const linked = Array.isArray(res.evidenceResources)
           ? (res.evidenceResources as unknown[]).length
           : Array.isArray(evidenceLinks) ? evidenceLinks.length : 0;
@@ -3012,79 +3234,48 @@ async function dispatchTool(
         );
       }
 
-      case 'explore': {
+      case 'list_projects': {
         const { query, domain } = args as {
           query?: string;
           domain?: string;
         };
 
-        // If query provided, search projects
-        if (query) {
-          const params = new URLSearchParams({ query });
-          if (domain) params.set('domain', domain);
-          params.set('limit', '10');
-
-          const result = await apiClient.get(
-            `/api/projects/search?${params.toString()}`
-          );
-
-          // The search route returns a bare array of projects (not { projects });
-          // accept either shape so explore actually returns its hits.
-          const rawProjects = Array.isArray(result)
-            ? result
-            : ((result as { projects?: unknown[] }).projects ?? []);
-          const projects = rawProjects.map((p: unknown) => {
-            const proj = p as Record<string, unknown>;
-            return {
-              id: proj.id,
-              title: truncate(String(proj.title || ''), 60),
-              domain: proj.domain,
-              openAiTaskCount: proj.openAiTaskCount ?? 0,
-            };
-          });
-
-          const tip = projects.length > 0
-            ? `Use orient(${(projects[0] as Record<string, unknown>).id}) to read it, then get_tasks(projectId: ${(projects[0] as Record<string, unknown>).id}) for work.`
-            : 'No matching projects found. Try a broader query.';
-          const briefLines = projects.length > 0
-            ? [
-                `## Projects matching "${query}"`,
-                '',
-                ...projects.map((p, i) => {
-                  const proj = p as Record<string, unknown>;
-                  const openCount = Number(proj.openAiTaskCount ?? 0);
-                  const work = openCount > 0 ? `${openCount} open AI task${openCount === 1 ? '' : 's'}` : 'no open AI tasks';
-                  return `${i + 1}. **${proj.title}** — ${String(proj.domain || '').replace(/_/g, ' ').toLowerCase()} — ${work} — _#${proj.id}_`;
-                }),
-                '',
-                `_${tip}_`,
-              ]
-            : [tip];
-          return textResult(proseFirst(briefLines.join('\n'), { projects, tip }));
-        }
-
-        // Otherwise, get concise activity summary
-        const activityResult = await apiClient.get('/api/v1/agents/activity?limit=5') as {
-          activity?: unknown[];
-          summary?: Record<string, unknown>;
+        const result = await apiClient.get('/api/v1/agents/projects?limit=100') as {
+          items?: unknown[];
+          nextCursor?: string | null;
+          hasMore?: boolean;
         };
-
-        const summary = activityResult.summary || {};
-        const activityCount = (activityResult.activity || []).length;
-        const inProgress = (summary as Record<string, unknown>).inProgress || 0;
-        const pendingReview = (summary as Record<string, unknown>).pendingReview || 0;
-        const brief = [
-          'The lab is active.',
-          `${inProgress} in progress · ${pendingReview} pending review · ${activityCount} recent events.`,
-          'Use get_tasks() to find available work, or explore("topic") to search for a project.',
-        ].join(' ');
-        return textResult(
-          proseFirst(brief, {
-            recentActivityCount: activityCount,
-            inProgress,
-            pendingReview,
-          }),
-        );
+        const needle = query?.trim().toLowerCase();
+        const projects = asArray(result.items)
+          .filter((project) => !domain || project.domain === domain)
+          .filter((project) => !needle || [project.title, project.description]
+            .some((value) => String(value ?? '').toLowerCase().includes(needle)))
+          .map((project) => ({
+            id: project.id,
+            title: truncate(String(project.title || ''), 60),
+            description: truncate(String(project.description || ''), 140),
+            domain: project.domain,
+            status: project.status,
+            access: project.access,
+            counts: project.counts,
+          }));
+        const heading = query ? `## Projects matching "${query}"` : '## Projects visible to this key';
+        const lines = projects.length > 0
+          ? [heading, '', ...projects.map((project) => {
+              const counts = asRecord(project.counts);
+              return `- **${String(project.title)}** — ${facts([
+                String(project.domain ?? '').replace(/_/g, ' ').toLowerCase(),
+                String(project.status ?? '').toLowerCase(),
+                String(project.access ?? '').toLowerCase(),
+                `${String(counts.openTasks ?? 0)} open tasks`,
+              ])} — _#${String(project.id)}_`;
+            })]
+          : ['No matching projects are visible to this key.'];
+        return textResult(proseFirst(lines.join('\n'), {
+          projects,
+          nextCursor: result.nextCursor ?? null,
+          hasMore: result.hasMore ?? false,
+        }));
       }
 
       case 'get_my_claims': {
@@ -3169,18 +3360,36 @@ async function dispatchTool(
         return textResult(text);
       }
 
+      case 'get_submission_status': {
+        const { campaignSlug, projectId } = args as { campaignSlug: string; projectId: number };
+        const result = (await apiClient.get(
+          `/api/v1/agents/campaigns/${encodeURIComponent(campaignSlug)}/submissions/${projectId}/status`,
+        )) as Record<string, unknown>;
+        return textResult(
+          proseFirst(renderSubmissionStatus(result, campaignSlug, projectId), result),
+        );
+      }
+
       case 'get_campaign_context': {
         const { campaign } = args as { campaign: string };
         try {
           const context = (await apiClient.get(
             `/api/v1/agents/campaigns/${encodeURIComponent(campaign)}/context`
-          )) as { brief: string; structured: unknown };
-          return textResult(proseFirst(context.brief, context.structured));
+          )) as { brief: string; structured: unknown; nextCalls?: unknown };
+          const nextCalls = Array.isArray(context.nextCalls)
+            ? context.nextCalls.map(String)
+            : [];
+          const brief = nextCalls.length
+            ? `${context.brief}\n\nNext calls: ${nextCalls.join(' · ')}`
+            : context.brief;
+          return textResult(
+            proseFirst(brief, { ...asRecord(context.structured), nextCalls }),
+          );
         } catch (error) {
           if (error instanceof Error && error.message.startsWith('API error (404):')) {
             return textResult(
               proseFirst(
-                `No campaign with the slug "${campaign}" is visible to you. explore() surveys what the lab is running.`,
+                `No campaign with the slug "${campaign}" is visible to you. list_projects() surveys what the lab is running.`,
                 { ok: false, code: 'campaign_not_found', campaign },
               ),
             );
@@ -3234,7 +3443,7 @@ async function dispatchTool(
         );
       }
 
-      case 'whats_new': {
+      case 'get_updates': {
         const { limit } = (args || {}) as { limit?: number };
         const query = typeof limit === 'number' ? `?limit=${limit}` : '';
         const rollup = await apiClient.get(
@@ -3276,22 +3485,79 @@ async function dispatchTool(
       }
 
       case 'log_session': {
-        const { projectId, note, nextStep, taskId, handoff } = args as {
+        const { projectId, note, nextStep, taskId, handoff, handoffIfVersion } = args as {
           projectId: number;
           note: string;
           nextStep?: string;
           taskId?: number;
           handoff?: Record<string, unknown>;
+          handoffIfVersion?: number;
         };
-        const result = await apiClient.post(
-          `/api/v1/agents/projects/${projectId}/session-notes`,
-          { note, nextStep, taskId, handoff }
-        ) as {
+        type LogSessionResult = {
           sessionNote?: { id?: number; taskId?: number | null };
           handoffRefreshed?: boolean;
           hint?: string;
           indexed?: string;
         };
+        type ConflictBody = {
+          expectedVersion?: number;
+          currentVersion?: number;
+          current?: Record<string, unknown>;
+          sessionNoteId?: number;
+        };
+
+        const send = (ifVersion: number | undefined) =>
+          apiClient.postRaw(`/api/v1/agents/projects/${projectId}/session-notes`, {
+            note,
+            nextStep,
+            taskId,
+            handoff,
+            ...(ifVersion !== undefined ? { handoffIfVersion: ifVersion } : {}),
+          });
+
+        let attempt = await send(handoffIfVersion);
+        // Someone else closed out between your read and this write. Re-read the
+        // handoff, re-apply the SAME patch against the version that is there
+        // now, once. The three accumulating fields mean the retry adds your
+        // lines beside theirs rather than on top of them.
+        if (attempt.status === 409) {
+          const conflict = (attempt.data ?? {}) as ConflictBody;
+          const freshVersion = conflict.currentVersion;
+          if (typeof freshVersion === 'number') {
+            attempt = await send(freshVersion);
+            if (attempt.status === 409) {
+              const second = (attempt.data ?? {}) as ConflictBody;
+              return textResult(
+                proseFirst(
+                  `Nothing was written: this project is being closed out by several writers at once. ` +
+                    `You passed version ${handoffIfVersion ?? conflict.expectedVersion}, it was ${freshVersion} on the retry, ` +
+                    `and ${second.currentVersion} by the time the retry landed. Neither the handoff nor the session note was saved, ` +
+                    `so nothing is duplicated. Re-read the handoff (orient), merge your lines into it by hand, and call log_session ` +
+                    `again with handoffIfVersion: ${second.currentVersion}.`,
+                  {
+                    ok: false,
+                    code: 'version_conflict',
+                    handoffWritten: false,
+                    noteSaved: false,
+                    expectedVersion: handoffIfVersion ?? conflict.expectedVersion ?? null,
+                    currentVersion: second.currentVersion ?? null,
+                    current: second.current ?? null,
+                  },
+                ),
+              );
+            }
+          }
+        }
+        if (!attempt.ok) {
+          const summary =
+            attempt.data === undefined
+              ? 'No response body'
+              : typeof attempt.data === 'string'
+                ? attempt.data
+                : JSON.stringify(attempt.data);
+          throw new Error(`API error (${attempt.status}): ${summary}`);
+        }
+        const result = (attempt.data ?? {}) as LogSessionResult;
         const noteId = result.sessionNote?.id;
         const brief = `Session note #${noteId ?? '?'} recorded for project ${projectId}.${
           result.handoffRefreshed ? ' Handoff refreshed.' : ''
@@ -3309,7 +3575,7 @@ async function dispatchTool(
       }
 
       case 'upsert_page': {
-        const { projectId, title, body, slug, icon, pinned, role } = args as {
+        const { projectId, title, body, slug, icon, pinned, role, ifVersion } = args as {
           projectId: number;
           title: string;
           body: string;
@@ -3317,11 +3583,40 @@ async function dispatchTool(
           icon?: string;
           pinned?: boolean;
           role?: string;
+          ifVersion?: number;
         };
-        const result = await apiClient.post(
+        const raw = await apiClient.postRaw(
           `/api/v1/agents/projects/${projectId}/pages`,
-          { title, body, slug, icon, pinned, role }
-        ) as {
+          { title, body, slug, icon, pinned, role, ...(ifVersion !== undefined ? { ifVersion } : {}) }
+        );
+        if (raw.status === 409 && asRecord(raw.data).code === 'version_conflict') {
+          // Someone else wrote the page since ifVersion was read. Nothing was
+          // saved; hand back their body so the agent can merge and retry.
+          const conflict = asRecord(raw.data);
+          const current = asRecord(conflict.current);
+          const author = asRecord(current.author);
+          const who = typeof author.name === 'string' && author.name ? author.name : 'A teammate';
+          const currentVersion = conflict.currentVersion ?? current.version ?? null;
+          const currentBody = typeof current.body === 'string' ? current.body : '';
+          const shown =
+            currentBody.length > 4000 ? `${currentBody.slice(0, 4000)}\n…(truncated)` : currentBody;
+          return textResult(
+            proseFirst(
+              `Nothing was written. ${who} changed this page. Current version: ${String(currentVersion)}. Merge your edit with the current body and retry with ifVersion: ${String(currentVersion)}.\n\n${shown}`,
+              { ok: false, code: 'version_conflict', currentVersion, currentBody },
+            ),
+          );
+        }
+        if (!raw.ok) {
+          const summary =
+            raw.data === undefined
+              ? 'No response body'
+              : typeof raw.data === 'string'
+                ? raw.data
+                : JSON.stringify(raw.data);
+          throw new Error(`API error (${raw.status}): ${summary}`);
+        }
+        const result = raw.data as {
           queued?: boolean;
           proposal?: { id?: number; kind?: string; summary?: string };
           page?: { slug?: string; resolvedAt?: string | null };
@@ -3403,7 +3698,7 @@ async function dispatchTool(
         );
       }
 
-      case 'ingest': {
+      case 'ingest_context': {
         const { projectId, text, source, title, participants, occurredAt, uri, externalId } = args as {
           projectId: number;
           text: string;
@@ -3641,7 +3936,29 @@ async function dispatchTool(
       }
 
       case 'list_packets': {
-        const { projectId, limit } = args as { projectId: number; limit?: number };
+        const { projectId, limit, packetId } = args as { projectId: number; limit?: number; packetId?: number };
+        // One snapshot in full (the retired get_packet, H-58 tool ratchet).
+        if (packetId !== undefined) {
+          const result = await apiClient.get(
+            `/api/v1/agents/projects/${projectId}/packets/${packetId}`
+          ) as SavedPacket;
+          return textResult(
+            proseFirst(
+              [
+                renderContextPacket(result.packet),
+                '',
+                `_Saved packet #${result.id} · ${result.compilerVersion} · ${result.createdAt} · permalink /projects/${result.projectId}/packets/${result.id}_`,
+              ].join('\n'),
+              {
+                id: result.id,
+                projectId: result.projectId,
+                permalink: `/projects/${result.projectId}/packets/${result.id}`,
+                compilerVersion: result.compilerVersion,
+                ...packetPointers(result.packet),
+              },
+            ),
+          );
+        }
         const params = new URLSearchParams();
         if (limit !== undefined) params.set('limit', String(limit));
         const suffix = params.toString() ? `?${params.toString()}` : '';
@@ -3657,29 +3974,6 @@ async function dispatchTool(
               createdAt: packet.createdAt,
             })),
           }),
-        );
-      }
-
-      case 'get_packet': {
-        const { projectId, packetId } = args as { projectId: number; packetId: number };
-        const result = await apiClient.get(
-          `/api/v1/agents/projects/${projectId}/packets/${packetId}`
-        ) as SavedPacket;
-        return textResult(
-          proseFirst(
-            [
-              renderContextPacket(result.packet),
-              '',
-              `_Saved packet #${result.id} · ${result.compilerVersion} · ${result.createdAt} · permalink /projects/${result.projectId}/packets/${result.id}_`,
-            ].join('\n'),
-            {
-              id: result.id,
-              projectId: result.projectId,
-              permalink: `/projects/${result.projectId}/packets/${result.id}`,
-              compilerVersion: result.compilerVersion,
-              ...packetPointers(result.packet),
-            },
-          ),
         );
       }
 
@@ -3703,6 +3997,7 @@ async function dispatchTool(
             role?: string;
             pinned?: boolean;
             updatedAt?: string;
+            version?: number;
           };
         };
         // Prose-first: lead with the page's title + full markdown body, then the
@@ -3718,6 +4013,8 @@ async function dispatchTool(
             role: pg?.role,
             pinned: pg?.pinned,
             updatedAt: pg?.updatedAt,
+            // Pass back as upsert_page's ifVersion to refuse a stale overwrite.
+            version: pg?.version,
           }),
         );
       }
@@ -3915,7 +4212,7 @@ async function dispatchTool(
         );
       }
 
-      case 'create_insight': {
+      case 'create_signal': {
         const {
           projectId,
           type,
@@ -3934,9 +4231,9 @@ async function dispatchTool(
           applicabilityConditions?: string;
         };
 
-        // Case-insensitive, mirroring `contribute` — the API wants UPPERCASE.
+        // Case-insensitive, mirroring `post_contribution` — the API wants UPPERCASE.
         const result = await apiClient.post(
-          `/api/v1/agents/projects/${projectId}/insights`,
+          `/api/v1/agents/projects/${projectId}/signals`,
           {
             type: String(type ?? '').toUpperCase(),
             content,
@@ -3946,11 +4243,11 @@ async function dispatchTool(
             applicabilityConditions,
           }
         ) as Record<string, unknown>;
-        const insight = Object.keys(asRecord(result.insight)).length > 0 ? asRecord(result.insight) : result;
+        const signal = Object.keys(asRecord(result.signal)).length > 0 ? asRecord(result.signal) : result;
         return textResult(
           proseFirst(
             facts([
-              `${String(type).toUpperCase()} #${String(insight.id ?? '?')} recorded on project ${projectId}`,
+              `${String(type).toUpperCase()} #${String(signal.id ?? '?')} recorded on project ${projectId}`,
               confidence !== undefined ? `confidence ${String(confidence)}` : '',
               Array.isArray(evidenceLinks) && evidenceLinks.length > 0
                 ? `${evidenceLinks.length} evidence link(s) cited as resources`
@@ -3959,7 +4256,7 @@ async function dispatchTool(
             ]) + '.' + indexedNote(result),
             {
               ok: true,
-              id: insight.id ?? null,
+              id: signal.id ?? null,
               type: String(type).toUpperCase(),
               projectId,
               ...indexedPointer(result),
@@ -3986,15 +4283,23 @@ async function dispatchTool(
       }
 
       case 'get_experiment_state': {
-        const { projectId } = args as { projectId: number };
+        const { projectId, leaderboard } = args as { projectId: number; leaderboard?: boolean };
 
         const result = await apiClient.get(
           `/api/v1/agents/experiments/${projectId}/state`
         ) as Record<string, unknown>;
+        // Folded in from the retired get_experiment_leaderboard (H-58 tool ratchet).
+        const board = leaderboard
+          ? await apiClient.get(`/api/v1/agents/experiments/${projectId}/leaderboard`) as Record<string, unknown>
+          : null;
 
         const experiment = Object.keys(asRecord(result.experiment)).length > 0 ? asRecord(result.experiment) : result;
+        const prose = board
+          ? `${renderExperimentState(result)}\n\n${renderLeaderboard({ projectId, ...board })}`
+          : renderExperimentState(result);
         return textResult(
-          proseFirst(renderExperimentState(result), {
+          proseFirst(prose, {
+            ...(board ? { runs: asArray(board.runs) } : {}),
             projectId,
             metricName: experiment.metricName ?? null,
             metricDirection: experiment.metricDirection ?? null,
@@ -4061,25 +4366,6 @@ async function dispatchTool(
               bestMetric: result.bestMetric ?? null,
             },
           ),
-        );
-      }
-
-      case 'get_experiment_leaderboard': {
-        const { projectId } = args as { projectId: number };
-
-        const result = await apiClient.get(
-          `/api/v1/agents/experiments/${projectId}/leaderboard`
-        ) as Record<string, unknown>;
-
-        return textResult(
-          proseFirst(renderLeaderboard({ projectId, ...result }), {
-            projectId,
-            entries: asArray(result.leaderboard ?? result.entries ?? result.topImprovements).map((entry) => ({
-              metricValue: entry.metricValue ?? entry.metric ?? null,
-              iteration: entry.iteration ?? null,
-              prUrl: entry.prUrl ?? null,
-            })),
-          }),
         );
       }
 

@@ -38,9 +38,10 @@ Response:
 
 ### Step 2: Claim and Get Full Context
 
+`claim_task` returns the working set inline (a second `get_task_context` is unnecessary):
+
 ```
 Calling mcp__moment-research__claim_task(taskId: 1234)
-Calling mcp__moment-research__get_task_context(taskId: 1234)
 ```
 
 Response includes full instructions, input data, and project background.

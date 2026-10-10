@@ -260,7 +260,8 @@ def test_api_get_project_context_view_param() -> None:
 
 
 def test_orient_cli_full_flag() -> None:
-    """cli.py orient --full passes view='full', default passes view=None."""
+    """orient --full passes view='full'. Piped with no view, it asks for the lean
+    spinup view; --json keeps the server default (view=None)."""
     mock_client = MagicMock()
     mock_client.get_project_context.return_value = {
         "project": {"name": "Test"},
@@ -270,9 +271,13 @@ def test_orient_cli_full_flag() -> None:
     with patch("moment_cli.cli._get_client", return_value=mock_client), \
          patch("moment_cli.cli._resolve_project_id", return_value=99):
 
-        # Default orient call -> view=None
+        # Piped (CliRunner is not a terminal) -> the lean view
         res = runner.invoke(app, ["orient"])
         assert res.exit_code == 0
+        mock_client.get_project_context.assert_called_with(99, view="spinup")
+
+        res_json = runner.invoke(app, ["--json", "orient"])
+        assert res_json.exit_code == 0
         mock_client.get_project_context.assert_called_with(99, view=None)
 
         # orient --full -> view="full"
@@ -331,22 +336,31 @@ def test_api_find_context_query_params() -> None:
 
 
 def test_find_cli_options() -> None:
-    """find command forwards --team, --types, --since to api client."""
+    """find forwards one scope plus --types/--since; two scopes are refused locally,
+    because the server rejects projectId/team/campaign/user together."""
     mock_client = MagicMock()
     mock_client.find_context.return_value = {"results": []}
 
     with patch("moment_cli.cli._get_client", return_value=mock_client):
         res = runner.invoke(app, [
-            "find", "auth",
-            "--project", "7",
-            "--team", "infra",
-            "--types", "PAGE,RESOURCE",
-            "--since", "14d",
+            "find", "auth", "--team", "infra", "--types", "PAGE,RESOURCE", "--since", "14d",
         ])
-        assert res.exit_code == 0
+        assert res.exit_code == 0, res.output
         mock_client.find_context.assert_called_with(
-            "auth", 7, None, team="infra", types="PAGE,RESOURCE", since="14d"
+            "auth", None, None, team="infra", types="PAGE,RESOURCE", since="14d",
+            campaign=None, user=None,
         )
+
+        res = runner.invoke(app, ["find", "auth", "--project", "7", "--since", "14d"])
+        assert res.exit_code == 0, res.output
+        mock_client.find_context.assert_called_with(
+            "auth", 7, None, team=None, types=None, since="14d", campaign=None, user=None,
+        )
+
+        mock_client.find_context.reset_mock()
+        res = runner.invoke(app, ["find", "auth", "--project", "7", "--team", "infra"])
+        assert res.exit_code == 2
+        mock_client.find_context.assert_not_called()
 
 
 def test_raw_markdown_is_stale_unit() -> None:

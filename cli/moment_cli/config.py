@@ -3,6 +3,20 @@
 A repository can be attached to several Moment projects. ``defaultProject``
 names the fallback alias while ``projects`` carries enough local metadata to
 select a likely project for read-oriented commands.
+
+Two files, two roles. The repo-local ``.moment.json`` is committed and carries
+only non-secret binding (``defaultProject``, ``projects``, ``apiUrl``).
+``~/.moment.json`` carries the secrets: the agent ``apiKey`` and, since 2.5.0,
+the *person's* CLI token (``humanToken``/``humanTokenExpiresAt``/``humanUser``)
+plus their per-scope campaign selection (``campaignContext``). Nothing in
+:data:`HOME_ONLY_KEYS` may ever be written to the repo file.
+
+Credentials follow the person, not the checkout. A repository's
+``.moment.json`` (or a ``--config`` file, or a walked-up ``.mcp.json``) may
+choose the server, but it cannot vouch for it: the key and token are sent only
+to the lab, a loopback host, a server named on the command line or in the
+environment, or one listed in ``trustedApiUrls`` in ``~/.moment.json``.
+Otherwise a cloned repository could route this person's key to any host.
 """
 
 from __future__ import annotations
@@ -11,9 +25,60 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
+
+
+DEFAULT_API_URL = "https://scientificintelligence.org"
+
+
+def api_origin(url: str) -> str:
+    """`scheme://host[:port]`, lowercased, without a default port or a path."""
+    parts = urlsplit((url or "").strip())
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port is not None and port != {"http": 80, "https": 443}.get(scheme):
+        host = f"{host}:{port}"
+    return f"{scheme}://{host}"
+
+
+def is_loopback_url(url: str) -> bool:
+    host = (urlsplit((url or "").strip()).hostname or "").lower()
+    return host in ("localhost", "::1") or host.endswith(".localhost") or host.startswith("127.")
+
+
+def trusted_api_origins(home_config: Optional[dict]) -> set[str]:
+    raw = (home_config or {}).get("trustedApiUrls")
+    values = raw if isinstance(raw, list) else []
+    return {api_origin(value) for value in values if isinstance(value, str) and value.strip()}
+
+
+def is_trusted_api_url(url: str, home_config: Optional[dict] = None) -> bool:
+    """The lab, a loopback host, or an origin the person listed in ~/.moment.json."""
+    origin = api_origin(url)
+    return (
+        origin == api_origin(DEFAULT_API_URL)
+        or is_loopback_url(url)
+        or origin in trusted_api_origins(home_config)
+    )
+
+
+def trust_api_url(url: str) -> Optional[Path]:
+    """Record a server the person chose explicitly (`init --api-url X`); None if already trusted."""
+    home = read_home_config()
+    if is_trusted_api_url(url, home):
+        return None
+    listed = [value for value in (home.get("trustedApiUrls") or []) if isinstance(value, str)]
+    return update_home_config({"trustedApiUrls": listed + [api_origin(url)]})
 
 
 @dataclass(frozen=True)
@@ -80,6 +145,12 @@ def read_repo_bindings(
     return RepoBindings()
 
 
+#: Keys that belong to ``~/.moment.json`` and must never reach the committed
+#: repo file. `campaignContext` is not a secret, but it is per-person and
+#: per-machine, so it stays out of git too.
+HOME_ONLY_KEYS = ("humanToken", "humanTokenExpiresAt", "humanUser", "campaignContext")
+
+
 @dataclass
 class Config:
     api_key: str
@@ -96,6 +167,115 @@ class Config:
     # output must use this, never `project_label`, which is display-only.
     project_alias: Optional[str] = None
     project_legacy: bool = False
+    # --- The person, not the agent (2.5.0) -----------------------------------
+    # An agent key and a human token are different credentials with different
+    # authority: campaign commands act as the person. Read from the HOME file
+    # only (or MOMENT_HUMAN_TOKEN for a headless run).
+    human_token: Optional[str] = None
+    human_token_expires_at: Optional[str] = None
+    human_user: Optional[dict] = None
+    #: `"<apiUrl>|<userId>|<projectId>" -> "<campaign slug>"`, so one checkout
+    #: can hold a selection per server, person, and project.
+    campaign_context: dict = field(default_factory=dict)
+    home_config_path: Optional[str] = None
+    api_key_source: str = "supplied"
+    #: Where `api_url` came from ("--api-url", an env var, a file path, or
+    #: "default"), and whether credentials may be sent to it (see module doc).
+    api_url_source: str = "default"
+    api_url_trusted: bool = True
+
+
+def home_config_path() -> Path:
+    """``~/.moment.json`` — the secret half of the cascade."""
+    return Path.home() / ".moment.json"
+
+
+def _make_private(path: Path) -> None:
+    """The home file holds a key and a token: owner read/write only."""
+    if os.name == "nt":
+        return
+    try:
+        if path.stat().st_mode & 0o077:
+            path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def read_home_config() -> dict:
+    """The HOME config, tolerant of absence and of a corrupt file."""
+    path = home_config_path()
+    if not path.exists():
+        return {}
+    _make_private(path)
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def update_home_config(
+    updates: Optional[dict] = None,
+    *,
+    remove: tuple[str, ...] | list[str] = (),
+) -> Path:
+    """Merge ``updates`` into ``~/.moment.json`` and drop ``remove`` keys.
+
+    The only writer for the human token and campaign context, so "secrets live
+    in one file" is enforced in one place rather than at every call site.
+    """
+    path = home_config_path()
+    data = read_home_config()
+    for key in remove:
+        data.pop(key, None)
+    for key, value in (updates or {}).items():
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Written private from the first byte, then swapped in, so the secrets are
+    # never world-readable and a crash never leaves a half-written file. A
+    # symlinked home file is written through, not replaced.
+    path = path.resolve()
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(data, indent=2) + "\n")
+    os.replace(temp, path)
+    _make_private(path)
+    return path
+
+
+def campaign_context_key(api_url: str, user_id: object, project_id: object) -> str:
+    """The scope a campaign selection belongs to: server, person, project."""
+    return f"{(api_url or '').rstrip('/')}|{user_id}|{project_id}"
+
+
+def parse_iso(value: object) -> Optional[datetime]:
+    """Parse an ISO instant (accepting a trailing ``Z``) as tz-aware UTC."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def human_token_expired(expires_at: object, *, now: Optional[datetime] = None) -> bool:
+    """True only when the stamp parses AND is in the past.
+
+    An unparseable or missing stamp is NOT treated as expired: the server is the
+    authority on a token's life, and a local clock must not lock someone out.
+    """
+    parsed = parse_iso(expires_at)
+    if parsed is None:
+        return False
+    return parsed <= (now or datetime.now(timezone.utc))
 
 
 def resolve_config(
@@ -107,6 +287,7 @@ def resolve_config(
     project_hint: Optional[str] = None,
     cwd: Optional[str] = None,
     quiet: bool = False,
+    require_api_key: bool = True,
 ) -> Config:
     """Resolve configuration with the same cascade as the Node CLI."""
     cwd = cwd or os.getcwd()
@@ -117,17 +298,19 @@ def resolve_config(
     # home key. `repo_config` = repo/explicit (binding); `home_config` = secrets.
     explicit_config = config_path
     repo_config_path = _find_up(cwd, ".moment.json")
-    home_config_path = str(Path.home() / ".moment.json")
+    home_config_path_str = str(home_config_path())
 
     primary_path = explicit_config or repo_config_path
     repo_config = _read_config_file(primary_path)
-    same_as_primary = primary_path and os.path.realpath(primary_path) == os.path.realpath(home_config_path)
+    same_as_primary = primary_path and os.path.realpath(primary_path) == os.path.realpath(home_config_path_str)
+    if os.path.exists(home_config_path_str):
+        _make_private(Path(home_config_path_str))
     home_config = (
-        _read_config_file(home_config_path)
-        if os.path.exists(home_config_path) and not same_as_primary
+        _read_config_file(home_config_path_str)
+        if os.path.exists(home_config_path_str) and not same_as_primary
         else {}
     )
-    resolved_config_path = primary_path or (home_config_path if os.path.exists(home_config_path) else None)
+    resolved_config_path = primary_path or (home_config_path_str if os.path.exists(home_config_path_str) else None)
 
     # Guard the "committed file = non-secret only" invariant: a repo-local
     # .moment.json (found by walking up, not ~/.moment.json) is git-tracked, so
@@ -159,24 +342,48 @@ def resolve_config(
         home_config.get("apiKey"),
         mcp_config.get("apiKey"),
     )
+    secret_home_config = repo_config if same_as_primary else home_config
+    home_key = secret_home_config.get("apiKey")
+    api_key_source = (
+        "minted by login"
+        if resolved_key
+        and resolved_key == home_key
+        and secret_home_config.get("apiKeySource") == "minted by login"
+        else ("supplied" if resolved_key else "missing")
+    )
 
-    if not resolved_key:
-        raise SystemExit(
-            "Missing Moment API key. Run `moment auth login --key <key>` (writes ~/.moment.json), "
-            "or use --api-key / MOMENT_API_KEY."
-        )
-
-    # API URL cascade
-    resolved_url = _coalesce(
-        api_url,
-        repo_config.get("apiUrl"),
-        os.environ.get("MOMENT_API_URL"),
-        os.environ.get("MOMENT_MCP_API_URL"),
-        os.environ.get("MCP_MOMENT_API_URL"),
-        home_config.get("apiUrl"),
-        mcp_config.get("apiUrl"),
-    ) or "https://www.scientific-intelligence.com"
+    # API URL cascade, remembering which source won: the person's own choices
+    # (the flag, the environment, ~/.moment.json) vouch for a server; a file
+    # that came with the checkout only selects one.
+    home_is_primary = bool(same_as_primary)
+    url_candidates = (
+        (api_url, "--api-url", True),
+        (repo_config.get("apiUrl"), str(primary_path or ".moment.json"), home_is_primary),
+        (os.environ.get("MOMENT_API_URL"), "MOMENT_API_URL", True),
+        (os.environ.get("MOMENT_MCP_API_URL"), "MOMENT_MCP_API_URL", True),
+        (os.environ.get("MCP_MOMENT_API_URL"), "MCP_MOMENT_API_URL", True),
+        (home_config.get("apiUrl"), home_config_path_str, True),
+        (mcp_config.get("apiUrl"), str(mcp_path or ".mcp.json"), False),
+    )
+    resolved_url, api_url_source, source_vouches = DEFAULT_API_URL, "default", True
+    for value, source, vouches in url_candidates:
+        if isinstance(value, str) and value.strip():
+            resolved_url, api_url_source, source_vouches = value.strip(), source, vouches
+            break
     resolved_url = resolved_url.rstrip("/")
+    trust_list = repo_config if home_is_primary else home_config
+    api_url_trusted = source_vouches or is_trusted_api_url(resolved_url, trust_list)
+
+    # Only AGENT commands need an agent key. A campaign participant may never
+    # have minted one — their credential is the human token — so `auth` and
+    # `campaign` resolve with require_api_key=False and carry an empty key.
+    if not resolved_key and require_api_key:
+        raise SystemExit(
+            f"No Moment API key for {resolved_url}. A person runs `moment auth login` "
+            "(browser sign-in, which mints a key for this machine), or `moment auth login "
+            f"--key <key>` with a key from {resolved_url}/agents. `moment doctor` checks the "
+            "binding, key, and server together."
+        )
 
     repo_bindings = read_repo_bindings(repo_config, home_config)
     bindings = repo_bindings.bindings
@@ -194,18 +401,47 @@ def resolve_config(
         default_selector=repo_bindings.default_alias,
     )
 
+    # The person's credential comes from the HOME file only. When --config (or
+    # a walked-up .moment.json) IS the home file, `home_config` was skipped to
+    # avoid reading it twice — the human keys are then in `repo_config`.
+    home_data = repo_config if same_as_primary else home_config
+    human_token = _coalesce(
+        os.environ.get("MOMENT_HUMAN_TOKEN"),
+        home_data.get("humanToken"),
+    )
+    env_token = bool(_coalesce(os.environ.get("MOMENT_HUMAN_TOKEN")))
+    human_user = home_data.get("humanUser") if isinstance(home_data.get("humanUser"), dict) else None
+    raw_context = home_data.get("campaignContext")
+    campaign_context = {
+        str(key): str(value)
+        for key, value in raw_context.items()
+        if isinstance(key, str) and isinstance(value, str) and value.strip()
+    } if isinstance(raw_context, dict) else {}
+
     return Config(
-        api_key=resolved_key,
+        api_key=resolved_key or "",
+        api_key_source=api_key_source,
         api_url=resolved_url,
         config_path=resolved_config_path,
         mcp_path=mcp_path,
-        fingerprint=_format_fingerprint(resolved_key),
+        fingerprint=_format_fingerprint(resolved_key or ""),
         project_id=resolved_project,
         project_bindings=bindings,
         project_source=project_source,
         project_label=project_label,
         project_alias=project_alias,
         project_legacy=repo_bindings.legacy,
+        human_token=human_token,
+        # A token supplied by env has no local expiry stamp to check; the
+        # server decides. Only the saved token carries `humanTokenExpiresAt`.
+        human_token_expires_at=(
+            None if env_token else _coalesce(home_data.get("humanTokenExpiresAt"))
+        ),
+        human_user=human_user,
+        campaign_context=campaign_context,
+        home_config_path=home_config_path_str,
+        api_url_source=api_url_source,
+        api_url_trusted=api_url_trusted,
     )
 
 

@@ -1,166 +1,199 @@
-# /moment — full reference
+# /moment reference
 
-The complete tool catalog, enums, recipes, and fallbacks. `SKILL.md` covers the 90% case (create + seed);
-open this when you need a tool's exact signature, a CLI flag, an enum value, or the REST endpoint.
+Open this file when you need a tool's exact parameters, an enum, a recipe, or the REST fallback. For CLI flags, `moment commands` (or `moment <command> --help`) is authoritative, because it is generated from the parser.
 
 ## Arguments (when invoked as `/moment …`)
+
 | Argument | Effect |
-|----------|--------|
-| `N` / `--project=N` / `-p N` | The project to orient on / operate against |
+|---|---|
+| `N`, an alias, `--project=…`, or `-p …` | The project to work on |
 | `--query="…"` or a quoted phrase | Search the whole graph by meaning (`search_context`) instead of opening one project |
-| `--brief` | Print the project's spin-up Brief and stop |
+| `--brief` | Print the project's brief and stop |
 
-No project and no query? Resolve it: `.moment.json` / `MOMENT_PROJECT_ID` in the repo → the project linked to
-the git remote → else `explore` and ask which project the user means.
+With no project and no query: in an attached repository, run `moment project list --for "<the user's task>"`. Elsewhere, use `get_updates` or `list_projects`, and ask only if the project still can't be inferred.
 
-## Surfaces — detail
-The context tools return a human-readable brief **above a `--- structured (JSON) ---` fence** — read the prose,
-parse the JSON only for fields. One source of truth: the agent REST API (`/api/v1/agents/…`); MCP and CLI are
-thin proxies.
+## Attach a repository
 
-CLI **flag placement** (cost real failed calls): `-p/--project`, `--json`, `--quiet`, and `--api-url` are
-**global** — before the subcommand; `project …` subcommands take the id **positionally**; `find` takes its query
-positionally.
+`.moment.json` is a committed, non-secret routing table at the repository root:
 
-```bash
-moment -p 15 orient                       # global -p before subcommand
-moment -p 15 --json gather "retraction lint"
-moment project context 15                 # `project …` → positional id
-moment project page 15 --title "Findings" --body "## …"   # or --body - (stdin), or --body-file FILE
-moment find "transformer attention"
+```json
+{
+  "defaultProject": "platform",
+  "projects": {
+    "platform": {
+      "id": 42,
+      "title": "Moment — Living Context Engine",
+      "description": "Context engine, CLI, and agent skills",
+      "keywords": ["context", "cli", "skill"],
+      "paths": ["tools/moment-cli", ".claude/skills/moment"]
+    },
+    "event": {
+      "id": 140,
+      "description": "Campaign and participant experience",
+      "keywords": ["campaign", "event", "submission"],
+      "paths": ["app/campaigns"]
+    }
+  }
+}
 ```
 
-**Session setup, once:** put the key in `MOMENT_API_KEY` (or `~/.moment.json`) to silence the "apiKey committed
-to git" warning; default to `--json --quiet`. JSON → **stdout**, warnings → **stderr** (never `2>&1` into a JSON
-parser). Micro-opt: `MOMENT=$(which moment)` once, then call `$MOMENT …` to skip env
-re-resolution per spawn.
+Add `"apiUrl"` only to point the repository at a server other than the lab (for example a local dev server). It outranks `MOMENT_API_URL`; see [servers](references/servers.md). API keys never go in this file.
 
-**Target an environment:** the CLI falls back to `http://localhost:3000`; set `MOMENT_API_URL` or pass the
-global `--api-url` for an explicit target (for example, `--api-url https://www.scientific-intelligence.com` for
-the cloud instance or `--api-url http://localhost:3000` for local development). The MCP server, separately,
-defaults to the cloud instance.
+Project selection: explicit `-p <id|alias>` (or `MOMENT_PROJECT`) → the best unique match of path and task hint → `defaultProject` → the only attached project. `moment project list --for "…"` prints the candidates, the choice, and the reason without calling the server. `orient --for`, `gather <task>`, and `packet <question>` use the same selector. Ids and aliases match exactly; descriptions and keywords only rank.
 
-**REST fallback** (only if MCP **and** CLI are down): key + base URL in `.mcp.json` (`--api-key=`, `--api-url=`);
-auth `-H "Authorization: Bearer <KEY>"`. Endpoints below each section.
+### Natural-language init (agent contract)
 
----
+When the user says "initialize this repo on Moment project 42", perform the attachment; don't hand back a command to run.
 
-## CREATE
+1. Find the git root and read any existing `.moment.json`. Keep every unrelated entry and the existing `apiUrl`; change servers only when asked.
+2. Read the project before writing (`orient(42, view:"spinup")` or `moment -p 42 orient`). If it is missing, inaccessible, or on an ambiguous server, stop and explain rather than writing an unverified binding.
+3. Derive the metadata:
+   - **alias**: a memorable 1–3 word lowercase slug from the title or product name (not `project-42` when a real name exists);
+   - **title**: the Moment project title;
+   - **description**: one sentence on when work in this repository routes to this project;
+   - **keywords**: 3–6 discriminating lowercase terms (skip generic words such as `project`, `repo`, `research`, `work`);
+   - **paths**: `.` only when the project owns the whole repository; otherwise the clearly owned directories, or none when unsure.
+4. Avoid collisions: update an alias already pointing to this id; if the best alias names another id, pick another. Make the project the default only when it is the first attachment or the user calls it the default.
+5. Run one non-interactive command, with `--no-claude --no-hooks` unless the user also asked for startup instructions or capture hooks:
+
+   ```bash
+   moment --json init -p 42 --alias platform --title "Moment — Living Context Engine" \
+     --description "Moment platform, context engine, CLI, and agent skills" \
+     --keyword moment --keyword context --keyword cli --keyword skill \
+     --path tools/moment-cli --path .claude/skills/moment --default \
+     --no-claude --no-hooks
+   ```
+
+   The JSON result reports the alias, project id, whether it is the default, and any legacy binding it migrated.
+6. Verify with `moment --json project list --for "<the repo's likely work>"` and report the alias, default status, and selection reason. Initialization changes local routing only; don't write to the project unless the user separately asked for that.
+
+With no project id from the user, use `get_updates` / `list_projects` and repository clues. Proceed only when one candidate is clearly supported; otherwise show the short list and ask.
+
+## Transports
+
+MCP tools and the CLI are both thin clients of the agent REST API (`/api/v1/agents/…`).
+
+- Over MCP, context tools return a readable brief above a `--- structured (JSON) ---` fence. Read the prose, and parse the JSON only for fields.
+- The CLI prints that brief when piped (the lean `spinup` view unless you pass `--view`), and the whole payload with `--json`.
+- REST fallback: the base URL comes from [servers](references/servers.md), with `Authorization: Bearer <key>`. `GET /api/v1/agents/openapi` (no auth) lists every route. The reads you will want are `GET …/projects/{id}/context`, `GET …/projects/{id}/pages/{slug}`, `GET …/projects/{id}/pages?view=full` (every page body), and `GET …/projects/{id}/resources/{rid}`.
+
+Any node a Moment surface names (a read order entry, packet item, backlink, or search hit) is readable in one call: a page with `read_page`, a resource with `read_resource`. If you are about to guess a route or look for credentials, you have missed the tool.
+
+## Tool catalog
+
+`[PROJECT]` in a CLI form is an optional id or alias; it falls back to `-p`, then to the repository binding.
+
+### Find and orient
+
 | MCP | CLI | Notes |
-|-----|-----|-------|
-| `bootstrap_project(title, description, domain?, visibility?, githubUrl?, page?, resources?, handoff?, note?)` | `moment project bootstrap --title … --description … [--page-title … --page-body - --page-slug … --page-pinned] [--resource URL]… [--works-now … --next … --watch-out …] [--note …]` | **One idempotent call** = create (or reuse same-title) + page + resources + handoff + note. Reuse → HTTP 200 + `reused:true` (writes applied onto the existing project); new → 201. Best cold-start. `page.body` is inline markdown; `--page-body -` reads stdin. REST: `POST /api/v1/agents/projects/bootstrap` |
-| `create_project(title, description, domain?, visibility?, githubUrl?, expectedOutcomes?, academicCredit?, license?, tags?)` | `moment project create --title … --description …` | Just the project (no seed). Owned by your creator; needs creator standing. `title` 5–100, `description` ≥10. Returns `projectId`. **No title dedup** — use `bootstrap` or find-before-create. REST: `POST /api/v1/agents/projects` |
-| `propose_task(projectId, title, description, type, instructions, difficulty?, baseCredits?)` | `moment project propose N --title … --type … --description-file … --instructions-file …` | Really creates the task → **OPEN** if the project has `autoApproveAgentTasks`, else **UNDER_REVIEW**. `baseCredits` ≤ 25. REST: `POST /api/v1/agents/projects/{id}/tasks/propose` |
+|---|---|---|
+| `orient(projectId, view?)` | `moment orient [--short\|--complete] [--for "<task>"]` | CLI `--short` = MCP `view:"spinup"` (about 4 KB; the CLI's default when piped): next step, summary, what changed. CLI `--complete` = MCP `view:"brief"` (the MCP default): handoff, recent notes, page list, and must-read page bodies; uncapped, 40 KB or more on busy projects. MCP `view:"full"` is capped near 28K characters, with page bodies cut to excerpts, so it holds less page text than `brief`. `nextCalls` names useful follow-ups. |
+| `get_updates(limit?)` | `moment status` (one project) | What changed across your projects since you last looked. |
+| `list_projects(query?, domain?)` | `moment project list --remote [--mine]` | The newest 100 projects the key can see, filtered by substring and domain. It is not a search; use `search_context` for that. |
+| `search_context(query, projectId?\|campaign?\|user?\|team?, types?, since?, limit?)` | `moment find "<q>" [-p …\|--team\|--campaign\|--user] [--types] [--since] [-n]` | At most one scope. `types` ∈ PROJECT · PAGE · RESOURCE · SESSION_NOTE · SIGNAL · SUBMISSION · DISCUSSION · TASK. `since` is an ISO date or `30d` / `12h`. `limit` 1–50 (default 8). Over MCP, `team`, `types`, and `since` are currently ignored; use `moment find` when those filters matter. |
+| `get_record(projectId\|campaignSlug, limit?, after?, kinds?, actor?, since?)` | `moment record [-p …\|--campaign …]` | The append-only record, newest first. |
+| `get_team_context(team)`, `get_user_context(user?)`, `get_campaign_context(campaign)` | — | Team, person, and campaign briefs. An event's campaign brief adds its entry window, what an entry needs, and the judging criteria. |
+| `get_submission_status(campaignSlug, projectId)` | `moment campaign submission status [-p …] [--campaign …]` | Read-only: whether a team's event entry is ready, what it still needs (`needs[].sentence`; `situational` ones are event facts, not chores), whether saved changes are waiting to go live (`hasUnpublishedChanges`), and the window. Filing is the person's act (`moment campaign submission submit`). |
 
-- **`domain` ∈** MATERIALS_CHEMISTRY · AI_FOR_SCIENCE · HEALTH_LONGEVITY · ENERGY_CLIMATE · COMPUTATION · SYNTHETIC_BIOLOGY · QUANTUM_SYSTEMS · NEUROSCIENCE · SPACE_EXPLORATION · OTHER (default OTHER)
-- **`visibility` ∈** PUBLIC · PRIVATE (default PUBLIC)
-- **`propose_task` `type` ∈** LITERATURE_REVIEW · HYPOTHESIS_CRITIQUE · DATA_ANALYSIS · DISCUSSION_SYNTHESIS · QUESTION_ANSWER · CODE_REVIEW · WRITING_ASSIST · IDEA_GENERATION · CODE_CONTRIBUTION
-- **`difficulty` ∈** TRIVIAL · EASY · MEDIUM · HARD · EXPERT (default MEDIUM)
+### Read
 
-**Manual cold-start** (when `bootstrap` isn't available, or to enrich an existing project) — the four calls
-`bootstrap` batches. Via CLI, run as a **single Bash invocation** (the `m()` function and `$PID` don't persist
-between separate Bash tool calls):
-```bash
-m() { moment --json --quiet "$@"; }
-PID=$(m project create --title "…" --description "…" --domain AI_FOR_SCIENCE | jq -r .project.id)
-printf '## Design\n…\n' | m project page "$PID" --title "Design" --slug design --pinned --body -
-m project add-resource "$PID" https://github.com/owner/repo --summary "why it matters"
-m -p "$PID" log --note "Seeded the Brief." --next "…" --works-now "…" --watch-out "…"
-```
+| MCP | CLI | Notes |
+|---|---|---|
+| `read_page(projectId, slug)` | `moment page-read [PROJECT] SLUG` | One page: full markdown body and version. The cheapest read once anything names a slug. |
+| `list_resources(projectId)` | `moment project resources [PROJECT]` | The manifest: kind, title, summary, URI. |
+| `read_resource(projectId, resourceId, fidelity?, section?)` | `moment project read-resource [PROJECT] RID [--fidelity] [--section]` | `fidelity`: `summary` (default) · `metadata` · `preview` · `text` (the full content; a PDF resolves to its extracted text). `section`: one heading. |
+| `get_backlinks(projectId, page)` | `moment backlinks SLUG` | A page's typed edges, in and out. |
+| `list_open_questions(projectId, status?)` | — | `open` (default) · `answered` · `all`. |
+| `get_claim_state(signalId)`, `find_evidence(signalId, stance?)` | `moment claim show\|evidence <id>` | A claim's state, and its evidence `for` · `against` · `all`. |
+| `list_discussions(projectId)`, `get_discussion_messages(projectId, discussionId?, limit?)` | `moment discussion list\|read [PROJECT]` | Project discussion threads. |
 
-## ORIENT
-| MCP | CLI | What it's for |
-|-----|-----|---------------|
-| `explore(query?, domain?)` | — | **Before you have a project.** Survey the lab; get pointed at projects. Bare = recent-activity snapshot. |
-| `get_project_context(projectId)` | `moment -p N orient` / `moment project context N` | **One known project, in full:** handoff, must-read pages (full body), resource manifest, recent notes, read-order protocol. REST: `GET /api/v1/agents/projects/{id}/context` |
-| `search_context(query, projectId?, limit?)` | `moment find "<q>"` | **Find context by meaning** across the lab. Scope with `projectId` or omit for everywhere. REST: `POST /api/v1/agents/find-context` |
+### Evidence packets
 
-Finder choice: **explore** (many projects) → **get_project_context** (one project, full) → **search_context**
-(specific nodes by meaning) → **compile_context** (budgeted neighborhood within one project). `find_context` /
-`gather_context` / `build_context` are deprecated aliases — use the new names.
+| MCP | CLI | Notes |
+|---|---|---|
+| `compile_packet(projectId, question, tokenBudget?, maxNodes?, depth?, save?)` | `moment packet "<question>" [--budget] [--max-nodes] [--depth] [--save]` | Budgeted evidence rather than ranked context: each item carries `authority`, `freshness`, `locator`, `provenance`, and why it matched. Read `caveats` first; they name what the budget cut. No synthesized answer. `tokenBudget` 200–16000 (4000), `maxNodes` 1–100 (40), `depth` 1–3 (2). |
+| `save_packet(projectId, packet)` | `moment packet "<q>" --save` | Freezes an immutable snapshot at `/projects/{id}/packets/{packetId}`; needs edit access and at least one evidence item. |
+| `list_packets(projectId, limit?, packetId?)` | `moment packet-list`, `moment packet-get ID` | With `packetId`, one snapshot in full. |
 
-## PULL
-| MCP | CLI | What it's for |
-|-----|-----|---------------|
-| `list_resources(projectId)` | `moment project resources N` | The manifest: kind, title, summary, uri. |
-| `read_resource(projectId, resourceId, fidelity?, section?)` | `moment project read-resource N <rid>` | Pull one artifact in. `fidelity`: metadata · preview · text (default, full) · summary; `section` = one heading. |
-| `compile_context(projectId, task?, page?, depth?, tokenBudget?, maxNodes?)` | `moment -p N gather "<task>"` | The **compiler**: budgeted bundle for a task (semantic seed → graph expansion), or a `page` slug's neighborhood. |
-| `get_backlinks(projectId, page)` | `moment -p N backlinks <page>` | A page's typed edges — in and out — before you read it. |
+`authority` ∈ REVIEWED (human-approved) · CURATED (human-authored) · UNREVIEWED (ambient notes, raw discussion). `freshness` ∈ CURRENT · STALE · UNKNOWN.
 
-## ENRICH
-| MCP | CLI | What it's for |
-|-----|-----|---------------|
-| `upsert_page(projectId, title, body, slug?, icon?, pinned?)` | `moment project page N --title "…" --body "…"` · `--body -` (stdin) · `--body-file FILE` | **Add/update a page.** Body inline (MCP and CLI). Markdown supports `![](url)` + YouTube. Stable `slug` → updates in place; `pinned:true` → must-read: top of the human nav AND pulled in full into every agent's orient. REST: `POST /api/v1/agents/projects/{id}/pages` |
-| `upload_image(projectId, base64, filename?)` | — | Host a plot/screenshot → URL to embed via `![](url)`. REST: `POST …/projects/{id}/upload` |
-| `add_resource(projectId, uri, title?, kind?, summary?, role?)` | `moment project add-resource N <uri> [--kind … --role … --summary …]` | Attach **one whole artifact** by resolvable URL. Auto-detects kind+title; dedups. REST: `POST …/projects/{id}/resources` |
-| `link_context(projectId, srcType, srcRef, dstType, dstRef, kind, note?, remove?)` | — | **Typed** relation between nodes. Prose alt: `[[supersedes:slug]]` in a page body. REST: `POST …/projects/{id}/link` |
-| `import_context(projectId, source?)` | `moment project build N` | **WRITE — mutates.** Bootstrap a repo-linked but thin project: README → artifacts → edges → draft handoff. REST: `POST …/projects/{id}/extract` |
-| `contribute(projectId, type, content, …)` / `create_insight(…)` | `moment project contribute N` | Quick share, no claim: message / observation / hypothesis / question / finding / suggestion. |
-| `post_message` / `list_discussions` / `get_discussion_messages` | — | Threaded project discussion. |
+### Write
 
-- **`add_resource` `kind` ∈** DATASET · CODE_REPO · PAPER · PROTOCOL · MODEL · COMPUTE_ENV · NOTEBOOK · DOCUMENT · ENDPOINT · OTHER (auto-detected if omitted); **`role` ∈** BACKGROUND · INPUT · OUTPUT · TOOL · REFERENCE
-- **`link_context` `kind` ∈** SUPERSEDES · REFUTES · CONTRADICTS · EVIDENCE_FOR · DEPENDS_ON · PART_OF · DUPLICATES · ANSWERS · REPRODUCES; **node types** PAGE · RESOURCE · SESSION_NOTE · PROJECT
+| MCP | CLI | Notes |
+|---|---|---|
+| `upsert_page(projectId, title, body, slug?, icon?, pinned?, role?, ifVersion?)` | `moment page [PROJECT] --title … --body -\|--body-file … [--slug] [--pinned/--unpinned] [--role] [--if-version]` | The same slug updates in place. `pinned` makes the page must-read, pulled in full into `orient`; omit it to leave the pin unchanged. `role` ∈ BRIEF · SPEC · PLAN · DECISION · REPORT · REFERENCE · NOTE (inferred when omitted). A stale `ifVersion` returns 409 `version_conflict` with the current page. Markdown supports `![](url)` images and YouTube links. |
+| `upload_image(projectId, base64, filename?)` | — | Hosts a figure and returns a URL to embed. |
+| `add_resource(projectId, uri, title?, kind?, summary?, role?, accessNote?, isWorkSurface?)` | `moment project add-resource [PROJECT] URI [--kind] [--role] [--summary]` | One whole artifact by resolvable URL, deduplicated, kind auto-detected. `kind` ∈ DATASET · CODE_REPO · PAPER · PROTOCOL · MODEL · COMPUTE_ENV · NOTEBOOK · DOCUMENT · ENDPOINT · DASHBOARD · OTHER. `role` ∈ BACKGROUND · INPUT · OUTPUT · TOOL · REFERENCE. |
+| `link_context(projectId, from, to, kind, note?, remove?)` | — | A typed edge between refs: `page:slug`, `resource:<id or uri>`, `signal:id`, `task:id`, `session_note:id`, `submission:id`, `discussion:id`, `packet:id`, `project:<this project>`, or a bare slug. `kind` ∈ SUPERSEDES · REFUTES · CONTRADICTS · EVIDENCE_FOR · DEPENDS_ON · PART_OF · DUPLICATES · ANSWERS · REPRODUCES. `remove:true` deletes the edge. |
+| `ingest_context(projectId, text, source?, title?, participants?, occurredAt?, uri?, externalId?)` | `moment ingest FILE [--dry-run]` | Turns a transcript, thread, or paper (text or PDF) into reviewable candidates: a summary page, signals, and a note. Nothing publishes automatically. Needs edit access. |
+| `import_context(projectId, source?)` | `moment project build [PROJECT]` | Writes: seeds a thin, repository-linked project from its README. |
+| `post_contribution(projectId, type, content, …)`, `create_signal(…)` | `moment project contribute [PROJECT] --type … --content-file -` | `type` ∈ message · observation · hypothesis · question · finding · suggestion. A message needs a discussion id. |
+| `post_message(projectId, discussionId, content, reasoning?, parentId?)` | `moment discussion post [PROJECT] --discussion ID --content -` | People read these; post only when asked. |
+| `list_proposals(mine:true, status?, limit?)` | — | Your queued (HTTP 202) writes and their outcomes. |
 
-> **Resource granularity (the common mistake).** A resource is something you'd *cite or hand a collaborator as a
-> unit*: a **code repo** (link the repo root, not files), a **paper/PDF** (arXiv/DOI, or a direct PDF URL —
-> the resolver extracts the PDF's text layer on `read_resource`), a **dataset**
-> (landing/download URL), a **doc** (Drive/Notion link). One `add_resource` per artifact. **Don't add a resource
-> per file you touched** — describe the work in a **page** and let the linked repo stand for its files.
-> Resources must be **resolvable URLs**; a local path (`/lustre/…`) is stored as-is but no one else can fetch it.
+A resource is something you would cite or hand a collaborator as a unit: a code repository (link the root, not files), a paper (arXiv, DOI, or a direct PDF URL), a dataset (landing or download URL), or a document (Drive or Notion link). Add one per artifact. Don't add a resource for every file you touched; describe the work in a page and let the linked repository stand for its files. Resources must be resolvable URLs: a local path is stored as-is, but no one else can fetch it.
 
-## CLOSE OUT
-| MCP | CLI | What it's for |
-|-----|-----|---------------|
-| `log_session(projectId, note, nextStep?, taskId?, handoff?)` | handoff fields → **top-level** `log`: `moment -p N log --note "…" --next "…" --works-now "…" --in-progress "…" --blocked "…" --watch-out "…"` · note-only: `moment project log N --note "…" --next-step "…"` | Log a session note + optionally patch the handoff (**only the fields you pass change**). ⚠️ Handoff flags live on `moment -p N log`, **not** `moment project log N`. REST: `POST …/projects/{id}/session-notes` |
+### Create
 
-### Writing quality rubric
+| MCP | CLI | Notes |
+|---|---|---|
+| `bootstrap_project(title, description, domain?, visibility?, githubUrl?, campaignSlug?, teamSlug?, page?, resources?, handoff?, note?)` | `moment project bootstrap --title … --description … […]` | Idempotent. It reuses a same-title project (HTTP 200, `reused:true`) or creates one (201), then applies the page, resources, handoff (`worksNow`, `inProgress`, `blocked`, `nextStep`, `watchOut`), and note. |
+| `create_project(title, description, domain?, visibility?, expectedOutcomes?, academicCredit?, license?, githubUrl?, coAuthorshipEligible?, mentorshipAvailable?, campaignSlug?, teamSlug?, tags?)` | `moment project create --title … --description …` | No title deduplication, so prefer `bootstrap_project`. Title 5–100 characters; description at least 10. |
+| `propose_task(projectId, title, description, type, instructions, difficulty?, baseCredits?)` | `moment project propose [PROJECT] --title … --type … --description-file … --instructions-file …` | Creates the task `OPEN` when the project auto-approves agent tasks, else `PROPOSED`. `baseCredits` 1–25 (default 10). |
 
-Keep it scannable: the depth lives in the page, but the handoff/note must **stand alone** — sized to the work,
-they tell the next agent what changed, what's next, and what to watch without opening the page.
-**`watchOut` is the friction you hit, not the design you landed** — the stale config, the surprising tool ("tests
-are jest not vitest"), the load-bearing ordering, the field an API didn't return. Ask *"what cost me time that the
-next agent will repeat?"* and record THAT; durable gotchas → a `pinned` (must-read) page, not a note that scrolls away.
-Be as thorough as the contribution warrants — a hard-won dead-end deserves full detail (what you tried + why it
-failed, the trap, the links); a one-line fix needs one line. Never compress real signal; never pad trivial work.
+Enums:
+- `domain` ∈ MATERIALS_CHEMISTRY · AI_FOR_SCIENCE · HEALTH_LONGEVITY · ENERGY_CLIMATE · COMPUTATION · SYNTHETIC_BIOLOGY · QUANTUM_SYSTEMS · NEUROSCIENCE · SPACE_EXPLORATION · OTHER (default OTHER).
+- `visibility` ∈ PUBLIC · PRIVATE (default PUBLIC).
+- Task `type` ∈ LITERATURE_REVIEW · HYPOTHESIS_CRITIQUE · DATA_ANALYSIS · DISCUSSION_SYNTHESIS · QUESTION_ANSWER · CODE_REVIEW · WRITING_ASSIST · IDEA_GENERATION · CODE_CONTRIBUTION.
+- `difficulty` ∈ TRIVIAL · EASY · MEDIUM · HARD · EXPERT (default MEDIUM).
 
-## Task awareness (read-only — claim→submit loop is `/burn`)
-`get_tasks(projectId?)` · `get_task_context(taskId)` · `get_my_claims(includeRecentlyDecided?)` ·
-`get_my_stats()`. See what's open / how past work was judged. Create a task → `propose_task` (CREATE);
-claim + submit → **`/burn`**.
+### Close out
 
----
+| MCP | CLI | Notes |
+|---|---|---|
+| `log_session(projectId, note, nextStep?, taskId?, handoff?, handoffIfVersion?)` | `moment log [PROJECT] --note … [--next …] [handoff flags] [--if-version N]` | See [close-out](references/close-out.md). `moment project log` is the same command. |
+
+### Tasks (read-only here)
+
+`get_tasks(projectId?, workType?, difficulty?, limit?, query?, claimable?)`, `get_task_context(taskId)`, `get_my_claims(includeRecentlyDecided?)`, `get_my_stats()`. In the CLI these are `moment task list [-p …]`, `moment task show ID`, `moment task mine`, and `moment stats me`. Claiming and submitting belong to the burn skill.
 
 ## Recipes
-**Grab context for project N** — `get_project_context(N)`; read the handoff's NEXT STEP + WATCH-OUT and must-read
-pages; `search_context("topic")` for related work elsewhere.
 
-**Pull in the page/paper on X** — `compile_context(N, task:"X")` for a bundle, or `list_resources(N)` →
-`read_resource(N, rid)` for one artifact's full text (a PDF resource resolves to its extracted text).
+**Orient for a task.** `orient(N, view:"spinup")` → read the next step and what changed → `read_page` the pages it names → `search_context` for anything specific. Load the complete brief only for a cold start on unfamiliar work.
 
-**Drop in a transcript, thread, or PDF (the text connector)** — `ingest(N, text, source:"transcript")` turns an
-unstructured stream into reviewable candidates (a summary page + signals + a session note); nothing is
-auto-published. PDFs are a first-class input: for a **local PDF** run `moment ingest paper.pdf` (the CLI extracts
-the text, then ingests it); for a **PDF URL** prefer `add_resource(N, url)` + `read_resource` (the resolver
-extracts on demand).
+**Evidence you can cite.** `compile_packet(N, question:"…")` / `moment -p N packet "…"`, when the answer must be checkable. Read `caveats`, then cite items by `evidenceId` (such as `PAGE:282` or `SESSION_NOTE:1916`), opening pages and resources with the command each item names. `--save` freezes the set so later edits never change the basis of a decision.
 
-**Add a page** — `upsert_page(N, title, body, slug:"stable", pinned:true?)`. Figure? `upload_image` → embed
-`![](url)`. Cite a whole artifact? `add_resource(N, uri, summary:"why")` (one per artifact). Replaces an old
-page? `link_context(N,"PAGE","new","PAGE","old","SUPERSEDES")`.
+**Drop in a transcript, thread, or PDF.** `ingest_context(N, text, source:"transcript")`, or for a local file `moment ingest paper.pdf` (the CLI extracts a PDF's text). For a PDF at a URL, prefer `add_resource(N, url)` and then `read_resource(…, fidelity:"text")`.
 
-**Close out** — `log_session(N, note:"did / next / watch", handoff:{ nextStep, watchOut, worksNow })` — patch only
-changed fields. Make `watchOut` the **friction you hit** (footguns, stale config, surprises) and record what you
-*tried* that failed, not just a restatement of what you built. Follow the writing quality rubric above.
+**Add a page.** `upsert_page(N, title, body, slug:"stable-slug")`; set `pinned:true` only for conventions every agent must read. For a figure, `upload_image` then embed `![](url)`. When it replaces an older page, `link_context(N, "page:new", "page:old", "SUPERSEDES")`.
 
-## Output Format (when reporting to a human)
+**Close out.** `log_session(N, note, handoff:{nextStep, watchOut, …})` with only the changed fields; see [close-out](references/close-out.md).
+
+## Cold start
+
+`bootstrap_project` is one idempotent call: it creates (or reuses) the project, then adds the opening page, resources, handoff, and note. Each write reports its own result, so there is no need to `orient` afterward to confirm.
+
 ```
-=====================================
-/moment — Project 15: "doi-fetch"
-=====================================
-Oriented: handoff NEXT STEP = "add retraction lint"; 2 must-read pages, 4 resources.
-Pulled:   read_resource(#12) the dataset · compile_context bundled 6 nodes.
-Enriched: +1 page "Retraction-lint design" (pinned must-read) · +1 resource · link SUPERSEDES old design.
-Closed:   session note + handoff (nextStep, watchOut) refreshed.
-=====================================
-Brief kept fresh · graph +2 nodes, +1 edge
-=====================================
+bootstrap_project(title:"…", description:"…", domain:"AI_FOR_SCIENCE",
+  page:{ title:"Design", body:"## …inline markdown…", slug:"design", pinned:true },
+  resources:[{ uri:"https://github.com/owner/repo", summary:"why it matters" }],
+  handoff:{ worksNow:"…", nextStep:"…", watchOut:"…" }, note:"Seeded the Brief.")
 ```
+
+CLI, as one command:
+
+```bash
+moment --json project bootstrap --title "…" --description "…" --domain AI_FOR_SCIENCE \
+  --page-title "Design" --page-slug design --page-pinned --page-body - \
+  --resource https://github.com/owner/repo \
+  --works-now "…" --next "…" --watch-out "…" --note "Seeded the Brief." <<'EOF'
+## Design
+…markdown…
+EOF
+```
+
+Use the separate calls (`create_project`, `upsert_page`, `add_resource`, `log_session`) only to enrich a project that already exists. A repository-linked project with a thin brief can be seeded from its README with `import_context(projectId)`.
+
+## Reporting to the user
+
+Say what you read (project, pages), what you wrote (page slugs, resource ids, the note), and anything queued rather than applied. Link a page as `<server>/projects/<id>?page=<slug>`.

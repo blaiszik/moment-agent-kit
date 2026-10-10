@@ -7,6 +7,8 @@ export interface MomentServerConfig {
   debug: boolean;
 }
 
+export const DEFAULT_API_URL = 'https://scientificintelligence.org';
+
 interface RawConfigFile {
   apiKey?: string;
   apiUrl?: string;
@@ -130,7 +132,7 @@ export function loadConfig(argv = process.argv.slice(2)): MomentServerConfig {
       process.env.MOMENT_MCP_API_URL,
       process.env.MCP_MOMENT_API_URL,
       process.env.MOMENT_API_URL,
-      'https://www.scientific-intelligence.com'
+      DEFAULT_API_URL
     )!
   );
 

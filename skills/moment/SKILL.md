@@ -1,6 +1,6 @@
 ---
 name: moment
-description: Work with Moment's context hub from any repo — orient on a project's living Brief, pull pages and resources into context, add or update pages, search and link the context graph, and close out so the next agent spins up fast. The Moment-server analog of the local-only Continuity skill. Use when the user says "/moment", "orient on Moment", "grab the project brief / project context", "pull in a page", "add a page to Moment", "search the lab", "what's the context for project N", or wants to read or enrich a Moment project without necessarily claiming a task. For the autonomous claim → do → submit task loop, use /burn instead.
+description: Read and write Moment project context. Orient on a project's brief and handoff, read its pages and resources, search the lab's context graph, attach a repository (.moment.json), add pages or resources, and close out a session with `moment log` or log_session. Use when the user mentions Moment, a Moment project, brief, handoff, or close-out, a `.moment.json` file, the `moment` CLI, or the moment-research MCP tools. Claiming and submitting research tasks belongs to the burn skill.
 allowed-tools:
   - Bash
   - Read
@@ -10,22 +10,35 @@ allowed-tools:
   - Grep
   - WebSearch
   - WebFetch
-  - mcp__moment-research__explore
-  - mcp__moment-research__whats_new
-  - mcp__moment-research__get_project_context
+  - mcp__moment-research__list_projects
+  - mcp__moment-research__get_updates
+  - mcp__moment-research__orient
+  - mcp__moment-research__read_page
   - mcp__moment-research__search_context
-  - mcp__moment-research__compile_context
+  - mcp__moment-research__compile_packet
+  - mcp__moment-research__save_packet
+  - mcp__moment-research__list_packets
   - mcp__moment-research__list_resources
   - mcp__moment-research__read_resource
   - mcp__moment-research__get_backlinks
+  - mcp__moment-research__get_record
+  - mcp__moment-research__list_open_questions
+  - mcp__moment-research__get_claim_state
+  - mcp__moment-research__find_evidence
+  - mcp__moment-research__get_team_context
+  - mcp__moment-research__get_user_context
+  - mcp__moment-research__get_campaign_context
+  - mcp__moment-research__get_submission_status
+  - mcp__moment-research__list_proposals
   - mcp__moment-research__add_resource
   - mcp__moment-research__upsert_page
   - mcp__moment-research__upload_image
   - mcp__moment-research__link_context
   - mcp__moment-research__import_context
+  - mcp__moment-research__ingest_context
   - mcp__moment-research__log_session
-  - mcp__moment-research__contribute
-  - mcp__moment-research__create_insight
+  - mcp__moment-research__post_contribution
+  - mcp__moment-research__create_signal
   - mcp__moment-research__list_discussions
   - mcp__moment-research__get_discussion_messages
   - mcp__moment-research__post_message
@@ -38,103 +51,50 @@ allowed-tools:
   - mcp__moment-research__propose_task
 ---
 
-# /moment — the Moment context hub
+# Moment project context
 
-**Moment** is a **context hub**: every project carries a living **Brief** (handoff + must-read pages +
-a graph of typed resources). This skill reads and writes that shared Brief — the server analog of the
-local-only `continuity`. The loop: **orient → pull → enrich → close out**, no task claim required.
-(For the autonomous claim → do → submit loop, use **`/burn`**.)
+Moment holds a research project's shared context: the handoff (next step, what works, what is blocked, what to watch out for), pages, resources, and session notes. Agents read it before substantive work and write back what changed.
 
-Fastest spin-up order (adapted for reading and orienting):
-1. `whats_new()` — see what changed across your projects since last time.
-2. `get_project_context(projectId, view: "spinup")` — a lean peek to decide whether to engage.
-3. `get_project_context(projectId)` — the full brief once you commit to the project.
-4. `get_task_context(taskId)` — call BEFORE claiming to preview a task's fit; after claim_task it returns the full working set.
+## Pick the workflow
 
-**Two surfaces, same capabilities.** Check which is live in one step — *don't fan out ToolSearch*: if a
-`mcp__moment-research__*` tool is in your tool list, use MCP; if not, the server isn't connected — go straight
-to the **`moment` CLI** (the REST API underneath; MCP and CLI are thin proxies).
+- **Answer a question or read a known page.** Resolve the project, then read the page (`read_page` / `moment page-read <slug>`) or search (`search_context` / `moment find "<question>"`). Skip the full brief, and skip the close-out: a read-only request ends with its answer.
+- **Orient before substantive work.** Start short with `moment orient` (piped, it prints the short brief) or `orient(projectId, view:"spinup")`: about 4 KB with the next step, summary, and what changed. Then read the pages it names. Ask for everything (`moment orient --complete` / `view:"brief"`) only when you need the whole picture: on busy projects it runs past 40 KB, and some harnesses show only the start of a result that large.
+- **Attach a repository.** Follow [attach a repository](reference.md#attach-a-repository). This changes local routing only.
+- **Create a project.** Use `bootstrap_project`, which reuses a same-title project instead of duplicating it; see [cold start](reference.md#cold-start). Reading context does not authorize creating a project.
+- **Enrich.** Add or update a page (`upsert_page` / `moment page`) or attach an artifact (`add_resource` / `moment project add-resource`).
+- **Close out** after substantive project work; see below.
+- **Claim and submit tasks** with the burn skill, only when the user asked for task-queue work.
 
-**Targeting an environment (cloud vs local).** The MCP server defaults to the cloud instance
-(`https://www.scientific-intelligence.com`), while the CLI falls back to `http://localhost:3000`.
-To target a local Moment dev server with the CLI, set `MOMENT_API_URL=http://localhost:3000` or pass
-`--api-url http://localhost:3000`; use `--api-url` for any explicit CLI target. For MCP, configure a
-separate `moment-local` server entry in `.mcp.json` pointed at localhost.
+## Resolve the project and the transport
 
-> **Most tasks need only the block below.** Run it and stop. Reach for the full catalog
-> (**[reference.md](reference.md)** — every tool's exact signature, all CLI flags, enums, recipes) only when
-> you need a tool or flag you don't already know.
+- **Project.** Use an explicit target from the user first. In an attached repository, `moment project list --for "<task>"` lists the projects in `.moment.json` and explains which one is selected. An id or an alias works wherever a project is expected. Ask only when the candidates remain materially ambiguous.
+- **Transport.** Use the `moment-research` MCP tools when they are connected; in Claude Code they are deferred, so load the ones you need in one ToolSearch call. Otherwise use the `moment` CLI (if it is missing: `uv tool install "git+https://github.com/blaiszik/moment-agent-kit#subdirectory=cli"`, or the same address with `pipx install`; it is not on PyPI). Fall back to REST (`/api/v1/agents/…`, catalog at `GET /api/v1/agents/openapi`) only when neither works. If an MCP call fails on transport, switch to the CLI.
+- **Server or key trouble.** Run `moment doctor`, and read [servers](references/servers.md). Never print credentials. The CLI sends credentials only to the lab, localhost, or a server the person chose; if it refuses a server that a repository's config picked, tell the user. Trusting that server (`--api-url`, `trustedApiUrls`) is their decision, not yours.
 
-## Cold start — create a project + seed its Brief (the 90% case)
+## Using the CLI
 
-**Use `bootstrap` — one idempotent call does everything:** create (or reuse a same-title project) + opening
-page + resources + handoff + note. Re-running with the same title **reuses** the project (no duplicate) and
-applies the writes, so it's safe to retry. Each write returns its result — **trust it; don't `get_project_context`
-afterward to "check".**
+- `moment commands` maps the CLI in one screen, generated from the parser; `moment commands <command>` (or a group such as `project`) adds the options, and `moment <command> --help` shows one command. Check there rather than relying on memory.
+- `-p <id|alias>`, `--json`, and `--quiet` work before or after the subcommand; `--api-url`, `--api-key`, and `--config` go before it. `--quiet` drops tips, footers, and excerpts.
+- Piped output is plain text and markdown, and read results name the command that opens them (`→ moment page-read <slug>`). Add `--json` when you will parse fields. Results go to stdout and errors to stderr; under `--json`, every error is one JSON object with `error`, `hint`, and, for server refusals, `status` and `code`. Exit codes: 0 success, 1 refused or failed, 2 wrong usage.
+- For long text, pass `-` and a heredoc (`--note -`, `--body -`, or any `…-file -`) instead of quoting it inline.
+- `moment watch` and `moment ingest --watch` run until interrupted, and `moment auth login` is a person's browser step. Leave them to people.
 
-**MCP:**
-```
-bootstrap_project(title:"…", description:"…", domain:"AI_FOR_SCIENCE",
-  page:{ title:"Design", body:"## …inline markdown…", slug:"design", pinned:true },
-  resources:[{ uri:"https://github.com/owner/repo", summary:"why it matters" }],
-  handoff:{ worksNow:"…", nextStep:"…", watchOut:"…" }, note:"Seeded the Brief.")
-```
+## Event entry
 
-**CLI (one tool call — send as a single Bash invocation):**
-```bash
-export MOMENT_API_KEY=…                                   # silences the "apiKey committed to git" warning
-printf '## Design\n…markdown…\n' | moment --json --quiet project bootstrap \
-  --title "…" --description "…" --domain AI_FOR_SCIENCE \
-  --page-title "Design" --page-slug design --page-pinned --page-body - \
-  --resource https://github.com/owner/repo \
-  --works-now "…" --next "…" --watch-out "…" --note "Seeded the Brief."
-# domain ∈ MATERIALS_CHEMISTRY·AI_FOR_SCIENCE·HEALTH_LONGEVITY·ENERGY_CLIMATE·COMPUTATION·SYNTHETIC_BIOLOGY·QUANTUM_SYSTEMS·NEUROSCIENCE·SPACE_EXPLORATION·OTHER
-```
+- **Read** where a team's entry stands with `get_submission_status(campaignSlug, projectId)` / `moment campaign submission status`: it prints what the entry still needs in the editor's own sentences, whether saved changes are waiting to go live, and the window. `get_campaign_context(campaign)` gives the event's window, what an entry needs, and the judging criteria.
+- **Filing, withdrawing, and team changes are the person's own act**, through the CLI signed in as them (`moment auth login`): `moment campaign mine`, `moment campaign status`, `moment campaign submission edit|check|submit|update|withdraw`, and `moment team list|create|join|invite-link|rename|leave`. Help them write the entry; do not file it for them. An event entry's title is its team's name, so the team lead renames it with `moment team rename`.
 
-Prefer `bootstrap` over the four separate calls (`create_project` → `upsert_page` → `add_resource` →
-`log_session`) — reach for those only to enrich a project that already exists (the step-by-step sequence is in
-[reference.md](reference.md)). Note the raw `create_project` has **no title dedup**, so `bootstrap` (or a
-`search_context` check) is also how you avoid duplicate hubs. Linked a repo? `import_context(projectId)`
-auto-seeds from the README instead of a hand-written page.
+## Authorization
 
-**Keep the Brief scannable:** the depth lives in the **page** — don't duplicate it. But the handoff and note
-must **stand alone**: sized to the work, they tell the next agent what changed, what to do next, and what to
-watch, without making them open the page to get the gist.
+Reading is always in scope. Writing (pages, resources, notes, handoffs, projects, tasks) needs a request for that kind of change; permission to read is not permission to write. Posting a discussion message, installing hooks, and claiming tasks each need an explicit request. On a project where you lack edit access, a write returns HTTP 202 and is queued for an editor: report it as pending, not applied (`list_proposals` shows its state). A successful write result is enough; read it back only when it looks incomplete or contradictory.
 
-## Ownership & access — know this before you write
-- A project you create is owned by **your creator** (the user whose key you carry) — you can't set another owner.
-- On your creator's projects (incl. any you just made) you have **edit access**: `upsert_page` / `add_resource`
-  / `link_context` / `log_session` **apply directly**.
-- Elsewhere those writes are **queued as ContextProposals** — the API returns **HTTP 202 "proposal queued"** and
-  an owner must approve. A 202 (not 200/201) means you're editing a project your creator doesn't own.
+## Close out
 
-## Close out — leave the Brief better than you found it
-The last step of any work session (the "close out" in the loop): `log_session(N, note, handoff?)`, and promote
-lasting reference material to a page (`upsert_page`, `pinned:true` for must-know conventions/gotchas).
+After substantive work on a project, record what changed in one call:
 
-Use the [writing quality rubric](reference.md#writing-quality-rubric): record what changed, the concrete
-friction/watch-out, what to do next, and any durable page/resource updates. Keep the depth in pages, but make
-the note and handoff stand alone.
+- MCP: `log_session(projectId, note, handoff?)`, where `handoff` carries only the changed fields among `nextStep`, `worksNow`, `inProgress`, `blocked`, `watchOut`, `triedAndFailed`, `decisions`, `openQuestions`, and `readFirst`.
+- CLI: `moment log --note "…"`, plus `--decisions`, `--tried-and-failed`, or `--open-questions` (these append), and, when your work is the project's main thread, `--next`, `--works-now`, `--in-progress`, `--blocked`, `--watch-out`, or `--read-first` (these replace).
 
-## Which tool when (signatures + flags → [reference.md](reference.md))
-| Need | MCP | CLI |
-|------|-----|-----|
-| **Create + seed a project (1 call, idempotent)** | `bootstrap_project(title,description,page?,resources?,handoff?)` | `moment project bootstrap --title … --description …` |
-| Read one project's Brief | `get_project_context(N)` | `moment -p N orient` |
-| Survey the lab / find by meaning | `explore(q?)` · `search_context(q)` | `moment find "q"` |
-| Pull an artifact / a budgeted bundle | `read_resource(N,rid)` · `compile_context(N,task)` | `moment project read-resource N rid` · `moment -p N gather "task"` |
-| Add/update a page | `upsert_page(N,title,body,slug?,pinned?)` | `moment project page N --title … --body -` |
-| Attach **one whole artifact** (URL) | `add_resource(N,uri,summary?)` | `moment project add-resource N <uri>` |
-| Link two nodes (typed edge) | `link_context(N,…,kind)` | — |
-| Close out / refresh handoff (`watchOut` = the friction you hit, not just the design) | `log_session(N,note,handoff?)` | `moment -p N log --note … --works-now … --watch-out …` |
-| Open work for others | `propose_task(N,…)` → then `/burn` | `moment project propose N …` |
+Fields you omit stay as they are. The project has only one next step: on a shared project, side work puts its next step in the note and uses only the appending fields, so it doesn't overwrite someone else's. `moment status` shows the current next step and handoff version first. The note holds at most 4000 characters, so put depth in a page and summarize it. Make `watchOut` the friction you hit, not a summary of what you built. The contract, merge rules, and examples are in [close-out](references/close-out.md).
 
-**CLI gotchas:** global flags (`-p/--project`, `--json`, `--quiet`) go **before** the subcommand; `project …`
-subcommands take the id **positionally**. Handoff fields (`--works-now/--watch-out/…`) live on top-level `log`,
-**not** `project log`. **Resources are whole artifacts by resolvable URL** — link the repo root, not each file;
-local paths (`/lustre/…`) store but won't resolve for anyone else.
-
-## See also
-- **`/burn`** — the autonomous claim → do → submit task loop (this skill is its context half).
-- **`continuity`** — the same idea for *local* repos (read-only Briefs from local git state).
-- **[reference.md](reference.md)** — full MCP↔CLI catalog, enums, recipes, REST fallback, output format.
+Open [reference.md](reference.md) for tool signatures, enums, recipes, and the REST fallback.

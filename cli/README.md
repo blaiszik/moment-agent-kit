@@ -1,95 +1,14 @@
-# moment — Moment CLI
+# Moment CLI
 
-`moment` is a Python command-line client for the [Moment](https://www.scientific-intelligence.com)
-context hub. It talks to the same Agent REST API as the MCP server, and is what the `moment`
-and `burn` skills fall back to when MCP isn't connected. It's also handy on its own in shells
-and CI.
-
-## Install
+Moment CLI connects research agents to projects in the lab. It lets a person sign in, attach a repository, render the current brief, and leave durable context behind.
 
 ```bash
-pip install .          # from this directory
-# or, isolated:
-pipx install .
+uv tool install "git+https://github.com/blaiszik/moment-agent-kit#subdirectory=cli"
+moment onboard -p <projectId>
 ```
 
-Requires Python ≥ 3.10. This installs a `moment` console command (entry point
-`moment_cli.cli:app`).
+No [uv](https://docs.astral.sh/uv/getting-started/installation/)? `pipx install "git+https://github.com/blaiszik/moment-agent-kit#subdirectory=cli"` works the same way, and `python3 -m pip install --user` with the same address works where neither is available. From a clone of the kit, `uv tool install ./cli` does the same. The CLI is not on PyPI yet (see RELEASING.md).
 
-## Authenticate
+`moment onboard` signs you in through the browser the first time, binds the current repository to the project, seeds useful repository context, updates the agent instructions, and installs supported ambient-capture hooks.
 
-Get an API key from the Moment app's **AI Agents** page, then:
-
-```bash
-moment auth login --key YOUR_MOMENT_API_KEY   # writes ~/.moment.json (secret)
-moment auth whoami                            # confirm the key resolves
-```
-
-With no explicit target, the CLI uses the cloud instance
-`https://www.scientific-intelligence.com`. For local development, explicitly set
-`MOMENT_API_URL=http://localhost:3000` or pass the global `--api-url` flag.
-
-### Cloud vs local
-
-```bash
-moment activity                                                     # cloud fallback
-moment --api-url http://localhost:3000 -p 42 orient                # one-off against local development
-export MOMENT_API_URL=http://localhost:3000                        # or make local development sticky for the shell session
-```
-
-An explicit `--api-url` wins over the environment. Your local server has its own seeded
-agent key (distinct from your cloud key) — authenticate against it with
-`MOMENT_API_KEY=<LOCAL_DEV_KEY>` or a separate `moment auth login`.
-
-## Configuration cascade
-
-Resolution order (first non-empty wins): **flags → repo `.moment.json` → environment →
-`~/.moment.json`**.
-
-- **`~/.moment.json`** — your secret: `{ "apiKey": "…" }` (written by `moment auth login`).
-- **repo `.moment.json`** — a committed, **non-secret** binding: `{ "projectId": N, "apiUrl": "…" }`.
-  The CLI warns if it finds an `apiKey` here, since the file is git-tracked.
-- **Env vars** — `MOMENT_API_KEY`, `MOMENT_API_URL`, `MOMENT_PROJECT_ID`.
-
-Most commands take a project via the global `-p/--project` flag (or the repo binding). Add
-`--json` for machine-readable output and `--quiet` to suppress decoration.
-
-## Common commands
-
-```bash
-# Orient & read
-moment -p 42 orient                       # the spin-up brief: handoff → next → watch-out
-moment project context 42                 # full project context
-moment find "transformer attention"       # semantic search across the whole graph
-moment -p 42 gather "retraction lint"     # budgeted context bundle within one project
-moment project resources 42               # the resource manifest
-moment project read-resource 42 12        # pull a resource into context
-moment backlinks 42 <page-slug>           # typed edges for a page
-
-# Enrich
-moment project page 42 --title "Findings" --body-file notes.md   # add/update a page (--body - reads stdin)
-moment project add-resource 42 https://github.com/owner/repo --summary "Authoritative source"
-moment project contribute 42 ...          # post an observation / hypothesis / finding
-moment project bootstrap ...              # idempotent create + seed page/resources/handoff
-
-# The work loop
-moment work list                          # AI-eligible tasks
-moment work start <taskId>                # claim
-moment work context <taskId>              # the task's working set
-moment work submit <taskId> ...           # submit structured output
-moment work pr <taskId> <prUrl>           # submit a GitHub PR for a code task
-
-# Close out
-moment -p 42 log --note "…" --next "…" --watch-out "…"   # session note + handoff patch
-moment sync                               # regenerate any local mirror
-```
-
-Command groups: `auth`, `work`, `project`, `stats`, `hooks`, `github`. Run `moment --help`
-or `moment <group> --help` for the full surface.
-
-## Tests
-
-```bash
-pip install pypdf            # used by the ingest tests
-python -m pytest tests       # or run a file directly, e.g. python tests/test_stop_hook.py
-```
+Run `moment orient` at the start of a session to render the project's current brief and next steps.

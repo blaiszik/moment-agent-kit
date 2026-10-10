@@ -6,6 +6,7 @@ import json
 import hashlib
 import os
 import re
+import socket
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -13,12 +14,37 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+import httpx
+from rich.markup import escape
 from rich.panel import Panel
+from typer.core import TyperGroup
+
+try:  # typer 0.2x vendors click as typer._click
+    from typer._click.exceptions import NoArgsIsHelpError as _NoArgsIsHelp
+    from typer._click.exceptions import UsageError as _UsageError
+except ImportError:  # older typer depends on click itself
+    from click.exceptions import UsageError as _UsageError
+
+    class _NoArgsIsHelp(Exception):  # click < 8.2 shows help without raising
+        pass
 
 from moment_cli import __version__, close_out, hooks as hooks_mod
 from moment_cli import doctor as doctor_mod
-from moment_cli.api import ApiError, MomentApiClient
-from moment_cli.config import read_repo_bindings, resolve_config
+from moment_cli import human_auth
+from moment_cli.api import ApiError, MomentApiClient, UntrustedServerError
+from moment_cli.campaign import campaign_app
+from moment_cli.team import team_app
+from moment_cli.config import (
+    DEFAULT_API_URL,
+    api_origin,
+    campaign_context_key,
+    human_token_expired,
+    parse_iso,
+    read_repo_bindings,
+    resolve_config,
+    trust_api_url,
+    update_home_config,
+)
 from moment_cli.display import (
     GLOW,
     ROSE,
@@ -30,7 +56,6 @@ from moment_cli.display import (
     print_error_json,
     print_json,
     render_activity,
-    render_auth_whoami,
     render_brief,
     render_bootstrap,
     render_contribution_result,
@@ -58,37 +83,221 @@ from moment_cli.display import (
     render_work_context,
     render_work_list,
     render_work_start,
+    render_find,
+    render_page_written,
+    render_resource_added,
+    render_resource_content,
+    render_resources,
+    stdout_is_rich,
+    write_queued,
 )
+
+# Options of the root callback that may also be written after the subcommand.
+# Only these three: they choose output and project, never server or credentials.
+# `--api-url`, `--api-key`, and `--config` stay before the subcommand, so text that
+# lands in a positional slot (a search query, a checklist item) can't redirect
+# where the key is sent.
+_GLOBAL_FLAGS = frozenset({"--json", "--quiet"})
+_GLOBAL_VALUED = frozenset({"--project", "-p"})
+
+
+def _option_names(command: object) -> tuple[set[str], set[str]]:
+    """(every option spelling, the spellings that take a value) for one command."""
+    names: set[str] = set()
+    valued: set[str] = set()
+    for param in getattr(command, "params", None) or []:
+        if getattr(param, "param_type_name", "") != "option":
+            continue
+        spellings = list(param.opts) + list(getattr(param, "secondary_opts", None) or [])
+        names.update(spellings)
+        if not getattr(param, "is_flag", False) and not getattr(param, "count", False):
+            valued.update(param.opts)
+    return names, valued
+
+
+def _hoist_global_options(root: object, args: list[str]) -> list[str]:
+    """Move global options written after the subcommand to before it.
+
+    `moment orient --json` and `moment log -p 42 …` are the natural spellings,
+    but the parser only reads global options before the subcommand. A token is
+    hoisted only when the command it follows does not define that option itself,
+    and values of that command's own options (`--note "-p is fine"`) are skipped.
+    """
+    _root_names, root_valued = _option_names(root)
+    index = 0
+    while index < len(args) and args[index].startswith("-") and args[index] != "-":
+        if args[index] == "--":
+            return args
+        head = args[index].split("=", 1)[0]
+        index += 2 if head in root_valued and "=" not in args[index] else 1
+    insert_at = index
+
+    hoisted: list[str] = []
+    passthrough: list[str] = []
+    command = root
+    while index < len(args) and hasattr(command, "commands"):
+        token = args[index]
+        subcommand = command.commands.get(token)  # type: ignore[attr-defined]
+        if subcommand is not None:
+            passthrough.append(token)
+            command = subcommand
+            index += 1
+            continue
+        head = token.split("=", 1)[0]
+        if head in _GLOBAL_FLAGS:
+            hoisted.append(token)
+            index += 1
+            continue
+        if head in _GLOBAL_VALUED:
+            take = 1 if "=" in token or index + 1 >= len(args) else 2
+            hoisted.extend(args[index:index + take])
+            index += take
+            continue
+        return args  # an unknown command or a group option: the parser reports it
+
+    leaf_names, leaf_valued = _option_names(command)
+    kept: list[str] = []
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            kept.extend(args[index:])
+            break
+        head = token.split("=", 1)[0] if token.startswith("--") else token
+        if token.startswith("-") and token != "-" and head not in leaf_names:
+            if head in _GLOBAL_FLAGS:
+                hoisted.append(token)
+                index += 1
+                continue
+            if head in _GLOBAL_VALUED:
+                take = 1 if "=" in token or index + 1 >= len(args) else 2
+                hoisted.extend(args[index:index + take])
+                index += take
+                continue
+        kept.append(token)
+        if head in leaf_valued and "=" not in token and index + 1 < len(args):
+            kept.append(args[index + 1])
+            index += 2
+            continue
+        index += 1
+
+    if not hoisted:
+        return args
+    return args[:insert_at] + hoisted + passthrough + kept
+
+
+def _report_usage_error(exc: Exception) -> "SystemExit":
+    """A parser complaint (missing argument, unknown option) in the one JSON error format."""
+    command = getattr(getattr(exc, "ctx", None), "command_path", None) or "moment"
+    message = exc.format_message() if hasattr(exc, "format_message") else str(exc)
+    _report_failure(message, hint=f"`{command} --help` shows the usage.")
+    return SystemExit(2)
+
+
+def _config_exit_hint(message: str) -> Optional[str]:
+    if "alias" in message:
+        return "`moment project list` shows this repository's aliases."
+    if "moment doctor" in message:
+        return None
+    return "`moment doctor` checks the binding, key, and server together."
+
+
+class MomentGroup(TyperGroup):
+    """The root command: global options anywhere; every failure in one format."""
+
+    def parse_args(self, ctx, args):  # type: ignore[override]
+        args = _hoist_global_options(self, list(args))
+        # The parser consumes the list it is given, and this runs before the root
+        # callback: read --json from the argv now.
+        wants_json = "--json" in _leading_options(self, args)
+        try:
+            return super().parse_args(ctx, args)
+        except _UsageError as exc:
+            if not wants_json or isinstance(exc, _NoArgsIsHelp):
+                raise
+            _state["json"] = True
+            raise _report_usage_error(exc) from None
+
+    def invoke(self, ctx):  # type: ignore[override]
+        # An unknown subcommand is reported before the root callback sets _state.
+        _state["json"] = bool(ctx.params.get("json_mode"))
+        try:
+            return super().invoke(ctx)
+        except _UsageError as exc:
+            if not _state.get("json") or isinstance(exc, _NoArgsIsHelp):
+                raise
+            raise _report_usage_error(exc) from None
+        except SystemExit as exc:
+            # Config resolution exits with a sentence (missing key, unknown alias,
+            # unreadable config). That is a usage failure: exit 2, JSON-aware.
+            if not isinstance(exc.code, str):
+                raise
+            _report_failure(exc.code, hint=_config_exit_hint(exc.code))
+            raise SystemExit(2) from None
+
+
+def _leading_options(root: object, args: list[str]) -> list[str]:
+    """The root-level tokens before the first subcommand name."""
+    _names, valued = _option_names(root)
+    index = 0
+    while index < len(args) and args[index].startswith("-") and args[index] != "-":
+        head = args[index].split("=", 1)[0]
+        index += 2 if head in valued and "=" not in args[index] else 1
+    return args[:index]
+
 
 app = typer.Typer(
     name="moment",
+    cls=MomentGroup,
     help=(
-        "Moment research agent CLI — work discovery, claiming, submission, and project contributions. "
-        "Bound-project shortcuts: `moment page` (add/update a page), `moment doctor` (diagnose the binding)."
+        "Moment CLI: read and write a Moment project's shared context from a repository.\n\n"
+        "Loop: `moment orient` (the brief) -> `moment page-read <slug>` or `moment find \"<question>\"` "
+        "-> work -> `moment log --note \"...\" --next \"...\"` (close out).\n\n"
+        "The project comes from -p <id|alias> or this repository's .moment.json. -p, --json, and "
+        "--quiet work before or after the subcommand; --api-url, --api-key, and --config go before it. "
+        "Output is plain text when piped; add --json to parse it. --quiet drops tips and footers. "
+        "`moment commands` maps every command."
     ),
     no_args_is_help=True,
-    rich_markup_mode="rich",
+    rich_markup_mode="rich" if stdout_is_rich() else None,
+    # Piped help defaults to 80 columns, which cuts command summaries at ~45 characters.
+    context_settings={} if stdout_is_rich() else {"terminal_width": 120, "max_content_width": 120},
     pretty_exceptions_enable=False,
 )
 
 auth_app = typer.Typer(help="Authentication commands.", no_args_is_help=True)
-work_app = typer.Typer(help="Work discovery, claiming, and submission.", no_args_is_help=True)
+task_app = typer.Typer(help="Task discovery, claiming, and submission.", no_args_is_help=True)
+work_app = typer.Typer(hidden=True, help="Legacy alias for task commands.", no_args_is_help=True)
 project_app = typer.Typer(help="Project context and contributions.", no_args_is_help=True)
+checklist_app = typer.Typer(help="Project coordination checklist.", no_args_is_help=True)
 claim_app = typer.Typer(
     help="Claim ledger — falsifiers: what would change our mind about a claim.",
     no_args_is_help=True,
 )
+experiment_app = typer.Typer(help="Experiment state, results, and leaderboard.", no_args_is_help=True)
+discussion_app = typer.Typer(help="Project discussions.", no_args_is_help=True)
 stats_app = typer.Typer(help="Agent statistics.", no_args_is_help=True)
 hooks_app = typer.Typer(help="Install ambient capture hooks across agent runtimes.", no_args_is_help=True)
 github_app = typer.Typer(help="GitHub sync — pull PR/issue discussion into Moment context.", no_args_is_help=True)
 
 app.add_typer(auth_app, name="auth")
+app.add_typer(task_app, name="task")
 app.add_typer(work_app, name="work")
 app.add_typer(project_app, name="project")
+app.add_typer(checklist_app, name="checklist")
 app.add_typer(claim_app, name="claim")
+app.add_typer(experiment_app, name="experiment")
+app.add_typer(discussion_app, name="discussion")
 app.add_typer(stats_app, name="stats")
 app.add_typer(hooks_app, name="hooks")
 app.add_typer(github_app, name="github")
+app.add_typer(campaign_app, name="campaign")
+app.add_typer(team_app, name="team")
+
+
+@work_app.callback()
+def work_alias_notice() -> None:
+    """Keep the old group usable while teaching the canonical noun."""
+    sys.stderr.write("moment work is now moment task\n")
 
 # --- Global state ---
 
@@ -97,8 +306,7 @@ _state: dict = {}
 
 def _version_callback(value: bool) -> None:
     if value:
-        console.print(moment_header())
-        console.print(f"v{__version__}")
+        console.print(f"moment {__version__}")
         raise typer.Exit()
 
 
@@ -127,24 +335,105 @@ def _resolve_cli_config(
     hint: Optional[str] = None,
     require_api_key: bool = True,
 ):
-    api_key = _state.get("api_key")
-    if not require_api_key and not api_key:
-        api_key = "dry-run"
     cfg = resolve_config(
-        api_key=api_key,
+        api_key=_state.get("api_key"),
         api_url=_state.get("api_url"),
         config_path=_state.get("config"),
         project_id=project if project is not None else _state.get("project"),
         project_hint=hint,
         quiet=bool(_state.get("quiet")),
+        require_api_key=require_api_key,
     )
     _state["_config"] = cfg
     return cfg
 
 
-def _get_client(project: Optional[int | str] = None, *, hint: Optional[str] = None) -> MomentApiClient:
+HOOK_TIMEOUT = httpx.Timeout(connect=3.0, read=5.0, write=5.0, pool=5.0)
+
+
+def _get_client(
+    project: Optional[int | str] = None,
+    *,
+    hint: Optional[str] = None,
+    hook_mode: bool = False,
+) -> MomentApiClient:
     cfg = _resolve_cli_config(project=project, hint=hint)
-    return MomentApiClient(cfg)
+    return MomentApiClient(cfg, timeout=HOOK_TIMEOUT if hook_mode else None)
+
+
+def _interactive() -> bool:
+    """A person at a terminal, who can approve a browser sign-in."""
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _sign_in_if_needed() -> None:
+    """First run: with no agent key and no live sign-in, start the browser sign-in.
+
+    Only a person at a terminal can approve it, so a non-interactive caller (an
+    agent) gets told to ask a person instead of waiting on a browser for minutes.
+    """
+    cfg = _resolve_cli_config(require_api_key=False)
+    signed_in = cfg.human_token and not human_token_expired(cfg.human_token_expires_at)
+    if cfg.api_key or signed_in:
+        return
+    if not cfg.api_url_trusted:
+        raise UntrustedServerError(cfg)
+    if not _interactive():
+        raise typer.BadParameter(
+            f"No Moment credentials on this machine for {cfg.api_url}. A person runs "
+            "`moment onboard` (or `moment auth login`) in a terminal to sign in through the browser."
+        )
+    if not _state.get("json"):
+        console.print("First, sign in to Moment.")
+    human_auth.run_device_login(
+        cfg, open_browser=True, json_mode=bool(_state.get("json")), quiet=bool(_state.get("quiet")),
+    )
+
+
+def _mint_agent_key_if_needed() -> bool:
+    """Mint this person's machine key once; failures leave human auth usable."""
+    def report(message: str) -> None:
+        if _state.get("json"):
+            sys.stderr.write(message + "\n")
+        else:
+            console.print(message)
+
+    try:
+        cfg = _resolve_cli_config(require_api_key=False)
+    except (Exception, SystemExit) as exc:
+        report(f"Could not mint an agent key: {exc}. Continuing human-only.")
+        return False
+    if cfg.api_key or not cfg.human_token:
+        return False
+    if human_token_expired(cfg.human_token_expires_at):
+        report("Could not mint an agent key: the saved human token has expired. Continuing human-only.")
+        return False
+    name = socket.gethostname() or "this machine"
+    try:
+        result = MomentApiClient(cfg, human=True).post(
+            "/api/agents",
+            {"name": name, "type": "LLM", "version": __version__},
+        )
+        api_key = result.get("apiKey") if isinstance(result, dict) else None
+        if not isinstance(api_key, str) or not api_key:
+            report("Could not mint an agent key: the server returned no key. Continuing human-only.")
+            return False
+        update_home_config({"apiKey": api_key, "apiKeySource": "minted by login"})
+        report(f"Agent key minted for this machine ({name}).")
+        return True
+    except ApiError as exc:
+        if exc.status == 403:
+            report(str(exc))
+        elif exc.status == 429:
+            report("You already have 10 agents — rotate one on /agents.")
+        else:
+            report(f"Could not mint an agent key: {exc}. Continuing human-only.")
+    except Exception as exc:
+        report(f"Could not mint an agent key: {exc}. Continuing human-only.")
+    return False
 
 
 def _resolve_project_id() -> int:
@@ -155,28 +444,147 @@ def _resolve_project_id() -> int:
     cfg = _state.get("_config")
     pid = cfg.project_id if cfg else None
     if pid is None:
-        raise typer.BadParameter(
-            "No project could be selected. Pass --project <id-or-alias>, set "
-            "MOMENT_PROJECT, or configure defaultProject / matching metadata in "
-            ".moment.json. Run `moment projects` to inspect the repository bindings."
-        )
+        raise typer.BadParameter(NO_PROJECT_MESSAGE)
     return pid
 
 
-def _handle_error(exc: Exception) -> None:
+NO_PROJECT_MESSAGE = (
+    "No project could be selected. Pass -p <id-or-alias>, set MOMENT_PROJECT, or "
+    "set defaultProject in .moment.json. `moment project list` shows this repository's bindings."
+)
+
+PROJECT_ARG_HELP = "Project id or alias (default: -p, else this repository's binding)."
+
+
+def _project_arg(value: Optional[str]) -> int:
+    """A project written as an id or alias; None means -p, else the repo binding."""
+    cfg = _resolve_cli_config(project=value, require_api_key=False)
+    if cfg.project_id is None:
+        raise typer.BadParameter(NO_PROJECT_MESSAGE)
+    return cfg.project_id
+
+
+def _project_and(values: list[str], what: str) -> tuple[int, str]:
+    """`[PROJECT] THING` positionals: two values name the project; one leaves it to -p."""
+    if len(values) == 2:
+        return _project_arg(values[0]), values[1]
+    if len(values) == 1:
+        return _project_arg(None), values[0]
+    raise typer.BadParameter(f"Expected [PROJECT] {what} (got {len(values)} values).")
+
+
+def _int_value(value: str, what: str) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        raise typer.BadParameter(f"{what} must be a number (got {value!r}).") from None
+
+
+def _explicit_project(value: Optional[str]) -> Optional[int]:
+    """This command's own --project, else an explicit -p / MOMENT_PROJECT; never the
+    repository default. For filters and scopes, where no project means every project."""
+    selector = (
+        value
+        or _state.get("project")
+        or os.environ.get("MOMENT_PROJECT")
+        or os.environ.get("MOMENT_PROJECT_ID")
+    )
+    if not selector or not str(selector).strip():
+        return None
+    return _project_arg(str(selector))
+
+
+def _server_url() -> str:
+    cfg = _state.get("_config")
+    return getattr(cfg, "api_url", None) or _default_api_url()
+
+
+def _api_error_hint(exc: ApiError) -> Optional[str]:
+    """The server's own recovery step when it sent one, else one keyed to the status."""
+    details = exc.details if isinstance(exc.details, dict) else {}
+    server_step = details.get("nextStep") if isinstance(details.get("nextStep"), str) else None
+    server = _server_url()
+    status = exc.status
+    if status == 401:
+        local = (
+            f"{server} rejected the API key. Keys are per server; `moment doctor` checks "
+            "which key and server this command used."
+        )
+        return f"{server_step} {local}" if server_step else local
+    if server_step:
+        return server_step
+    if status == 403:
+        return "The key is valid but lacks access for this action on this project."
+    if status == 404:
+        return (
+            f"Not found on {server}. Check the project id or alias, slug, or resource id "
+            "(`moment project list` shows this repository's bindings)."
+        )
+    if status == 409:
+        return "Conflict with the current state: re-read it, then retry."
+    if status == 429:
+        return "Rate limited: wait, then retry."
+    if status >= 500:
+        return f"Server error at {server}: retry shortly; if it persists, run `moment doctor`."
+    return None
+
+
+class MomentFailure(Exception):
+    """A command that ran correctly but could not finish (exit 1, not a usage error)."""
+
+
+def _describe_error(exc: BaseException) -> tuple[str, Optional[int], object, Optional[str]]:
+    """(message, HTTP status, server details, next-step hint) for one failure."""
     if isinstance(exc, ApiError):
-        if _state.get("json"):
-            print_error_json(str(exc), exc.status, exc.details)
-        else:
-            print_error(str(exc), exc.status)
-    elif _state.get("json"):
-        print_error_json(str(exc))
+        return str(exc), exc.status, exc.details, _api_error_hint(exc)
+    if isinstance(exc, UntrustedServerError):
+        return str(exc), None, None, exc.hint
+    if isinstance(exc, httpx.TimeoutException):
+        return (
+            f"Timed out waiting for {_server_url()}.", None, None,
+            "Retry; if it keeps timing out, run `moment doctor`.",
+        )
+    if isinstance(exc, httpx.RequestError):
+        reason = str(exc) or type(exc).__name__
+        return (
+            f"Could not reach {_server_url()} ({reason}).", None, None,
+            "The server comes from --api-url, then ./.moment.json apiUrl, then MOMENT_API_URL, "
+            "then ~/.moment.json. `moment doctor` checks the whole chain.",
+        )
+    return str(exc), None, None, None
+
+
+def _report_failure(message: str, status: Optional[int] = None,
+                    details: object = None, hint: Optional[str] = None) -> None:
+    if _state.get("json"):
+        print_error_json(message, status, details, hint=hint)
     else:
-        print_error(str(exc))
-    raise typer.Exit(1)
+        print_error(message, status, hint=hint)
+
+
+def _handle_error(exc: Exception) -> None:
+    """Report a failure on stderr and exit: 2 for misuse, 1 for a refusal or failure."""
+    if isinstance(exc, (typer.Exit, typer.Abort)):
+        raise exc  # a deliberate exit from inside the command, not a failure
+    if isinstance(exc, BrokenPipeError):
+        # The reader stopped early (`| head`): not a failure. Point stdout at
+        # devnull so the interpreter's final flush doesn't raise again.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+        raise typer.Exit(0)
+    message, status, details, hint = _describe_error(exc)
+    _report_failure(message, status, details, hint)
+    misuse = isinstance(exc, (typer.BadParameter, ValueError, UntrustedServerError))
+    raise typer.Exit(2 if misuse else 1)
 
 
 def _read_file(path: str) -> str:
+    """A file's text, or stdin when the path is `-`."""
+    if path == "-":
+        return sys.stdin.read().strip()
     return Path(path).read_text().strip()
 
 
@@ -186,8 +594,98 @@ def _default_api_url(api_url: Optional[str] = None) -> str:
         or _state.get("api_url")
         or os.environ.get("MOMENT_API_URL")
         or os.environ.get("MOMENT_MCP_API_URL")
-        or "https://www.scientific-intelligence.com"
+        or DEFAULT_API_URL
     ).rstrip("/")
+
+
+# The indexed-status sentences, mirroring app/lib/context-index.ts's
+# INDEXED_STATUS_SENTENCES. A write that could not be embedded must SAY so —
+# "skipped" would read as "nothing to do" and hide a dead provider.
+INDEXED_STATUS_SENTENCES = {
+    "done": "Searchable now.",
+    "pending": "Indexing finishes after this reply.",
+    "skipped": "Nothing to index (too short or not eligible for retrieval).",
+    "failed": (
+        "Not searchable yet — the embedding provider refused; "
+        "the next write to this project retries it."
+    ),
+}
+
+
+def _indexed_sentence(result: dict) -> Optional[str]:
+    """The one-line searchability report for a write, or None if unreported."""
+    if not isinstance(result, dict):
+        return None
+    return INDEXED_STATUS_SENTENCES.get(str(result.get("indexed") or ""))
+
+
+def _version_conflict(exc: Exception) -> Optional[dict]:
+    """The 409 body when this error is a lost-update collision, else None."""
+    if not isinstance(exc, ApiError) or exc.status != 409:
+        return None
+    details = exc.details
+    if isinstance(details, dict) and details.get("code") == "version_conflict":
+        return details
+    return None
+
+
+def _log_session_with_retry(client, project_id: int, payload: dict) -> dict:
+    """POST a close-out, retrying ONCE against the version that won the race.
+
+    Six writers close out on one project minutes apart. When the handoff moved
+    between our read and our write the server refuses the patch rather than
+    overwriting it, and writes NOTHING — not even the session note — so a retry
+    cannot double-log. We re-send the identical patch against the new version
+    once; the accumulating fields put our lines beside theirs. If the second
+    attempt collides too, we stop and print both versions rather than guessing.
+    """
+    try:
+        return client.log_session(project_id, payload)
+    except Exception as exc:
+        conflict = _version_conflict(exc)
+        if conflict is None:
+            raise
+        current = conflict.get("currentVersion")
+        if not isinstance(current, int):
+            raise
+        retry = dict(payload, handoffIfVersion=current)
+        try:
+            return client.log_session(project_id, retry)
+        except Exception as exc2:
+            second = _version_conflict(exc2)
+            if second is None:
+                raise
+            raise MomentFailure(
+                "Nothing was written — the handoff moved twice while this "
+                "close-out was in flight.\n"
+                f"  you read version {conflict.get('expectedVersion')}\n"
+                f"  it was version {current} when the retry went out\n"
+                f"  it is version {second.get('currentVersion')} now\n"
+                "Neither the handoff nor the session note was saved, so nothing "
+                "is duplicated. Re-read the brief (moment orient), merge your "
+                "lines into it by hand, and run the same command again with "
+                f"--if-version {second.get('currentVersion')}."
+            ) from exc2
+
+
+NOTE_MAX_CHARS = 4000
+NOTE_NEXT_STEP_MAX_CHARS = 2000
+HANDOFF_FIELD_MAX_CHARS = 4000
+READ_FIRST_MAX_ITEMS = 20
+
+
+def _read_first_items(values: Optional[list[str]]) -> list[dict]:
+    """`--read-first 'LABEL'` or `'LABEL :: why'` → the handoff's readFirst items."""
+    items: list[dict] = []
+    for raw in values or []:
+        label, _sep, why = raw.partition(" :: ")
+        label, why = label.strip(), why.strip()
+        if not label:
+            raise typer.BadParameter(f"--read-first needs a label (got {raw!r}).")
+        items.append({"label": label[:200], **({"why": why[:300]} if why else {})})
+    if len(items) > READ_FIRST_MAX_ITEMS:
+        raise typer.BadParameter(f"--read-first takes at most {READ_FIRST_MAX_ITEMS} items.")
+    return items
 
 
 def _build_session_payload(
@@ -199,31 +697,47 @@ def _build_session_payload(
     in_progress: Optional[str] = None,
     blocked: Optional[str] = None,
     watch_out: Optional[str] = None,
+    tried_and_failed: Optional[str] = None,
+    decisions: Optional[str] = None,
+    open_questions: Optional[str] = None,
+    read_first: Optional[list[dict]] = None,
+    if_version: Optional[int] = None,
 ) -> dict:
     """Build the POST body for the session-notes / close-out endpoint.
 
-    A handoff patch is attached only when one of the handoff fields is given —
-    a plain note never silently bumps the handoff version. When refreshing the
-    handoff, --next is mirrored into handoff.nextStep so the brief stays in sync.
+    The handoff is patched only with the fields given, so a plain note never
+    bumps the handoff version. `--next` is the brief's next step: it goes to the
+    handoff and, when it fits the note's 2000-char field, to the note as well.
     """
     payload: dict = {"note": note}
-    if next_step:
+    if next_step and len(next_step) <= NOTE_NEXT_STEP_MAX_CHARS:
         payload["nextStep"] = next_step
     if task is not None:
         payload["taskId"] = task
     handoff: dict = {}
     for key, val in (
+        ("nextStep", next_step),
         ("worksNow", works_now),
         ("inProgress", in_progress),
         ("blocked", blocked),
         ("watchOut", watch_out),
+        ("triedAndFailed", tried_and_failed),
+        ("decisions", decisions),
+        ("openQuestions", open_questions),
     ):
         if val:
+            if len(val) > HANDOFF_FIELD_MAX_CHARS:
+                raise typer.BadParameter(
+                    f"The handoff's {key} is {len(val)} characters; the limit is "
+                    f"{HANDOFF_FIELD_MAX_CHARS}. Put the detail in a page and point to it."
+                )
             handoff[key] = val
+    if read_first:
+        handoff["readFirst"] = read_first
     if handoff:
-        if next_step:
-            handoff["nextStep"] = next_step
         payload["handoff"] = handoff
+        if if_version is not None:
+            payload["handoffIfVersion"] = if_version
     return payload
 
 
@@ -232,62 +746,86 @@ def _build_session_payload(
 
 @auth_app.command("whoami")
 def auth_whoami() -> None:
-    """Show the authenticated agent identity and key fingerprint."""
-    try:
-        client = _get_client()
-        result = client.get_stats()
-        if _state.get("json"):
-            print_json({
-                "agent": result["agent"],
-                "stats": result["stats"],
-                "metadata": {
-                    "apiUrl": _state["_config"].api_url,
-                    "fingerprint": _state["_config"].fingerprint,
-                    "source": "stats",
-                },
-            })
-            return
-        render_auth_whoami(result, _state["_config"])
-    except Exception as exc:
-        _handle_error(exc)
+    """Show both identities: the person signed in, and the agent key, if any.
+
+    They are different credentials with different authority, so neither is ever
+    reported as the other. `--json` always carries both keys, with nulls.
+    """
+    cfg = _resolve_cli_config(require_api_key=False)
+    human = human_auth.human_identity(cfg)
+    agent = human_auth.agent_identity(cfg)
+    if _state.get("json"):
+        print_json({"human": human, "agent": agent})
+        return
+    if not human and not agent:
+        sys.stderr.write(
+            "No identity on this machine.\n"
+            "  moment auth login             sign in as yourself\n"
+            "  moment auth login --key <k>   save an agent key\n"
+        )
+        raise typer.Exit(2)
+    human_auth.render_whoami(human, agent, cfg)
 
 
 @auth_app.command("login")
 def auth_login(
-    key: Optional[str] = typer.Option(None, "--key", "-k", help="API key to save."),
+    key: Optional[str] = typer.Option(None, "--key", "-k", help="Save an AGENT API key instead of signing in."),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Print the code and URL; do not open a browser."),
+    label: Optional[str] = typer.Option(None, "--label", help="How this machine appears on the approval page."),
+    no_mint: bool = typer.Option(False, "--no-mint", help="Sign in without minting an agent key for this machine."),
 ) -> None:
-    """Save API key to ~/.moment.json for future use."""
-    if not key:
-        key = typer.prompt("Enter your Moment API key")
-    config_path = Path.home() / ".moment.json"
-    existing = {}
-    if config_path.exists():
-        try:
-            existing = json.loads(config_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    existing["apiKey"] = key
-    config_path.write_text(json.dumps(existing, indent=2) + "\n")
-    if _state.get("json"):
-        print_json({"saved": str(config_path)})
-    else:
-        console.print(f"[{_state.get('_accent', '#8ce99a')}]API key saved to {config_path}[/]")
+    """Sign in as yourself through the browser (or save an agent key with --key).
+
+    Without --key this runs the browser device grant: the terminal shows a short
+    code, you confirm it in Moment, and the token that comes back is saved to
+    ~/.moment.json. An agent key can never stand in for a person, so campaign
+    commands use this token and nothing else.
+    """
+    if key:
+        path = update_home_config({"apiKey": key, "apiKeySource": "supplied"})
+        if _state.get("json"):
+            print_json({"saved": str(path)})
+        else:
+            console.print(f"[{GLOW}]API key saved to {path}[/]")
+        return
+    cfg = _resolve_cli_config(require_api_key=False)
+    if not cfg.api_url_trusted:
+        # Signing in to a server a checkout chose would hand the person's
+        # approval (and a token) to it.
+        _handle_error(UntrustedServerError(cfg))
+    human_auth.run_device_login(
+        cfg,
+        label=label,
+        open_browser=not no_browser,
+        json_mode=bool(_state.get("json")),
+        quiet=bool(_state.get("quiet")),
+    )
+    if not no_mint:
+        _mint_agent_key_if_needed()
+
+
+@auth_app.command("logout")
+def auth_logout() -> None:
+    """Revoke this machine's CLI token and forget the saved identity."""
+    cfg = _resolve_cli_config(require_api_key=False)
+    human_auth.run_logout(cfg, json_mode=bool(_state.get("json")))
 
 
 # --- Work (tasks) ---
 
 
+@task_app.command("list")
 @work_app.command("list")
 def work_list(
-    project: Optional[int] = typer.Option(None, "--project", "-p", help="Filter by project ID."),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Only this project (id or alias). Default: every project."),
     type: Optional[str] = typer.Option(None, "--type", "-t", help="Filter by work type (e.g. CODE_CONTRIBUTION)."),
     difficulty: Optional[str] = typer.Option(None, "--difficulty", "-d", help="Filter by difficulty (EASY, MEDIUM, HARD)."),
-    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max results."),
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", "-l", help="Max results."),
 ) -> None:
-    """List available tasks for agents."""
+    """List open tasks across the lab (or one project with -p)."""
     try:
         client = _get_client()
-        result = client.list_work(project, type, difficulty, limit)
+        result = client.list_work(_explicit_project(project), type, difficulty, limit)
         if _state.get("json"):
             print_json(result)
             return
@@ -296,6 +834,7 @@ def work_list(
         _handle_error(exc)
 
 
+@task_app.command("claim")
 @work_app.command("start")
 def work_start(
     work_id: int = typer.Argument(help="Task ID to claim and start."),
@@ -320,6 +859,7 @@ def work_start(
         _handle_error(exc)
 
 
+@task_app.command("mine")
 @work_app.command("my-claims")
 def work_my_claims() -> None:
     """List your active claims — tasks you're working on or have submitted."""
@@ -331,7 +871,7 @@ def work_my_claims() -> None:
             return
         claims = result.get("claims", [])
         if not claims:
-            console.print(f"[{GLOW}]No active claims. Use `moment work list` to find work.[/]")
+            console.print(f"[{GLOW}]No active claims. Use `moment task list` to find tasks.[/]")
             return
         for claim in claims:
             status_color = "#8ce99a" if claim["status"] == "ACTIVE" else "#ffd43b"
@@ -342,6 +882,7 @@ def work_my_claims() -> None:
         _handle_error(exc)
 
 
+@task_app.command("show")
 @work_app.command("context")
 def work_context(
     work_id: int = typer.Argument(help="Task ID."),
@@ -358,6 +899,7 @@ def work_context(
         _handle_error(exc)
 
 
+@task_app.command("submit")
 @work_app.command("submit")
 def work_submit(
     work_id: int = typer.Argument(help="Task ID."),
@@ -388,6 +930,7 @@ def work_submit(
         _handle_error(exc)
 
 
+@task_app.command("pr")
 @work_app.command("pr")
 def work_pr(
     task_id: int = typer.Argument(help="Task ID."),
@@ -408,6 +951,7 @@ def work_pr(
         _handle_error(exc)
 
 
+@task_app.command("pr-status")
 @work_app.command("pr-status")
 def work_pr_status(
     task_id: int = typer.Argument(help="Task ID."),
@@ -429,10 +973,11 @@ def work_pr_status(
 
 @project_app.command("context")
 def project_context(
-    project_id: int = typer.Argument(help="Project ID."),
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
 ) -> None:
-    """Fetch full project context."""
+    """Fetch full project context (the raw brief payload; `orient` renders it)."""
     try:
+        project_id = _project_arg(project)
         client = _get_client()
         result = client.get_project_context(project_id)
         if _state.get("json"):
@@ -445,45 +990,59 @@ def project_context(
 
 @project_app.command("resources")
 def project_resources(
-    project_id: int = typer.Argument(help="Project ID."),
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
 ) -> None:
-    """List a project's resources (the context manifest)."""
+    """List a project's resources (the context manifest): id, kind, title, URI."""
     try:
-        print_json(_get_client().list_resources(project_id))
+        result = _get_client().list_resources(_project_arg(project))
+        if _state.get("json"):
+            print_json(result)
+            return
+        render_resources(result, quiet=bool(_state.get("quiet")))
     except Exception as exc:
         _handle_error(exc)
 
 
 @project_app.command("add-resource")
 def project_add_resource(
-    project_id: int = typer.Argument(help="Project ID."),
-    uri: str = typer.Argument(help="Resource URI (repo / paper / dataset / doc)."),
+    args: list[str] = typer.Argument(..., metavar="[PROJECT] URI", help="Optional project id or alias, then the resource URI (repo, paper, dataset, doc)."),
     title: Optional[str] = typer.Option(None, "--title"),
     kind: Optional[str] = typer.Option(None, "--kind", help="DATASET|CODE_REPO|PAPER|... (auto-detected if omitted)."),
-    summary: Optional[str] = typer.Option(None, "--summary"),
+    summary: Optional[str] = typer.Option(None, "--summary", help="One line on why this artifact matters."),
     role: Optional[str] = typer.Option(None, "--role", help="BACKGROUND|INPUT|OUTPUT|TOOL|REFERENCE."),
 ) -> None:
-    """Attach a resolvable artifact to a project (dedups into the context graph)."""
-    payload: dict = {"uri": uri}
-    for key, val in (("title", title), ("kind", kind), ("summary", summary), ("role", role)):
-        if val is not None:
-            payload[key] = val
+    """Attach one resolvable artifact to a project (deduplicated)."""
     try:
-        print_json(_get_client().add_resource(project_id, payload))
+        project_id, uri = _project_and(args, "URI")
+        payload: dict = {"uri": uri}
+        for key, val in (("title", title), ("kind", kind), ("summary", summary), ("role", role)):
+            if val is not None:
+                payload[key] = val
+        client = _get_client()
+        result = client.add_resource(project_id, payload)
+        if _state.get("json"):
+            print_json(result)
+            return
+        render_resource_added(result, client.last_status)
     except Exception as exc:
         _handle_error(exc)
 
 
 @project_app.command("read-resource")
 def project_read_resource(
-    project_id: int = typer.Argument(help="Project ID."),
-    resource_id: int = typer.Argument(help="Resource ID (from `project resources`)."),
-    fidelity: Optional[str] = typer.Option(None, "--fidelity", help="metadata|preview|text|summary (default summary)."),
+    args: list[str] = typer.Argument(..., metavar="[PROJECT] RESOURCE_ID", help="Optional project id or alias, then the resource id (from `project resources`)."),
+    fidelity: Optional[str] = typer.Option(None, "--fidelity", help="summary (default) | metadata | preview | text (the full content)."),
     section: Optional[str] = typer.Option(None, "--section", help="Return just one heading of the text."),
 ) -> None:
-    """Pull a resource's content into context."""
+    """Pull one resource's content into context (a summary unless --fidelity text)."""
     try:
-        print_json(_get_client().read_resource(project_id, resource_id, fidelity, section))
+        project_id, raw_id = _project_and(args, "RESOURCE_ID")
+        resource_id = _int_value(raw_id, "RESOURCE_ID")
+        result = _get_client().read_resource(project_id, resource_id, fidelity, section)
+        if _state.get("json"):
+            print_json(result)
+            return
+        render_resource_content(result)
     except Exception as exc:
         _handle_error(exc)
 
@@ -491,13 +1050,14 @@ def project_read_resource(
 PAGE_ROLES = ("BRIEF", "SPEC", "PLAN", "DECISION", "REPORT", "REFERENCE", "NOTE")
 
 
+@app.command("page-read")
 @project_app.command("page-read")
 def project_page_read(
-    project_id: int = typer.Argument(help="Project ID."),
-    slug: str = typer.Argument(help="Page slug (from orient's read order, gather, or `project context`)."),
+    args: list[str] = typer.Argument(..., metavar="[PROJECT] SLUG", help="Optional project id or alias, then the page slug (from orient, find, or gather)."),
 ) -> None:
-    """Read one page's full markdown body — the read twin of `project page`."""
+    """Read one page's full markdown body (the read twin of `page`)."""
     try:
+        project_id, slug = _project_and(args, "SLUG")
         result = _get_client().read_page(project_id, slug)
         if _state.get("json"):
             print_json(result)
@@ -507,21 +1067,28 @@ def project_page_read(
         _handle_error(exc)
 
 
+@app.command("page")
 @project_app.command("page")
 def project_page(
-    project_id: int = typer.Argument(help="Project ID."),
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
     title: str = typer.Option(..., "--title"),
     body: Optional[str] = typer.Option(None, "--body", help="Inline markdown body (pass '-' to read stdin). Alternative to --body-file."),
-    body_file: Optional[str] = typer.Option(None, "--body-file", help="Path to a markdown file for the page body."),
-    slug: Optional[str] = typer.Option(None, "--slug", help="Stable slug to update an existing page."),
+    body_file: Optional[str] = typer.Option(None, "--body-file", help="Path to a markdown file for the page body (`-` for stdin)."),
+    slug: Optional[str] = typer.Option(None, "--slug", help="Stable slug: an existing slug updates that page in place."),
     icon: Optional[str] = typer.Option(None, "--icon"),
-    pinned: bool = typer.Option(False, "--pinned", help="Must-read: top of the human nav and pulled in full into every agent's orient."),
+    pinned: Optional[bool] = typer.Option(None, "--pinned/--unpinned", help="Must-read (pulled in full into every orient) or not. Omit to leave it unchanged.", show_default=False),
     role: Optional[str] = typer.Option(None, "--role", help="BRIEF|SPEC|PLAN|DECISION|REPORT|REFERENCE|NOTE (inferred from slug/title when omitted)."),
+    if_version: Optional[int] = typer.Option(None, "--if-version", help="Page version you read: refuse (409) rather than overwrite a newer edit."),
 ) -> None:
-    """Add or update a freeform markdown page."""
+    """Add or update a markdown page; the same slug updates it in place."""
+    try:
+        project_id = _project_arg(project)
+    except Exception as exc:
+        _handle_error(exc)
+        return
     _upsert_page(
         project_id, title=title, body=body, body_file=body_file,
-        slug=slug, icon=icon, pinned=pinned, role=role,
+        slug=slug, icon=icon, pinned=pinned, role=role, if_version=if_version,
     )
 
 
@@ -533,68 +1100,101 @@ def _upsert_page(
     body_file: Optional[str],
     slug: Optional[str],
     icon: Optional[str],
-    pinned: bool,
+    pinned: Optional[bool],
     role: Optional[str] = None,
+    if_version: Optional[int] = None,
 ) -> None:
-    """Shared page-upsert body for `project page` (explicit id) and `page` (bound id)."""
-    if bool(body) == bool(body_file):
-        raise typer.BadParameter("Provide exactly one of --body or --body-file.")
-    body_text = sys.stdin.read() if body == "-" else (body if body is not None else _read_file(body_file))  # type: ignore[arg-type]
-    payload: dict = {"title": title, "body": body_text, "pinned": pinned}
-    if slug:
-        payload["slug"] = slug
-    if icon:
-        payload["icon"] = icon
-    if role:
-        role_upper = role.strip().upper()
-        if role_upper not in PAGE_ROLES:
-            raise typer.BadParameter(f"--role must be one of {', '.join(PAGE_ROLES)} (got {role!r}).")
-        payload["role"] = role_upper
+    """The page upsert. `pinned=None` leaves an existing page's must-read state alone."""
     try:
-        print_json(_get_client().upsert_page(project_id, payload))
-    except Exception as exc:
-        _handle_error(exc)
-
-
-@project_app.command("log")
-def project_log(
-    project_id: int = typer.Argument(help="Project ID."),
-    note: str = typer.Option(..., "--note", help="What you did; the next step; what to watch."),
-    next_step: Optional[str] = typer.Option(None, "--next-step"),
-    task: Optional[int] = typer.Option(None, "--task", help="Task ID this close-out followed."),
-) -> None:
-    """Close out: log a session note (keeps the brief fresh)."""
-    payload = _build_session_payload(note, next_step, task)
-    try:
-        print_json(_get_client().log_session(project_id, payload))
+        if bool(body) == bool(body_file):
+            raise typer.BadParameter("Provide exactly one of --body or --body-file (either accepts - for stdin).")
+        body_text = sys.stdin.read() if body == "-" else (body if body is not None else _read_file(body_file))  # type: ignore[arg-type]
+        payload: dict = {"title": title, "body": body_text}
+        if pinned is not None:
+            payload["pinned"] = pinned
+        if slug:
+            payload["slug"] = slug
+        if icon:
+            payload["icon"] = icon
+        if if_version is not None:
+            payload["ifVersion"] = if_version
+        if role:
+            role_upper = role.strip().upper()
+            if role_upper not in PAGE_ROLES:
+                raise typer.BadParameter(f"--role must be one of {', '.join(PAGE_ROLES)} (got {role!r}).")
+            payload["role"] = role_upper
+        result = _get_client().upsert_page(project_id, payload)
+        if _state.get("json"):
+            print_json(result)
+            return
+        report_index = not _state.get("quiet") or result.get("indexed") == "failed"
+        render_page_written(result, _indexed_sentence(result) if report_index else None)
     except Exception as exc:
         _handle_error(exc)
 
 
 @project_app.command("build")
 def project_build(
-    project_id: int = typer.Argument(help="Project ID."),
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
     source: Optional[str] = typer.Option(None, "--source", help="Repo URL (defaults to the project's githubRepo)."),
 ) -> None:
-    """Auto-populate a project's context graph from a source repo."""
+    """Write: seed a thin project's context graph from its repository (README, artifacts, edges)."""
     try:
-        print_json(_get_client().build_context(project_id, source))
+        result = _get_client().build_context(_project_arg(project), source)
+        if _state.get("json") or not isinstance(result, dict) or not result.get("message"):
+            print_json(result)
+            return
+        if not write_queued(result):
+            console.print(result["message"], markup=False)
     except Exception as exc:
         _handle_error(exc)
+
+
+SEARCH_TYPES = ("PROJECT", "PAGE", "RESOURCE", "SESSION_NOTE", "SIGNAL", "SUBMISSION", "DISCUSSION", "TASK")
+
+
+def _search_types(value: Optional[str]) -> Optional[str]:
+    """`pages,session-notes` → `PAGE,SESSION_NOTE`; unknown words pass through for the server to judge."""
+    if not value:
+        return value
+    words = []
+    for raw in value.split(","):
+        word = raw.strip().upper().replace("-", "_").replace(" ", "_")
+        if word not in SEARCH_TYPES and word.endswith("S") and word[:-1] in SEARCH_TYPES:
+            word = word[:-1]
+        if word:
+            words.append(word)
+    return ",".join(words)
 
 
 @app.command("find")
 def find(
     query: str = typer.Argument(help="Natural-language query."),
-    project: Optional[int] = typer.Option(None, "--project", "-p", help="Scope to one project."),
-    limit: Optional[int] = typer.Option(None, "--limit", "-n"),
-    team: Optional[str] = typer.Option(None, "--team", help="Scope to a team slug."),
-    types: Optional[str] = typer.Option(None, "--types", help="Filter by entity types (e.g. PAGE,RESOURCE)."),
-    since: Optional[str] = typer.Option(None, "--since", help="Filter by update recency (e.g. 30d or ISO date)."),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Only this project (id or alias). Default: the whole lab."),
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", help="1-50 (default 8)."),
+    team: Optional[str] = typer.Option(None, "--team", help="Only this team (slug)."),
+    campaign: Optional[str] = typer.Option(None, "--campaign", help="Only this campaign (slug)."),
+    user: Optional[str] = typer.Option(None, "--user", help="Only this person (handle)."),
+    types: Optional[str] = typer.Option(None, "--types", "--type", help="Comma-separated: PROJECT,PAGE,RESOURCE,SESSION_NOTE,SIGNAL,SUBMISSION,DISCUSSION,TASK (case and plurals are forgiven)."),
+    since: Optional[str] = typer.Option(None, "--since", help="Updated since: an ISO date, or 30d / 12h."),
 ) -> None:
-    """Semantically search the context graph across projects (find_context)."""
+    """Search the context graph by meaning, across the lab or one scope; each hit names its reader.
+
+    Use one scope at most: -p, --team, --campaign, or --user.
+    """
     try:
-        print_json(_get_client().find_context(query, project, limit, team=team, types=types, since=since))
+        other_scope = team or campaign or user
+        if project and other_scope:
+            raise typer.BadParameter("Use one scope at most: --project, --team, --campaign, or --user.")
+        scope = None if other_scope else _explicit_project(project)
+        result = _get_client().find_context(
+            query, scope, limit, team=team, types=_search_types(types), since=since,
+            campaign=campaign, user=user,
+        )
+        if _state.get("json"):
+            print_json(result)
+            return
+        render_find(result, quiet=bool(_state.get("quiet")))
     except Exception as exc:
         _handle_error(exc)
 
@@ -602,12 +1202,43 @@ def find(
 # --- Context round-trip (binding-aware: project from --project/.moment.json) ---
 
 
-@app.command("projects")
+@project_app.command("list")
+@app.command("projects", hidden=True)
 def projects(
     for_task: Optional[str] = typer.Option(None, "--for", help="Show which project would be selected for this task."),
+    remote: bool = typer.Option(False, "--remote", help="List projects visible to the agent key instead of local bindings."),
+    status: Optional[str] = typer.Option(None, "--status", help="Remote only: filter by project status."),
+    mine: bool = typer.Option(False, "--mine", help="Remote only: show projects the key can edit."),
+    after: Optional[str] = typer.Option(None, "--after", help="Remote only: continue from this cursor."),
 ) -> None:
     """List this repository's attached projects and explain the active choice."""
     try:
+        if remote:
+            payload = _get_client().list_projects_remote(
+                status=status, mine=mine, after=after
+            )
+            if _state.get("json"):
+                print_json(payload)
+                return
+            items = payload.get("items") or []
+            if not items:
+                console.print("No projects visible to this key.")
+                return
+            for item in items:
+                counts = item.get("counts") or {}
+                console.print(
+                    f"[bold]{item.get('title') or 'Untitled project'}[/]  #{item.get('id')}"
+                    f" · {item.get('status') or 'unknown'} · {item.get('access') or 'VIEWER'}"
+                )
+                console.print(
+                    f"    [dim]{item.get('domain') or 'OTHER'} · "
+                    f"{counts.get('openTasks', 0)} open tasks · {counts.get('members', 0)} members[/]"
+                )
+            if payload.get("nextCursor"):
+                console.print(f"\nNext: moment project list --remote --after {payload['nextCursor']}")
+            return
+        if status or mine or after:
+            raise typer.BadParameter("--status, --mine, and --after require --remote.")
         cfg = _resolve_cli_config(hint=for_task, require_api_key=False)
         selected = cfg.project_id
         # `alias` is a contract: whatever appears there must work as
@@ -670,25 +1301,615 @@ def projects(
         _handle_error(exc)
 
 
-@app.command("orient")
-def orient(
-    prompt: bool = typer.Option(False, "--prompt", help="Print the agent-ready promptContext verbatim."),
-    for_task: Optional[str] = typer.Option(None, "--for", help="Select the most relevant attached project for this task."),
-    full: bool = typer.Option(False, "--full", help="Load the full brief (pages, discussions, tasks); default is the lean brief."),
+@project_app.command("show")
+def project_show(
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
 ) -> None:
-    """Print the project brief — orient before you edit (the spin-up ritual)."""
+    """Show one project's metadata and current handoff headline."""
     try:
-        client = _get_client(hint=for_task)
-        pid = _resolve_project_id()
-        view = "full" if full else None
-        result = client.get_project_context(pid, view=view)
-        if prompt:
-            sys.stdout.write((result.get("promptContext") or "") + "\n")
+        project_id = _project_arg(project)
+        payload = _get_client().get_project(project_id)
+        if _state.get("json"):
+            print_json(payload)
             return
+        project = payload.get("project") or {}
+        console.print(f"[bold]{project.get('title') or 'Untitled project'}[/] (#{project_id})")
+        for label, key in (
+            ("Status", "status"), ("Domain", "domain"), ("Visibility", "visibility"),
+            ("Access", None), ("Tasks", "tasksEnabled"), ("Checklist", "checklistEnabled"),
+        ):
+            value = payload.get("access") if key is None else project.get(key)
+            console.print(f"{label}: {value}")
+        if project.get("description"):
+            console.print(f"\n{project['description']}")
+        handoff = payload.get("handoff") or {}
+        if handoff.get("nextStep"):
+            console.print(f"\nNext: {handoff['nextStep']}")
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@project_app.command("tasks")
+def project_tasks(
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
+    status: Optional[str] = typer.Option(None, "--status"),
+    difficulty: Optional[str] = typer.Option(None, "--difficulty"),
+    after: Optional[str] = typer.Option(None, "--after", help="Continue from this cursor."),
+) -> None:
+    """List one project's task board, including human-only and finished work."""
+    try:
+        project_id = _project_arg(project)
+        payload = _get_client().list_project_tasks(
+            project_id, status=status, difficulty=difficulty, after=after
+        )
+        if _state.get("json"):
+            print_json(payload)
+            return
+        items = payload.get("items") or []
+        if not items:
+            console.print(f"No matching tasks on project #{project_id}.")
+            return
+        for item in items:
+            console.print(
+                f"#{item.get('id')}  [bold]{item.get('title') or 'Untitled task'}[/]"
+                f" · {item.get('status')} · {item.get('difficulty')}"
+            )
+        if payload.get("nextCursor"):
+            console.print(f"\nNext: moment project tasks {project_id} --after {payload['nextCursor']}")
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@project_app.command("set")
+def project_set(
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
+    title: Optional[str] = typer.Option(None, "--title"),
+    description: Optional[str] = typer.Option(None, "--description"),
+    domain: Optional[str] = typer.Option(None, "--domain"),
+    tasks_enabled: Optional[bool] = typer.Option(None, "--tasks-enabled/--no-tasks-enabled"),
+    checklist_enabled: Optional[bool] = typer.Option(None, "--checklist-enabled/--no-checklist-enabled"),
+) -> None:
+    """Change project metadata (EDITOR access required)."""
+    payload = {
+        key: value
+        for key, value in {
+            "title": title,
+            "description": description,
+            "domain": domain,
+            "tasksEnabled": tasks_enabled,
+            "checklistEnabled": checklist_enabled,
+        }.items()
+        if value is not None
+    }
+    try:
+        if not payload:
+            raise typer.BadParameter("Set at least one project field.")
+        project_id = _project_arg(project)
+        result = _get_client().update_project(project_id, payload)
         if _state.get("json"):
             print_json(result)
             return
+        console.print(
+            f"Project #{project_id} updated: {', '.join(result.get('changed') or payload.keys())}."
+        )
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@checklist_app.command("list")
+def checklist_list(
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
+) -> None:
+    """List a project's coordination checklist."""
+    try:
+        project_id = _project_arg(project)
+        payload = _get_client().list_checklist(project_id)
+        if _state.get("json"):
+            print_json(payload)
+            return
+        if not payload.get("enabled"):
+            console.print(f"Checklist is off for project #{project_id}.")
+            return
+        items = payload.get("items") or []
+        if not items:
+            console.print(f"No checklist items on project #{project_id}.")
+            return
+        for item in items:
+            mark = "x" if item.get("done") else " "
+            console.print(f"[{mark}] #{item.get('id')}  {item.get('text')}")
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@checklist_app.command("add")
+def checklist_add(
+    args: list[str] = typer.Argument(..., metavar="[PROJECT] TEXT", help="Optional project id or alias, then the item text."),
+    url: Optional[str] = typer.Option(None, "--url"),
+) -> None:
+    """Add a coordination checklist item."""
+    try:
+        project_id, text = _project_and(args, "TEXT")
+        result = _get_client().add_checklist_item(project_id, text, url)
+        if _state.get("json"):
+            print_json(result)
+            return
+        item = result.get("item") or {}
+        console.print(f"Added checklist item #{item.get('id', '?')} to project #{project_id}.")
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@checklist_app.command("done")
+def checklist_done(
+    args: list[str] = typer.Argument(..., metavar="[PROJECT] ITEM_ID", help="Optional project id or alias, then the checklist item id."),
+    undone: bool = typer.Option(False, "--undone", help="Mark the item not done."),
+) -> None:
+    """Mark a coordination checklist item done (or undo it)."""
+    try:
+        project_id, raw_item = _project_and(args, "ITEM_ID")
+        item_id = _int_value(raw_item, "ITEM_ID")
+        result = _get_client().update_checklist_item(project_id, item_id, {"done": not undone})
+        if _state.get("json"):
+            print_json(result)
+            return
+        console.print(f"Checklist item #{item_id} marked {'not done' if undone else 'done'}.")
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@checklist_app.command("remove")
+def checklist_remove(
+    args: list[str] = typer.Argument(..., metavar="[PROJECT] ITEM_ID", help="Optional project id or alias, then the checklist item id."),
+) -> None:
+    """Remove a coordination checklist item."""
+    try:
+        project_id, raw_item = _project_and(args, "ITEM_ID")
+        item_id = _int_value(raw_item, "ITEM_ID")
+        result = _get_client().remove_checklist_item(project_id, item_id)
+        if _state.get("json"):
+            print_json(result)
+            return
+        console.print(f"Removed checklist item #{item_id} from project #{project_id}.")
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@app.command("orient")
+def orient(
+    prompt: bool = typer.Option(False, "--prompt", help="Print the markdown brief even in a terminal."),
+    for_task: Optional[str] = typer.Option(None, "--for", help="Select the most relevant attached project for this task."),
+    complete: Optional[bool] = typer.Option(
+        None, "--complete/--short",
+        help="--short: next step, summary, what changed (~4 KB; the default when piped). "
+             "--complete: everything, with the whole handoff and must-read pages (can pass 40 KB; "
+             "the default in a terminal).",
+        show_default=False,
+    ),
+    full: bool = typer.Option(False, "--full", hidden=True),
+    view: Optional[str] = typer.Option(None, "--view", hidden=True, help="The server's view name: spinup, brief, or full."),
+) -> None:
+    """Print the project brief: the next step, summary, and what changed (--complete for everything).
+
+    Piped (an agent), this prints the short markdown brief the MCP `orient` tool
+    returns for view "spinup"; --complete matches view "brief". In a terminal it
+    renders the complete brief as panels. --json returns the whole payload.
+    """
+    try:
+        if view not in (None, "spinup", "brief", "full"):
+            raise typer.BadParameter("--view must be one of spinup, brief, full; prefer --short or --complete.")
+        client = _get_client(hint=for_task)
+        pid = _resolve_project_id()
+        piped = not stdout_is_rich() and not _state.get("json")
+        # Agents read piped output through tool results that often show only
+        # the first couple of KB: lead with the short view unless asked for more.
+        if view:
+            resolved_view: Optional[str] = view
+        elif full:
+            resolved_view = "full"
+        elif complete is not None:
+            resolved_view = "brief" if complete else "spinup"
+        else:
+            resolved_view = "spinup" if piped or prompt else None
+        result = client.get_project_context(pid, view=resolved_view)
+        brief = result.get("promptContext")
+        if _state.get("json") and not prompt:
+            print_json(result)
+            return
+        if isinstance(brief, str) and brief.strip() and (prompt or piped):
+            sys.stdout.write(brief.rstrip() + "\n")
+            if not _state.get("quiet"):
+                sys.stdout.write(_orient_footer(result, resolved_view) + "\n")
+            return
         render_brief(result, quiet=bool(_state.get("quiet")))
+    except Exception as exc:
+        _handle_error(exc)
+
+
+def _orient_footer(result: dict, view: Optional[str]) -> str:
+    handoff = result.get("handoff") or {}
+    parts = []
+    if view in (None, "spinup"):
+        parts.append("everything: moment orient --complete")
+    parts += ["read a page: moment page-read <slug>", 'search: moment find "<question>"']
+    if handoff.get("version") is not None:
+        parts.append(f"handoff v{handoff['version']}")
+    return "— " + " · ".join(parts)
+
+
+def _status_instant(value: object) -> Optional[str]:
+    parsed = parse_iso(value)
+    if parsed is None:
+        return value.strip() if isinstance(value, str) and value.strip() else None
+    return parsed.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _status_optional(call, section: str, skipped: list[str]):
+    """A credential mismatch omits one section; other API failures still fail."""
+    try:
+        return call()
+    except ApiError as exc:
+        if exc.status in (401, 403):
+            skipped.append(section)
+            return None
+        raise
+
+
+def _active_campaign(cfg, project_id: int) -> Optional[str]:
+    user_id = (cfg.human_user or {}).get("id") or "token"
+    key = campaign_context_key(cfg.api_url, user_id, project_id)
+    return cfg.campaign_context.get(key)
+
+
+def _status_payload(cfg, project_id: int) -> dict:
+    context = claims = whats_new = None
+    skipped: list[str] = []
+    if cfg.api_key:
+        agent_client = MomentApiClient(cfg)
+        context = _status_optional(
+            lambda: agent_client.get_project_context(project_id), "project", skipped
+        )
+        claims = _status_optional(agent_client.get_my_claims, "myClaims", skipped)
+        whats_new = _status_optional(agent_client.get_whats_new, "sinceYouWereHere", skipped)
+
+    bound = next(
+        (item for item in cfg.project_bindings if item.project_id == project_id),
+        None,
+    )
+    remote_project = (context or {}).get("project") or {}
+    project = {
+        "id": project_id,
+        "title": remote_project.get("title") or (bound.title if bound else None),
+        "status": remote_project.get("status"),
+    }
+
+    handoff = (context or {}).get("handoff") or {}
+    freshness = (context or {}).get("contextFreshness") or {}
+    brief = None
+    if context is not None:
+        brief = {
+            "updatedAt": handoff.get("updatedAt") or freshness.get("handoffUpdatedAt"),
+            "version": handoff.get("version"),
+            "tasksCompletedSince": freshness.get("tasksCompletedSince", 0),
+        }
+
+    campaign = _active_campaign(cfg, project_id)
+    submission = None
+    if campaign and cfg.human_token:
+        human_client = MomentApiClient(cfg, human=True)
+        submission = _status_optional(
+            lambda: human_client.get_submission(project_id, campaign), "submission", skipped
+        )
+
+    return {
+        "project": project,
+        "brief": brief,
+        "nextStep": handoff.get("nextStep") if context is not None else None,
+        "myClaims": claims,
+        "sinceYouWereHere": whats_new,
+        "submission": submission,
+        "activeCampaign": campaign,
+        "skipped": skipped,
+    }
+
+
+def _render_status(payload: dict) -> None:
+    project = payload["project"]
+    title = project.get("title") or "Untitled project"
+    state = (
+        "— (not available with this key)"
+        if "project" in payload.get("skipped", [])
+        else project.get("status") or "status unavailable"
+    )
+    console.print(f"[bold]{title}[/] (#{project['id']}) · {state}")
+
+    brief = payload.get("brief")
+    if brief is not None:
+        version = f"v{brief['version']}" if brief.get("version") is not None else "unversioned"
+        updated = _status_instant(brief.get("updatedAt")) or "no handoff yet"
+        completed = int(brief.get("tasksCompletedSince") or 0)
+        console.print(
+            f"Brief: {version} · {updated} · {completed} task"
+            f"{'s' if completed != 1 else ''} completed since handoff"
+        )
+    elif "project" in payload.get("skipped", []):
+        console.print("Brief: — (not available with this key)")
+
+    if payload.get("nextStep"):
+        console.print(f"Next: {payload['nextStep']}")
+
+    claims = payload.get("myClaims")
+    if claims is not None:
+        console.print(
+            "My claims: "
+            f"{claims.get('active', 0)} active · "
+            f"{claims.get('submitted', 0)} submitted · "
+            f"{claims.get('recentlyDecided', 0)} recently decided"
+        )
+    elif "myClaims" in payload.get("skipped", []):
+        console.print("My claims: — (not available with this key)")
+
+    changed = payload.get("sinceYouWereHere")
+    if changed is not None:
+        feed = changed.get("feed") or []
+        console.print(
+            f"Since you were here, across your projects: {len(feed)} project"
+            f"{'s' if len(feed) != 1 else ''} changed"
+        )
+        for item in feed[:3]:
+            label = item.get("title") or item.get("name") or f"project {item.get('projectId', '?')}"
+            total = item.get("changeCount")
+            if not isinstance(total, int):
+                counts = item.get("counts") or (item.get("delta") or {}).get("counts") or {}
+                total = sum(value for value in counts.values() if isinstance(value, int))
+            console.print(f"  - {label} (#{item.get('projectId', '?')}): {total} change{'s' if total != 1 else ''}")
+    elif "sinceYouWereHere" in payload.get("skipped", []):
+        console.print("Since you were here: — (not available with this key)")
+
+    submission = payload.get("submission")
+    if submission is not None:
+        missing = submission.get("missing") or []
+        console.print(
+            f"Submission: {submission.get('status') or 'unknown'}"
+            f" · {len(missing)} requirement{'s' if len(missing) != 1 else ''} missing"
+        )
+    elif "submission" in payload.get("skipped", []):
+        console.print("Submission: — (not available with this key)")
+
+    if payload.get("activeCampaign"):
+        console.print(f"Active campaign: {payload['activeCampaign']}")
+
+
+@app.command("status")
+def status() -> None:
+    """Show where the bound project stands in one screen."""
+    try:
+        cfg = _resolve_cli_config(require_api_key=False)
+        if cfg.project_id is None:
+            raise typer.BadParameter(NO_PROJECT_MESSAGE)
+        payload = _status_payload(cfg, cfg.project_id)
+        if _state.get("json"):
+            print_json(payload)
+            return
+        _render_status(payload)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _handle_error(exc)
+
+
+def _claim_id(value: str) -> int:
+    """Accept the numeric id and the numeric tail of a Moment claim URN."""
+    text = value.strip()
+    if text.isdigit():
+        return int(text)
+    match = re.search(r"(?:^|[/:#])([0-9]+)$", text)
+    if match:
+        return int(match.group(1))
+    raise typer.BadParameter("Expected a numeric claim id or a Moment claim URN.")
+
+
+def _record_actor(event: dict) -> str:
+    actor = event.get("actor") or {}
+    name = actor.get("name") or "unknown actor"
+    if actor.get("isAgent"):
+        operator = actor.get("operator")
+        return f"{name} (agent, for {operator})" if operator else f"{name} (agent)"
+    return str(name)
+
+
+def _record_line(event: dict) -> tuple[str, str]:
+    parsed = parse_iso(event.get("at"))
+    if parsed is None:
+        day, clock = "unknown date", "??:??"
+    else:
+        instant = parsed.astimezone(timezone.utc)
+        day, clock = instant.strftime("%Y-%m-%d"), instant.strftime("%H:%M")
+    snippet = str(event.get("snippet") or "").replace("\n", " ").strip()
+    title = str(event.get("title") or "Untitled event")
+    line = f"{clock}  {_record_actor(event)}  {title}"
+    if snippet:
+        line += f"  — {snippet}"
+    return day, line
+
+
+def _render_record_pages(pages: list[dict]) -> None:
+    previous_day: Optional[str] = None
+    for page in pages:
+        for event in page.get("items") or page.get("events") or []:
+            day, line = _record_line(event)
+            if day != previous_day:
+                if previous_day is not None:
+                    sys.stdout.write("\n")
+                sys.stdout.write(f"{day}\n")
+                previous_day = day
+            sys.stdout.write(f"{line}\n")
+
+
+def _record_pages(
+    client: MomentApiClient,
+    *,
+    project_id: Optional[int],
+    campaign_slug: Optional[str],
+    limit: Optional[int],
+    all_pages: bool,
+    since: Optional[str],
+    kinds: Optional[list[str]],
+    actor: Optional[str],
+) -> list[dict]:
+    pages: list[dict] = []
+    after: Optional[str] = None
+    while True:
+        page = client.get_record(
+            project_id=project_id,
+            campaign_slug=campaign_slug,
+            limit=limit,
+            after=after,
+            kinds=kinds,
+            actor=actor,
+            since=since,
+        )
+        pages.append(page)
+        if not all_pages or not page.get("nextCursor"):
+            return pages
+        next_after = page.get("nextCursor")
+        if not isinstance(next_after, str) or next_after == after:
+            return pages
+        after = next_after
+
+
+def _record_scope(project: Optional[str], campaign_slug: Optional[str]) -> Optional[int]:
+    """The project whose record to read; None when a campaign was named instead."""
+    if project and campaign_slug:
+        raise typer.BadParameter("Name a project or a campaign, not both.")
+    if campaign_slug:
+        return None
+    return _project_arg(project)
+
+
+@app.command("record")
+def record(
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Project id or alias (default: -p, else the repo binding)."),
+    campaign_slug: Optional[str] = typer.Option(None, "--campaign", help="Campaign slug, instead of a project."),
+    limit: Optional[int] = typer.Option(None, "--limit", min=1, help="Events per page."),
+    all_pages: bool = typer.Option(False, "--all", help="Follow nextCursor through the full record."),
+    since: Optional[str] = typer.Option(None, "--since", help="Only events at or after this ISO instant."),
+    kinds: Optional[list[str]] = typer.Option(None, "--kind", help="Filter by event kind; repeatable."),
+    actor: Optional[str] = typer.Option(None, "--actor", help="Filter by actor: human or agent."),
+) -> None:
+    """Read a project or campaign record, newest first."""
+    try:
+        if actor not in (None, "human", "agent"):
+            raise typer.BadParameter("--actor must be human or agent.")
+        project_id = _record_scope(project, campaign_slug)
+        pages = _record_pages(
+            _get_client(),
+            project_id=project_id,
+            campaign_slug=campaign_slug,
+            limit=limit,
+            all_pages=all_pages,
+            since=since,
+            kinds=kinds,
+            actor=actor,
+        )
+        if _state.get("json"):
+            print_json(pages[0] if len(pages) == 1 else {"pages": pages})
+            return
+        _render_record_pages(pages)
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@app.command("watch")
+def watch(
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Project id or alias (default: -p, else the repo binding)."),
+    campaign_slug: Optional[str] = typer.Option(None, "--campaign", help="Campaign slug, instead of a project."),
+    every: int = typer.Option(30, "--every", min=1, help="Polling interval in seconds."),
+    limit: int = typer.Option(50, "--limit", min=1, help="Events per poll."),
+) -> None:
+    """Poll a record and print events as they arrive. Runs until interrupted; not for agent sessions."""
+    try:
+        project_id = _record_scope(project, campaign_slug)
+    except Exception as exc:
+        _handle_error(exc)
+        return
+    client = _get_client()
+    # `latestCursor` is the forward cursor. Passing it back as `before` returns
+    # only events that arrived since the previous poll; `after` is exclusively
+    # the backwards/older-page cursor used by `moment record --all`.
+    before: Optional[str] = None
+    try:
+        while True:
+            page = client.get_record(
+                project_id=project_id,
+                campaign_slug=campaign_slug,
+                limit=limit,
+                after=None,
+                before=before,
+            )
+            events = page.get("items") or page.get("events") or []
+            latest = page.get("latestCursor")
+            if isinstance(latest, str) and latest:
+                before = latest
+            if events:
+                _render_record_pages([{**page, "items": list(reversed(events))}])
+            time.sleep(every)
+    except KeyboardInterrupt:
+        return
+    except Exception as exc:
+        _handle_error(exc)
+
+
+def _citation_parts(kind: str, identifier: str, client: MomentApiClient) -> tuple[str, str, str]:
+    if kind == "project":
+        project_id = int(identifier)
+        result = client.get_project_context(project_id)
+        title = str((result.get("project") or {}).get("title") or f"Project {project_id}")
+        url = f"{client.config.api_url}/projects/{project_id}"
+        key = f"moment_project_{project_id}"
+    elif kind == "campaign":
+        result = client.get_agent_campaign(identifier)
+        campaign = result.get("campaign") or result
+        title = str(campaign.get("title") or identifier)
+        url = f"{client.config.api_url}/campaigns/{identifier}"
+        key = f"moment_campaign_{identifier}"
+    else:
+        signal_id = _claim_id(identifier)
+        result = client.get_claim_state(signal_id)
+        claim = result.get("claim") or result.get("signal") or result
+        title = str(claim.get("content") or claim.get("title") or f"Claim {identifier}")
+        public_id = claim.get("publicId") or identifier
+        url = f"{client.config.api_url}/claims/{public_id}"
+        key = f"moment_claim_{signal_id}"
+    return title, url, key
+
+
+@app.command("cite")
+def cite(
+    kind: str = typer.Argument(help="One of project, campaign, or claim."),
+    identifier: str = typer.Argument(help="Project id, campaign slug, or claim URN/id."),
+    bibtex: bool = typer.Option(False, "--bibtex", help="Print the BibTeX citation."),
+) -> None:
+    """Print the stable Moment citation for a project, campaign, or claim."""
+    kind = kind.lower()
+    try:
+        if kind not in {"project", "campaign", "claim"}:
+            raise typer.BadParameter("Kind must be project, campaign, or claim.")
+        client = _get_client()
+        title, url, key = _citation_parts(kind, identifier, client)
+        accessed = datetime.now(timezone.utc).date().isoformat()
+        text = f"{title}. OSI — recorded on Moment. {url}"
+        bib = (
+            f"@misc{{{key},\n"
+            f"  title = {{{title}}},\n"
+            "  howpublished = {OSI — recorded on Moment},\n"
+            f"  url = {{{url}}},\n"
+            f"  note = {{Accessed {accessed}}}\n"
+            "}"
+        )
+        if _state.get("json"):
+            print_json({"title": title, "url": url, "key": key, "text": text, "bibtex": bib})
+        else:
+            sys.stdout.write((bib if bibtex else text) + "\n")
     except Exception as exc:
         _handle_error(exc)
 
@@ -814,86 +2035,80 @@ def backlinks(
         _handle_error(exc)
 
 
-@app.command("page-read")
-def page_read(
-    slug: str = typer.Argument(help="Page slug (from orient's read order, gather, or the brief)."),
-) -> None:
-    """Read one page in full from the bound project (--project / .moment.json). Same as `project page-read` without the id."""
-    try:
-        client = _get_client()
-        pid = _resolve_project_id()
-        result = client.read_page(pid, slug)
-        if _state.get("json"):
-            print_json(result)
-            return
-        render_page(result)
-    except Exception as exc:
-        _handle_error(exc)
-
-
-@app.command("page")
-def page(
-    title: str = typer.Option(..., "--title"),
-    body: Optional[str] = typer.Option(None, "--body", help="Inline markdown body (pass '-' to read stdin). Alternative to --body-file."),
-    body_file: Optional[str] = typer.Option(None, "--body-file", help="Path to a markdown file for the page body."),
-    slug: Optional[str] = typer.Option(None, "--slug", help="Stable slug to update an existing page."),
-    icon: Optional[str] = typer.Option(None, "--icon"),
-    pinned: bool = typer.Option(False, "--pinned", help="Must-read: top of the human nav and pulled in full into every agent's orient."),
-    role: Optional[str] = typer.Option(None, "--role", help="BRIEF|SPEC|PLAN|DECISION|REPORT|REFERENCE|NOTE (inferred from slug/title when omitted)."),
-) -> None:
-    """Add or update a page on the bound project (--project / .moment.json). Same as `project page` without the id."""
-    try:
-        _get_client()  # populate _state['_config'] so the binding resolves
-        pid = _resolve_project_id()
-    except Exception as exc:
-        _handle_error(exc)
-        return
-    _upsert_page(
-        pid, title=title, body=body, body_file=body_file,
-        slug=slug, icon=icon, pinned=pinned, role=role,
-    )
-
-
 @app.command("log")
+@project_app.command("log")
 def log(
-    note: Optional[str] = typer.Option(None, "--note", help="What you did; the next step; what to watch."),
-    note_file: Optional[str] = typer.Option(None, "--note-file", help="Read the note from a file."),
-    next_step: Optional[str] = typer.Option(None, "--next", help="The next step for the following session."),
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
+    note: Optional[str] = typer.Option(None, "--note", help="What changed, what you verified, what to watch. `-` reads stdin."),
+    note_file: Optional[str] = typer.Option(None, "--note-file", help="Read the note from a file (`-` for stdin)."),
+    next_step: Optional[str] = typer.Option(None, "--next", "--next-step", help="The single next concrete step for the following session."),
     task: Optional[int] = typer.Option(None, "--task", help="Task ID this close-out followed."),
-    works_now: Optional[str] = typer.Option(None, "--works-now", help="Refresh handoff: what works now."),
-    in_progress: Optional[str] = typer.Option(None, "--in-progress", help="Refresh handoff: in progress."),
-    blocked: Optional[str] = typer.Option(None, "--blocked", help="Refresh handoff: blocked / broken."),
-    watch_out: Optional[str] = typer.Option(None, "--watch-out", help="Refresh handoff: watch out for."),
+    works_now: Optional[str] = typer.Option(None, "--works-now", help="Handoff: what works now (verified)."),
+    in_progress: Optional[str] = typer.Option(None, "--in-progress", help="Handoff: work in flight."),
+    blocked: Optional[str] = typer.Option(None, "--blocked", help="Handoff: what is blocked, and on what."),
+    watch_out: Optional[str] = typer.Option(None, "--watch-out", help="Handoff: the trap or friction the next agent should avoid."),
+    tried_and_failed: Optional[list[str]] = typer.Option(None, "--tried-and-failed", help="Handoff: an approach that failed and why. Appends; repeatable."),
+    decisions: Optional[list[str]] = typer.Option(None, "--decisions", help="Handoff: a decision made. Appends; repeatable."),
+    open_questions: Optional[list[str]] = typer.Option(None, "--open-questions", help="Handoff: a question still open. Appends; repeatable."),
+    read_first: Optional[list[str]] = typer.Option(None, "--read-first", help="Handoff: something to read first, as 'LABEL' or 'LABEL :: why'. Repeatable; replaces the whole list."),
     no_tree: bool = typer.Option(False, "--no-tree", help="Do not append the working-tree fingerprint to the note."),
     commits: Optional[str] = typer.Option(None, "--commits", help="Git range, e.g. abc123..def456 — appends a commit summary to the note."),
-    sync: bool = typer.Option(False, "--sync", help="Regenerate .continuity/ after logging."),
+    if_version: Optional[int] = typer.Option(None, "--if-version", help="Handoff version you read: refuse (and retry once) rather than overwrite a newer one."),
+    sync: bool = typer.Option(False, "--sync", hidden=True, help="Also write the optional .continuity/ snapshot."),
 ) -> None:
-    """Close out a session: log a note and optionally refresh the handoff."""
+    """Close out a session: log a note, and patch only the handoff fields you pass.
+
+    `moment log` and `moment project log` are the same command.
+    """
     try:
         if bool(note) == bool(note_file):
-            raise typer.BadParameter("Provide exactly one of --note or --note-file.")
-        note_text = note if note else _read_file(note_file)  # type: ignore[arg-type]
+            raise typer.BadParameter("Provide exactly one of --note or --note-file (either accepts - for stdin).")
+        note_text = _read_file("-") if note == "-" else (note if note else _read_file(note_file))  # type: ignore[arg-type]
+        if not note_text:
+            raise typer.BadParameter("The note is empty.")
+        if len(note_text) > NOTE_MAX_CHARS:
+            raise typer.BadParameter(
+                f"The note is {len(note_text)} characters; the server accepts {NOTE_MAX_CHARS}. "
+                "Put the detail in a page (`moment page --title … --body -`) and summarize it here."
+            )
         # Append git truth to the NOTE only (never the handoff fields): a mechanical
         # working-tree fingerprint (unless --no-tree) and, when asked, a commit summary.
+        # Each is dropped rather than letting it push the note past the server's limit.
+        appendices = []
         if not no_tree:
-            fingerprint = close_out.tree_fingerprint()
-            if fingerprint:
-                note_text = f"{note_text}\n\n{fingerprint}"
+            appendices.append(close_out.tree_fingerprint())
         if commits:
-            commit_block = close_out.commits_summary(commits)
-            if commit_block:
-                note_text = f"{note_text}\n\n{commit_block}"
+            appendices.append(close_out.commits_summary(commits))
+        for block in appendices:
+            if block and len(note_text) + 2 + len(block) <= NOTE_MAX_CHARS:
+                note_text = f"{note_text}\n\n{block}"
         payload = _build_session_payload(
             note_text, next_step, task,
             works_now=works_now, in_progress=in_progress, blocked=blocked, watch_out=watch_out,
+            tried_and_failed="\n".join(tried_and_failed or []) or None,
+            decisions="\n".join(decisions or []) or None,
+            open_questions="\n".join(open_questions or []) or None,
+            read_first=_read_first_items(read_first),
+            if_version=if_version,
         )
         client = _get_client()
-        pid = _resolve_project_id()
-        result = client.log_session(pid, payload)
+        pid = _project_arg(project)
+        result = _log_session_with_retry(client, pid, payload)
         if _state.get("json"):
             print_json(result)
         else:
-            console.print(f"[{GLOW}]{result.get('message', 'Session note logged.')}[/]")
+            note_id = (result.get("sessionNote") or {}).get("id")
+            line = result.get("message") or "Session note logged."
+            console.print(f"[{GLOW}]{escape(line)}[/]" + (f" [dim](note #{note_id}, project #{pid})[/]" if note_id else ""))
+            # --quiet drops tips, never a failure: a dead embedding provider still says so.
+            quiet = _state.get("quiet")
+            extras = (
+                None if quiet else result.get("hint"),
+                _indexed_sentence(result) if not quiet or result.get("indexed") == "failed" else None,
+            )
+            for extra in extras:
+                if extra:
+                    console.print(f"[dim]{escape(str(extra))}[/]")
         if sync:
             _run_sync(pid, client, check=False, out=None)
     except Exception as exc:
@@ -905,7 +2120,7 @@ def sync(
     check: bool = typer.Option(False, "--check", help="Render and diff vs disk; exit nonzero on drift (no writes)."),
     out: Optional[str] = typer.Option(None, "--out", help="Target dir (default: <repo>/.continuity)."),
 ) -> None:
-    """Regenerate the .continuity/ mirror from Moment (Moment is the source of truth)."""
+    """Optional: write a local .continuity/ snapshot of the brief. Moment itself stays the source of truth."""
     try:
         client = _get_client()
         pid = _resolve_project_id()
@@ -917,8 +2132,6 @@ def sync(
 @app.command("doctor")
 def doctor() -> None:
     """Diagnose the binding in one screen — config, key, reachability, auth, project, MCP drift."""
-    from rich.markup import escape
-
     results = doctor_mod.run_doctor(
         config_path=_state.get("config"),
         api_url_override=_state.get("api_url"),
@@ -1358,7 +2571,7 @@ def _preview_ingest_envelope(envelope: dict) -> dict:
 @app.command("ingest")
 def ingest(
     file: Optional[str] = typer.Argument(None, help="Text or PDF file to ingest (for example, a meeting transcript or a paper PDF)."),
-    project: Optional[int] = typer.Option(None, "--project", "-p", help="Project ID (overrides MOMENT_PROJECT_ID and .moment.json)."),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Project id or alias (default: MOMENT_PROJECT, else .moment.json)."),
     source: str = typer.Option("transcript", "--source", help="Envelope source (default: transcript)."),
     title: Optional[str] = typer.Option(None, "--title", help="Envelope title (default: file name)."),
     participant: list[str] = typer.Option(None, "--participant", help="Participant name (repeatable)."),
@@ -2003,7 +3216,7 @@ def _collect_github_issue_envelopes(repo: str, since_iso: str, include_open: boo
 @github_app.command("sync")
 def github_sync(
     repo: Optional[str] = typer.Option(None, "--repo", help="owner/repo (default: the git origin)."),
-    project: Optional[int] = typer.Option(None, "--project", "-p", help="Project ID."),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Project id or alias (default: MOMENT_PROJECT, else .moment.json)."),
     since: str = typer.Option("30d", "--since", help="Window, e.g. 14d / 2026-06-01 (default 30d)."),
     prs_only: bool = typer.Option(False, "--prs-only"),
     issues_only: bool = typer.Option(False, "--issues-only"),
@@ -2265,6 +3478,7 @@ def _write_repo_binding(
     data = _read_repo_binding(root)
     had_key = isinstance(data.get("apiKey"), str)
     data.pop("apiKey", None)  # never store a secret in the committed binding file
+    data.pop("apiKeySource", None)  # provenance belongs beside the key in HOME
 
     projects = data.get("projects")
     if not isinstance(projects, dict):
@@ -2408,7 +3622,8 @@ def _watermark_base_sha(source_ref: Optional[str]) -> Optional[str]:
     if ref == "worktree":
         return None
     sha = ref.split("..")[-1].strip()
-    return sha or None
+    # The watermark comes from the server and lands in a git argv: a hex sha only.
+    return sha if re.fullmatch(r"[0-9a-fA-F]{7,40}", sha) else None
 
 
 def _collect_commits(root: Path, base_sha: Optional[str], since: Optional[str], max_commits: int) -> list:
@@ -2424,7 +3639,7 @@ def _collect_commits(root: Path, base_sha: Optional[str], since: Optional[str], 
     if not base_sha:
         args = ["log", "--reverse", fmt, "-n", str(max_commits)]
         if since:
-            args += ["--since", since]
+            args.append(f"--since={since}")
         raw = _git(args, root)
     commits = []
     for line in raw.splitlines():
@@ -2448,7 +3663,7 @@ def capture(
     let the Claude Code Stop hook (`moment onboard` / `moment init`) run it at the end of a session.
     """
     try:
-        client = _get_client()
+        client = _get_client(hook_mode=hook)
         pid = _resolve_project_id()
         root = _repo_root()
         repo = _repo_slug(root)
@@ -2482,6 +3697,8 @@ def capture(
             pass
 
         if not commits and not uncommitted:
+            if hook:
+                return
             if _state.get("json"):
                 print_json({"skipped": True, "reason": "Nothing to capture."})
             elif not _state.get("quiet"):
@@ -2515,9 +3732,9 @@ def capture(
             return
 
         result = client.post_capture(pid, payload)
-        if _state.get("json"):
+        if _state.get("json") and not hook:
             print_json(result)
-        elif not _state.get("quiet"):
+        elif not _state.get("quiet") and not hook:
             if result.get("skipped"):
                 console.print(f"[dim]{result.get('reason', 'Skipped.')}[/dim]")
             else:
@@ -2525,7 +3742,10 @@ def capture(
     except Exception as exc:
         if hook:
             # A Stop hook must never break the session it closes out.
-            print(f"moment capture (hook): {exc}", file=sys.stderr)
+            if isinstance(exc, ApiError) and exc.status not in (401, 429):
+                print(f"moment capture (hook): {exc}", file=sys.stderr)
+            elif not isinstance(exc, (ApiError, httpx.RequestError, httpx.TimeoutException)):
+                print(f"moment capture (hook): {exc}", file=sys.stderr)
             return
         _handle_error(exc)
 
@@ -2536,7 +3756,7 @@ CLAUDE_END = "<!-- moment:autostart:end -->"
 
 @app.command("init")
 def init(
-    project: int = typer.Option(..., "--project", "-p", help="Project ID to bind this repo to."),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Project id (or an alias already in .moment.json) to attach. Required."),
     alias: Optional[str] = typer.Option(None, "--alias", help="Memorable local name (default: project-N)."),
     title: Optional[str] = typer.Option(None, "--title", help="Human-readable project title used for matching."),
     description: Optional[str] = typer.Option(None, "--description", help="Short note describing when this project is relevant."),
@@ -2548,18 +3768,36 @@ def init(
         "--rebind",
         help="Allow --alias to be repointed when it already names a different project (otherwise that's an error).",
     ),
-    api_url: Optional[str] = typer.Option(None, "--api-url", help="API URL to bind (default: resolved / localhost)."),
+    api_url: Optional[str] = typer.Option(None, "--api-url", help="API URL to bind (default: https://scientificintelligence.org)."),
     no_claude: bool = typer.Option(False, "--no-claude", help="Don't touch CLAUDE.md."),
     no_hooks: bool = typer.Option(False, "--no-hooks", help="Don't install capture hooks for detected runtimes (ambient capture)."),
 ) -> None:
-    """Attach this repo to a Moment project. Repeat to attach more than one."""
+    """Attach this repo to a Moment project (writes .moment.json). Repeat to attach more than one.
+
+    Local routing only: nothing on the server changes. Agents should pass
+    --no-claude --no-hooks unless the user asked for startup instructions or
+    ambient capture.
+    """
+    try:
+        selector = project or _state.get("project")
+        if not selector:
+            raise typer.BadParameter("moment init needs the project: -p <project id>.")
+        project_id = _project_arg(str(selector))
+    except Exception as exc:
+        _handle_error(exc)
+        return
+    if api_url:
+        _state["api_url"] = api_url
+    json_mode = bool(_state.get("json"))
+    say = (lambda _message: None) if json_mode else console.print
+    _mint_agent_key_if_needed()
     root = _repo_root()
     url = _repo_binding_api_url(root, api_url)
-    binding_alias = _binding_alias(alias or title, project)
+    binding_alias = _binding_alias(alias or title, project_id)
     legacy_before = _repo_bindings(root).legacy_project_id
     moment_json, had_key = _write_repo_binding(
         root,
-        project,
+        project_id,
         url,
         alias=binding_alias,
         title=title,
@@ -2569,32 +3807,53 @@ def init(
         make_default=default,
         rebind=rebind,
     )
-    if legacy_before is not None and legacy_before != project:
-        console.print(
+    # Naming the server on the command line is the person's choice of it.
+    newly_trusted = api_origin(url) if api_url and trust_api_url(url) else None
+    if newly_trusted:
+        say(f"[{GLOW}]Trusted[/] {newly_trusted} for your credentials [dim](trustedApiUrls in ~/.moment.json)[/]")
+    migrated = legacy_before is not None and legacy_before != project_id
+    if migrated:
+        say(
             f"[{GLOW}]Migrated[/] legacy projectId #{legacy_before} → alias "
             f"{_binding_alias(None, legacy_before)} [dim](still the repository default unless --default)[/]"
         )
-    console.print(f"[{GLOW}]Attached[/] {binding_alias} → project #{project} in {moment_json}")
+    say(f"[{GLOW}]Attached[/] {binding_alias} → project #{project_id} in {moment_json}")
     if had_key:
-        console.print(
+        say(
             f"[{ROSE}]Removed apiKey from {moment_json.name}[/] — keep keys in "
             "~/.moment.json or $MOMENT_API_KEY (this file is committed)."
         )
 
+    claude_path = None
     if not no_claude:
-        path = root / "CLAUDE.md"
-        _upsert_claude_block(path, _claude_block())
-        console.print(f"[{GLOW}]Updated[/] {path} [dim](autostart block)[/]")
+        claude_path = root / "CLAUDE.md"
+        _upsert_claude_block(claude_path, _claude_block())
+        say(f"[{GLOW}]Updated[/] {claude_path} [dim](autostart block)[/]")
 
-    if not no_hooks:
-        _install_capture_hooks()
+    hook_results = None if no_hooks else _install_capture_hooks(quiet=json_mode)
 
-    console.print(
-        "[dim]Next: `moment projects` to inspect matching · `moment orient --for \"your task\"` to read the likely brief[/]"
+    if json_mode:
+        bindings = _repo_bindings(root)
+        print_json({
+            "alias": binding_alias,
+            "projectId": project_id,
+            "config": str(moment_json),
+            "apiUrl": url,
+            "trustedApiUrl": newly_trusted,
+            "default": bindings.default_alias == binding_alias,
+            "migratedLegacyProjectId": legacy_before if migrated else None,
+            "removedApiKey": had_key,
+            "claudeMd": str(claude_path) if claude_path else None,
+            "hooks": hook_results,
+        })
+        return
+    say(
+        "[dim]Next: `moment project list --for \"your task\"` to check routing · "
+        "`moment orient --for \"your task\"` to read the likely brief[/]"
     )
 
 
-def _install_capture_hooks() -> list[dict]:
+def _install_capture_hooks(*, quiet: bool = False) -> list[dict]:
     """Install ambient capture for every detected runtime; log per-runtime in rich style.
 
     Returns the per-runtime result dicts (also used to surface the summary). Each entry:
@@ -2610,6 +3869,8 @@ def _install_capture_hooks() -> list[dict]:
         entry = {"runtime": rt.key, "label": rt.label, "detected": True}
         entry.update(outcome)
         results.append(entry)
+        if quiet:
+            continue
         status = outcome.get("status", "failed")
         if status in ("added", "updated"):
             detail = rt.describe()
@@ -2642,20 +3903,18 @@ def _repo_root() -> Path:
 def _claude_block() -> str:
     return (
         f"{CLAUDE_START}\n"
-        f"## Moment context\n\n"
-        f"This repo is attached to one or more Moment projects. Moment is the single source of truth "
-        f"for context; `.continuity/` is a generated, read-only mirror — never hand-edit it.\n\n"
-        f"**Orient first** (before editing): run `moment orient --for \"<the current task>\"`. "
-        f"The local binding ranks aliases, path scopes, keywords, and the repository default; "
-        f"read the selected handoff → next step → watch-out.\n\n"
-        f'**Close out** (end of session): `moment log --note "…" --next "…"` — refresh the '
-        f"handoff with `--works-now/--in-progress/--blocked/--watch-out` as needed, then "
-        f"`moment sync` to regenerate `.continuity/` (or `moment log --sync` to do both).\n\n"
-        f"**Ambient capture**: a Claude Code Stop hook runs `moment capture --hook` so git "
-        f"drift is logged automatically — a deliberate `moment log` close-out is still better "
-        f"when you have judgment to record.\n\n"
-        f"Bindings live in `.moment.json` (`defaultProject`, `projects`, `apiUrl`). The API key comes from the "
-        f"environment / `.mcp.json` — never commit a key in `.moment.json`.\n"
+        "## Moment context\n\n"
+        "This repo is attached to one or more Moment projects (see `.moment.json`). Moment holds "
+        "the shared project context: the handoff, pages, resources, and session notes.\n\n"
+        "**Orient** before substantial work: `moment orient --for \"<the task>\"` prints the next step "
+        "and summary (`--complete` for everything). "
+        "Read a page the brief names with `moment page-read <slug>`; search with `moment find \"<question>\"`.\n\n"
+        "**Close out** after substantive work: `moment log --note \"<what changed and what you verified>\" "
+        "--next \"<the next concrete step>\"`, adding `--works-now`, `--in-progress`, `--blocked`, or "
+        "`--watch-out` only for handoff fields that changed.\n\n"
+        "A Stop hook may run `moment capture --hook` to log git drift automatically; a deliberate "
+        "`moment log` is still better when you have judgment to record. `moment commands` lists every "
+        "command and option. Keep API keys in `~/.moment.json` or `MOMENT_API_KEY`, never in `.moment.json`.\n"
         f"{CLAUDE_END}"
     )
 
@@ -2954,14 +4213,14 @@ def _print_onboard_summary(
 
 @app.command("onboard")
 def onboard(
-    project: Optional[int] = typer.Option(None, "--project", "-p", help="Bind to an existing project instead of creating one."),
+    project_ref: Optional[str] = typer.Option(None, "--project", "-p", help="Bind to an existing project (id or alias) instead of creating one."),
     alias: Optional[str] = typer.Option(None, "--alias", help="Local alias when attaching an existing project."),
     title: Optional[str] = typer.Option(None, "--title", help="Project title when creating/bootstrapping."),
     description: Optional[str] = typer.Option(None, "--description", help="Project description when creating/bootstrapping."),
     description_file: Optional[str] = typer.Option(None, "--description-file", help="Read project description from a file."),
     domain: Optional[str] = typer.Option(None, "--domain", "-d", help="Research domain (default server value)."),
     visibility: Optional[str] = typer.Option(None, "--visibility", help="PUBLIC or PRIVATE (default server value)."),
-    api_url: Optional[str] = typer.Option(None, "--api-url", help="API URL to bind (default: resolved / localhost)."),
+    api_url: Optional[str] = typer.Option(None, "--api-url", help="API URL to bind (default: https://scientificintelligence.org)."),
     no_claude: bool = typer.Option(False, "--no-claude", help="Don't touch CLAUDE.md."),
     no_hooks: bool = typer.Option(False, "--no-hooks", help="Don't install capture hooks for detected runtimes."),
     default: bool = typer.Option(False, "--default", help="Make an attached existing project the repository fallback."),
@@ -2973,10 +4232,12 @@ def onboard(
     yes: bool = typer.Option(False, "--yes", "-y", help="Accept defaults and do not prompt."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the onboarding plan without network calls or writes."),
 ) -> None:
-    """Guided first-run: bind a repo, seed its brief, and install ambient capture."""
+    """Guided first run: sign in if needed, bind this repo, seed its brief, and install ambient capture."""
     try:
         if api_url:
             _state["api_url"] = api_url
+        selector = project_ref or _state.get("project")
+        project = _project_arg(str(selector)) if selector else None
         root = _repo_root()
         repo = _repo_info(root)
         bound_project = _bound_project_id(root)
@@ -3032,6 +4293,11 @@ def onboard(
                 return
             _print_onboard_plan(plan)
             return
+
+        if api_url and trust_api_url(api_url) and not _state.get("json"):
+            console.print(f"[{GLOW}]Trusted[/] {api_origin(api_url)} for your credentials [dim](trustedApiUrls in ~/.moment.json)[/]")
+        _sign_in_if_needed()
+        _mint_agent_key_if_needed()
 
         prompt = not yes and sys.stdin.isatty()
         bootstrap_result: Optional[dict] = None
@@ -3121,7 +4387,7 @@ def onboard(
 
         hook_results: list[dict] = []
         if not no_hooks:
-            hook_results = _install_capture_hooks()
+            hook_results = _install_capture_hooks(quiet=bool(_state.get("json")))
 
         if _state.get("json"):
             print_json({
@@ -3148,9 +4414,9 @@ def onboard(
 
 @project_app.command("contribute")
 def project_contribute(
-    project_id: int = typer.Argument(help="Project ID."),
-    type: str = typer.Option(..., "--type", "-t", help="Contribution type: message, hypothesis, observation, etc."),
-    content_file: str = typer.Option(..., "--content-file", help="Path to content file."),
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
+    type: str = typer.Option(..., "--type", "-t", help="message | observation | hypothesis | question | finding | suggestion."),
+    content_file: str = typer.Option(..., "--content-file", help="Path to the content (`-` for stdin)."),
     confidence: Optional[float] = typer.Option(None, "--confidence", help="Confidence score (0-1)."),
     discussion: Optional[int] = typer.Option(None, "--discussion", help="Discussion ID (required for message type)."),
     reasoning_file: Optional[str] = typer.Option(None, "--reasoning-file", help="Path to reasoning file (for messages)."),
@@ -3158,8 +4424,9 @@ def project_contribute(
     parent: Optional[int] = typer.Option(None, "--parent", help="Parent message ID (for replies)."),
     source_file: Optional[str] = typer.Option(None, "--source-file", help="Path to source data JSON file."),
 ) -> None:
-    """Post a message or insight to a project."""
+    """Post a message or signal to a project."""
     try:
+        project_id = _project_arg(project)
         client = _get_client()
         content = _read_file(content_file)
         normalized_type = type.strip().lower()
@@ -3186,7 +4453,7 @@ def project_contribute(
                 payload["confidence"] = confidence
             if evidence_file:
                 payload["supportingEvidence"] = _read_file(evidence_file)
-            result = client.create_insight(project_id, payload)
+            result = client.create_signal(project_id, payload)
 
         if _state.get("json"):
             print_json(result)
@@ -3310,16 +4577,19 @@ def project_create(
 
 @project_app.command("propose")
 def project_propose(
-    project_id: int = typer.Argument(help="Project ID."),
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
     title: str = typer.Option(..., "--title", help="Task title."),
-    description_file: str = typer.Option(..., "--description-file", help="Path to description file."),
+    description_file: str = typer.Option(..., "--description-file", help="Path to description file (`-` for stdin)."),
     type: str = typer.Option(..., "--type", "-t", help="Work type (e.g. LITERATURE_REVIEW, CODE_CONTRIBUTION)."),
-    instructions_file: str = typer.Option(..., "--instructions-file", help="Path to instructions file (min 10 chars)."),
+    instructions_file: str = typer.Option(..., "--instructions-file", help="Path to instructions file, min 10 chars (`-` for stdin)."),
     difficulty: Optional[str] = typer.Option(None, "--difficulty", "-d", help="Difficulty (TRIVIAL, EASY, MEDIUM, HARD, EXPERT)."),
-    base_credits: Optional[int] = typer.Option(None, "--credits", help="Credits awarded (1-25)."),
+    base_credits: Optional[int] = typer.Option(None, "--credits", help="Credits awarded (1-25, default 10)."),
 ) -> None:
-    """Propose a new task for a project."""
+    """Propose a task: OPEN if the project auto-approves agent tasks, else PROPOSED for review."""
     try:
+        if description_file == "-" and instructions_file == "-":
+            raise typer.BadParameter("Only one of --description-file and --instructions-file can read stdin.")
+        project_id = _project_arg(project)
         client = _get_client()
         description = _read_file(description_file)
         instructions = _read_file(instructions_file)
@@ -3342,28 +4612,61 @@ def project_propose(
         _handle_error(exc)
 
 
-# --- Claim ledger (falsifiers) ---
+# --- Claim ledger -------------------------------------------------------------
 
 
-@claim_app.command("falsifiers")
-def claim_falsifiers(
-    signal_id: int = typer.Argument(help="Signal ID of the claim."),
+@claim_app.command("show")
+def claim_show(
+    claim: str = typer.Argument(help="Claim id or Moment claim URN."),
 ) -> None:
-    """List what would change our mind about a claim — open falsifiers first."""
+    """Show the current state of a claim."""
     try:
-        client = _get_client()
-        result = client.get_claim_falsifiers(signal_id)
+        signal_id = _claim_id(claim)
+        result = _get_client().get_claim_state(signal_id)
         if _state.get("json"):
             print_json(result)
             return
-        render_falsifiers(result, signal_id)
+        state = result.get("derivedState") or result.get("state") or result
+        signal = result.get("claim") or result.get("signal") or {}
+        console.print(f"Claim #{signal_id}: {signal.get('content') or signal.get('title') or 'unnamed'}")
+        if state.get("epistemicStatus"):
+            console.print(f"Status: {state['epistemicStatus']}")
+        summary = state.get("summary") or result.get("summary") or {}
+        if summary:
+            console.print(" · ".join(f"{key}: {value}" for key, value in summary.items()))
     except Exception as exc:
         _handle_error(exc)
 
 
-@claim_app.command("add-falsifier")
+@claim_app.command("evidence")
+def claim_evidence(
+    claim: str = typer.Argument(help="Claim id or Moment claim URN."),
+    stance: Optional[str] = typer.Option(None, "--stance", help="for, against, or all."),
+) -> None:
+    """List evidence linked to a claim."""
+    if stance not in (None, "for", "against", "all"):
+        raise typer.BadParameter("--stance must be for, against, or all.")
+    try:
+        signal_id = _claim_id(claim)
+        result = _get_client().find_claim_evidence(signal_id, stance)
+        if _state.get("json"):
+            print_json(result)
+            return
+        items = result.get("evidence") or []
+        if not items:
+            console.print(f"No evidence linked to claim #{signal_id}.")
+            return
+        for item in items:
+            other = f"{item.get('otherType', 'NODE')}:{item.get('otherId', '?')}"
+            title = f" — {item['title']}" if item.get("title") else ""
+            console.print(f"{item.get('kind', 'EVIDENCE')} · {other}{title}")
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@claim_app.command("falsify")
 def claim_add_falsifier(
-    signal_id: int = typer.Argument(help="Signal ID of the claim this falsifier tests."),
+    claim: str = typer.Argument(help="Claim id or Moment claim URN."),
     title: str = typer.Option(..., "--title", help="One sentence naming the result that would change our mind (≤200 chars)."),
     body: Optional[str] = typer.Option(None, "--body", help="Optional detail: the test, the threshold, the conditions."),
     body_file: Optional[str] = typer.Option(None, "--body-file", help="Read the detail from a file instead of --body."),
@@ -3371,12 +4674,216 @@ def claim_add_falsifier(
     """Record a falsifier on a claim (needs EDITOR access on the claim's project)."""
     try:
         client = _get_client()
+        signal_id = _claim_id(claim)
         detail = _read_file(body_file) if body_file else body
         result = client.add_claim_falsifier(signal_id, title, detail)
         if _state.get("json"):
             print_json(result)
             return
         render_falsifier_created(result, signal_id)
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@claim_app.command("reproduce")
+def claim_reproduce(
+    claim: str = typer.Argument(help="Claim id or Moment claim URN."),
+    target_id: int = typer.Option(..., "--target-id", help="Result node id."),
+    target_type: str = typer.Option("SUBMISSION", "--target-type", help="SUBMISSION, RESOURCE, or SIGNAL."),
+    note: Optional[str] = typer.Option(None, "--note", help="Optional note for the evidence-link proposal."),
+) -> None:
+    """Propose that a submission, resource, or signal reproduces a claim."""
+    target_type = target_type.upper()
+    if target_type not in {"SUBMISSION", "RESOURCE", "SIGNAL"}:
+        raise typer.BadParameter("--target-type must be SUBMISSION, RESOURCE, or SIGNAL.")
+    try:
+        signal_id = _claim_id(claim)
+        result = _get_client().propose_evidence_link(signal_id, {
+            "kind": "REPRODUCES",
+            "targetType": target_type,
+            "targetId": target_id,
+            **({"note": note} if note else {}),
+        })
+        if _state.get("json"):
+            print_json(result)
+            return
+        proposal = result.get("proposal") or {}
+        console.print(
+            f"REPRODUCES proposal #{proposal.get('id', '?')} queued for claim #{signal_id} "
+            f"from {target_type}:{target_id}."
+        )
+    except Exception as exc:
+        _handle_error(exc)
+
+
+# --- Experiments -------------------------------------------------------------
+
+
+@experiment_app.command("state")
+def experiment_state(
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
+) -> None:
+    """Show the current experiment loop for a project."""
+    try:
+        project_id = _project_arg(project)
+        result = _get_client().get_experiment_state(project_id)
+        if _state.get("json"):
+            print_json(result)
+            return
+        experiment = result.get("experiment") or result
+        console.print(f"Experiment for project #{project_id}")
+        for key in ("metricName", "metricDirection", "bestMetric", "evalCommand"):
+            if experiment.get(key) is not None:
+                console.print(f"{key}: {experiment[key]}")
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@experiment_app.command("submit")
+def experiment_submit(
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
+    metric_value: float = typer.Option(..., "--metric-value"),
+    accepted: Optional[bool] = typer.Option(None, "--accepted/--rejected"),
+    commit_sha: Optional[str] = typer.Option(None, "--commit-sha"),
+    parent_commit_sha: Optional[str] = typer.Option(None, "--parent-commit-sha"),
+    branch_name: Optional[str] = typer.Option(None, "--branch-name"),
+    pr_url: Optional[str] = typer.Option(None, "--pr-url"),
+    diff: Optional[str] = typer.Option(None, "--diff"),
+    description: Optional[str] = typer.Option(None, "--description"),
+    hypothesis: Optional[str] = typer.Option(None, "--hypothesis"),
+    eval_output: Optional[str] = typer.Option(None, "--eval-output"),
+    execution_time_ms: Optional[int] = typer.Option(None, "--execution-time-ms"),
+    tokens_used: Optional[int] = typer.Option(None, "--tokens-used"),
+) -> None:
+    """Submit one locally evaluated experiment iteration."""
+    try:
+        if accepted is None:
+            raise typer.BadParameter("Choose exactly one of --accepted or --rejected.")
+        project_id = _project_arg(project)
+    except Exception as exc:
+        _handle_error(exc)
+        return
+    payload = {
+        "metricValue": metric_value,
+        "accepted": accepted,
+        **({"commitSha": commit_sha} if commit_sha else {}),
+        **({"parentCommitSha": parent_commit_sha} if parent_commit_sha else {}),
+        **({"branchName": branch_name} if branch_name else {}),
+        **({"prUrl": pr_url} if pr_url else {}),
+        **({"diff": diff} if diff else {}),
+        **({"description": description} if description else {}),
+        **({"hypothesis": hypothesis} if hypothesis else {}),
+        **({"evalOutput": eval_output} if eval_output else {}),
+        **({"executionTimeMs": execution_time_ms} if execution_time_ms is not None else {}),
+        **({"tokensUsed": tokens_used} if tokens_used is not None else {}),
+    }
+    try:
+        result = _get_client().submit_experiment_result(project_id, payload)
+        if _state.get("json"):
+            print_json(result)
+            return
+        run = result.get("run") or result
+        console.print(
+            f"Iteration {run.get('iteration', '?')} filed for project #{project_id} "
+            f"at {metric_value}."
+        )
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@experiment_app.command("leaderboard")
+def experiment_leaderboard(
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
+) -> None:
+    """Show experiment runs ordered by the configured metric."""
+    try:
+        project_id = _project_arg(project)
+        result = _get_client().get_experiment_leaderboard(project_id)
+        if _state.get("json"):
+            print_json(result)
+            return
+        entries = result.get("runs") or []
+        if not entries:
+            console.print(f"No experiment results for project #{project_id}.")
+            return
+        for entry in entries:
+            console.print(
+                f"Iteration {entry.get('iteration', '?')} · "
+                f"{entry.get('metricValue', entry.get('metric', '?'))}"
+            )
+    except Exception as exc:
+        _handle_error(exc)
+
+
+# --- Discussions -------------------------------------------------------------
+
+
+@discussion_app.command("list")
+def discussion_list(
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
+) -> None:
+    """List discussions in a project."""
+    try:
+        project_id = _project_arg(project)
+        result = _get_client().list_discussions(project_id)
+        if _state.get("json"):
+            print_json(result)
+            return
+        discussions = result.get("recentDiscussions") or result.get("discussions") or []
+        if not discussions:
+            console.print("No discussions in this project yet.")
+            return
+        for discussion in discussions:
+            console.print(
+                f"#{discussion.get('id', '?')}  {discussion.get('title') or 'Untitled discussion'}"
+            )
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@discussion_app.command("read")
+def discussion_read(
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
+    discussion_id: Optional[int] = typer.Option(None, "--discussion", help="Discussion ID."),
+    limit: Optional[int] = typer.Option(None, "--limit"),
+) -> None:
+    """Read messages from a project discussion."""
+    try:
+        project_id = _project_arg(project)
+        result = _get_client().get_discussion_messages(project_id, discussion_id, limit)
+        if _state.get("json"):
+            print_json(result)
+            return
+        messages = result.get("messages") or []
+        for message in messages:
+            console.print(f"{message.get('id', '?')}  {message.get('content', '')}")
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@discussion_app.command("post")
+def discussion_post(
+    project: Optional[str] = typer.Argument(None, help=PROJECT_ARG_HELP, show_default=False),
+    discussion_id: int = typer.Option(..., "--discussion", help="Discussion ID."),
+    content: str = typer.Option(..., "--content", help="Message text (`-` reads stdin)."),
+    reasoning: Optional[str] = typer.Option(None, "--reasoning"),
+    parent_id: Optional[int] = typer.Option(None, "--parent"),
+) -> None:
+    """Post a message to a project discussion (visible to people: post only when asked to)."""
+    try:
+        project_id = _project_arg(project)
+        payload = {
+            "discussionId": discussion_id,
+            "content": _read_file("-") if content == "-" else content,
+            **({"reasoning": reasoning} if reasoning else {}),
+            **({"parentId": parent_id} if parent_id is not None else {}),
+        }
+        result = _get_client().post_message(project_id, payload)
+        if _state.get("json"):
+            print_json(result)
+            return
+        message = result.get("message") or result
+        console.print(f"Message #{message.get('id', '?')} posted to discussion #{discussion_id}.")
     except Exception as exc:
         _handle_error(exc)
 
@@ -3417,9 +4924,151 @@ def stats_timeline(
 # --- Top-level commands ---
 
 
+_CATALOG_SKIP_OPTIONS = frozenset({"help", "version", "install_completion", "show_completion"})
+
+
+def _catalog_type(param: object) -> str:
+    if getattr(param, "is_flag", False):
+        return "flag"
+    kind = getattr(param, "type", None)
+    choices = getattr(kind, "choices", None)
+    if choices:
+        return "|".join(str(choice) for choice in choices)
+    name = str(getattr(kind, "name", "") or "text").lower()
+    return {"integer": "int", "float": "number", "boolean": "bool"}.get(name, name)
+
+
+def _catalog_option(param: object) -> dict:
+    entry: dict = {
+        "flags": list(param.opts) + list(getattr(param, "secondary_opts", None) or []),  # type: ignore[attr-defined]
+        "type": _catalog_type(param),
+    }
+    if getattr(param, "required", False):
+        entry["required"] = True
+    if getattr(param, "multiple", False):
+        entry["repeatable"] = True
+    default = getattr(param, "default", None)
+    if isinstance(default, (str, int, float)) and not isinstance(default, bool) and default != "":
+        entry["default"] = default
+    if getattr(param, "help", None):
+        entry["help"] = param.help  # type: ignore[attr-defined]
+    return entry
+
+
+def _catalog_entry(path: list[str], command: object) -> dict:
+    arguments, options = [], []
+    for param in getattr(command, "params", None) or []:
+        if getattr(param, "hidden", False) or getattr(param, "name", None) in _CATALOG_SKIP_OPTIONS:
+            continue
+        if getattr(param, "param_type_name", "") == "argument":
+            name = getattr(param, "metavar", None) or param.name.upper()  # type: ignore[attr-defined]
+            arguments.append({
+                "name": name,
+                "required": bool(getattr(param, "required", False)),
+                **({"help": param.help} if getattr(param, "help", None) else {}),  # type: ignore[attr-defined]
+            })
+        elif getattr(param, "param_type_name", "") == "option":
+            options.append(_catalog_option(param))
+    help_text = (getattr(command, "help", None) or "").strip()
+    return {
+        "command": " ".join(path),
+        "summary": help_text.split("\n")[0].strip(),
+        "arguments": arguments,
+        "options": options,
+    }
+
+
+def _catalog_walk(group: object, path: list[str]):
+    for name, sub in sorted((getattr(group, "commands", None) or {}).items()):
+        if getattr(sub, "hidden", False):
+            continue
+        if hasattr(sub, "commands"):
+            yield from _catalog_walk(sub, path + [name])
+        else:
+            yield _catalog_entry(path + [name], sub)
+
+
+def _catalog_usage(entry: dict) -> str:
+    words = [f"moment {entry['command']}"]
+    for argument in entry["arguments"]:
+        name = argument["name"]
+        words.append(name if argument["required"] or name.startswith("[") else f"[{name}]")
+    return " ".join(words)
+
+
+# The context loop, in the order an agent meets it; everything else follows alphabetically.
+_CATALOG_START_HERE = (
+    "status", "orient", "page-read", "find", "packet", "page", "project add-resource", "log",
+)
+
+
+def _catalog_option_line(entry: dict) -> Optional[str]:
+    flags = []
+    for option in entry["options"]:
+        flag = "/".join(option["flags"])
+        if option["type"] != "flag":
+            flag += f" <{option['type']}>"
+        if option.get("required"):
+            flag += " (required)"
+        flags.append(flag)
+    return "    " + " · ".join(flags) if flags else None
+
+
+@app.command("commands")
+def commands_catalog(
+    ctx: typer.Context,
+    prefix: Optional[list[str]] = typer.Argument(None, help="A command or group, e.g. `log` or `project`: show its options."),
+    all_details: bool = typer.Option(False, "--all", help="Every command with every option."),
+) -> None:
+    """The CLI's map: one line per command; name a command or group (or --all) for its options."""
+    root = ctx.find_root().command
+    entries = [
+        entry for entry in _catalog_walk(root, [])
+        if not prefix or entry["command"].split()[: len(prefix)] == list(prefix)
+    ]
+    if prefix and not entries:
+        _handle_error(typer.BadParameter(f"No command matches {' '.join(prefix)!r}; `moment commands` lists them."))
+    detailed = bool(prefix) or all_details
+    global_options = [
+        _catalog_option(param) for param in root.params
+        if getattr(param, "param_type_name", "") == "option" and param.name not in _CATALOG_SKIP_OPTIONS
+    ]
+    if _state.get("json"):
+        commands = entries if detailed else [
+            {"command": entry["command"], "usage": _catalog_usage(entry), "summary": entry["summary"]}
+            for entry in entries
+        ]
+        print_json({"version": __version__, "globalOptions": global_options, "commands": commands})
+        return
+
+    def block(entry: dict) -> list[str]:
+        lines = [f"{_catalog_usage(entry)} — {entry['summary']}"]
+        options = _catalog_option_line(entry) if detailed else None
+        return lines + ([options] if options else [])
+
+    lines = [
+        "-p <id|alias>, --json, and --quiet work before or after the subcommand; "
+        "--api-url, --api-key, and --config go before it.",
+    ]
+    if detailed:
+        for entry in entries:
+            lines += block(entry)
+    else:
+        by_name = {entry["command"]: entry for entry in entries}
+        lines += ["", "Start here:"]
+        for name in _CATALOG_START_HERE:
+            if name in by_name:
+                lines += block(by_name[name])
+        lines += ["", "Everything else (`moment commands <command>` shows its options):"]
+        for entry in entries:
+            if entry["command"] not in _CATALOG_START_HERE:
+                lines += block(entry)
+    sys.stdout.write("\n".join(lines) + "\n")
+
+
 @app.command("activity")
 def activity(
-    limit: int = typer.Option(20, "--limit", "-l", help="Max results."),
+    limit: int = typer.Option(20, "--limit", "-n", "-l", help="Max results."),
 ) -> None:
     """Show recent activity feed."""
     try:

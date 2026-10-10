@@ -1,21 +1,148 @@
-"""Rich-based display helpers."""
+"""Display helpers: Rich for a person at a terminal, plain text for everything else.
+
+Most readers of this CLI are agents reading piped stdout. Panel borders and
+80-column hard wraps cost them tokens and split words mid-line, so when stdout
+is not a terminal every renderer's output is flattened: panels become
+``## Title`` sections, markdown prints raw, tables print as markdown tables, and
+nothing is wrapped. ``MOMENT_OUTPUT=plain`` or ``MOMENT_OUTPUT=rich`` overrides
+the detection (for example under a harness that allocates a pseudo-terminal).
+"""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
+import re
 import sys
 from typing import Any, Optional
 
 from rich.console import Console, Group
+from rich.errors import MarkupError
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-console = Console(highlight=False)
-err_console = Console(stderr=True, highlight=False)
+
+def _forced_mode() -> Optional[str]:
+    mode = (os.environ.get("MOMENT_OUTPUT") or "").strip().lower()
+    return mode if mode in ("plain", "rich") else None
+
+
+def stdout_is_rich() -> bool:
+    """True when a person is reading stdout in a terminal."""
+    mode = _forced_mode()
+    if mode:
+        return mode == "rich"
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _plain_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, Text):
+        return value.plain
+    text = str(value)
+    try:
+        return Text.from_markup(text).plain
+    except Exception:
+        return text
+
+
+def _table_cell(value: Any) -> str:
+    return _plain_text(value).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _markdown_table(table: Table) -> str:
+    headers = [_table_cell(column.header) for column in table.columns]
+    rows = zip(*(list(column.cells) for column in table.columns))
+    lines = []
+    if table.title:
+        lines.append(f"## {_plain_text(table.title)}")
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("---" for _ in headers) + "|")
+    lines.extend("| " + " | ".join(_table_cell(cell) for cell in row) + " |" for row in rows)
+    return "\n".join(lines)
+
+
+def _flatten(renderable: Any) -> list[Any]:
+    """One renderable as plain, unboxed pieces, each printed on its own line."""
+    if isinstance(renderable, Panel):
+        pieces: list[Any] = []
+        title = _plain_text(renderable.title)
+        if title:
+            pieces.append(Text(f"## {title}"))
+        pieces.extend(_flatten(renderable.renderable))
+        subtitle = _plain_text(renderable.subtitle)
+        if subtitle:
+            pieces.append(Text(subtitle))
+        return pieces
+    if isinstance(renderable, Group):
+        return [piece for child in renderable.renderables for piece in _flatten(child)]
+    if isinstance(renderable, Markdown):
+        return [Text(renderable.markup)]
+    if isinstance(renderable, Rule):
+        title = _plain_text(renderable.title)
+        return [Text(f"--- {title} ---" if title else "---")]
+    if isinstance(renderable, Table):
+        return [Text(_markdown_table(renderable))]
+    return [renderable]
+
+
+# This CLI never writes link markup itself, so any `[link=…]` tag came from
+# server text interpolated into a markup string, where it would become a real
+# terminal hyperlink. Drop the tags and keep the words.
+_LINK_MARKUP = re.compile(r"\[/?link(?:=[^\]]*)?\]")
+
+
+def _defuse(renderable: Any) -> Any:
+    return _LINK_MARKUP.sub("", renderable) if isinstance(renderable, str) else renderable
+
+
+class AgentConsole(Console):
+    """A Rich console that prints plain, unwrapped text when nobody is watching."""
+
+    def is_plain(self) -> bool:
+        mode = _forced_mode()
+        if mode:
+            return mode == "plain"
+        return not self.is_terminal
+
+    def _emit(self, objects: tuple, kwargs: dict) -> None:
+        objects = tuple(_defuse(obj) for obj in objects)
+        try:
+            super().print(*objects, **kwargs)
+        except MarkupError:
+            # Server text such as "Use [/] to close" breaks a markup string; print
+            # it literally (panels included) rather than failing the command.
+            previous = self._markup
+            self._markup = False
+            try:
+                super().print(*objects, **{**kwargs, "markup": False})
+            finally:
+                self._markup = previous
+
+    def print(self, *objects: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        if not self.is_plain():
+            self._emit(objects, kwargs)
+            return
+        kwargs.setdefault("soft_wrap", True)
+        if all(isinstance(obj, (str, Text)) for obj in objects):
+            self._emit(objects, kwargs)
+            return
+        for obj in objects:
+            for piece in _flatten(obj):
+                self._emit((piece,), kwargs)
+
+
+console = AgentConsole(highlight=False)
+err_console = AgentConsole(stderr=True, highlight=False)
 
 # Color palette matching the original theme
 ACCENT = "#72d6ff"
@@ -97,22 +224,45 @@ def format_structured_handoff(handoff: dict) -> list[str]:
     return hl
 
 
+def _write_json(stream: Any, data: Any, *, pretty: bool) -> None:
+    """Indented for a terminal, compact for a pipe; UTF-8 unless the stream can't take it."""
+    layout: dict[str, Any] = {"indent": 2} if pretty else {"separators": (",", ":")}
+    try:
+        stream.write(json.dumps(data, ensure_ascii=False, default=str, **layout) + "\n")
+    except UnicodeEncodeError:
+        stream.write(json.dumps(data, ensure_ascii=True, default=str, **layout) + "\n")
+
+
 def print_json(data: Any) -> None:
-    sys.stdout.write(json.dumps(data, indent=2, default=str) + "\n")
+    _write_json(sys.stdout, data, pretty=stdout_is_rich())
 
 
-def print_error(message: str, status: Optional[int] = None) -> None:
+def print_error(message: str, status: Optional[int] = None, hint: Optional[str] = None) -> None:
     prefix = f"Moment API error ({status})" if status else "Error"
-    err_console.print(f"[bold red]{prefix}:[/] {message}")
+    err_console.print(f"[bold red]{prefix}:[/] {escape(message)}")
+    if hint:
+        err_console.print(escape(hint))
 
 
-def print_error_json(error: str, status: Optional[int] = None, details: Any = None) -> None:
-    payload = {"error": error}
+def print_error_json(
+    error: str,
+    status: Optional[int] = None,
+    details: Any = None,
+    hint: Optional[str] = None,
+) -> None:
+    payload: dict[str, Any] = {"error": error}
     if status is not None:
         payload["status"] = status
+    if isinstance(details, dict):
+        # Lift the fields an agent branches on out of the server's error body.
+        for key in ("code", "retryable", "retryAfter"):
+            if details.get(key) is not None:
+                payload[key] = details[key]
+    if hint:
+        payload["hint"] = hint
     if details is not None:
         payload["details"] = details
-    sys.stderr.write(json.dumps(payload, indent=2, default=str) + "\n")
+    _write_json(sys.stderr, payload, pretty=False)
 
 
 def kv(label: str, value: Any, label_width: int = 16) -> str:
@@ -286,7 +436,7 @@ def render_project_context(payload: dict) -> None:
         kv("Token estimate", meta.get("tokenEstimate", "n/a")),
         kv("Cache hit", "yes" if meta.get("cacheHit") else "no"),
         kv("Active tasks", len(payload.get("activeTasks") or [])),
-        kv("Recent insights", len(payload.get("recentInsights") or [])),
+        kv("Recent signals", len(payload.get("recentSignals") or [])),
         kv("Discussions", len(payload.get("recentDiscussions") or [])),
     ]
     console.print(Panel("\n".join(lines), title=f"Project #{p['id']}", border_style=ACCENT_STRONG))
@@ -459,8 +609,8 @@ def render_brief(payload: dict, quiet: bool = False) -> None:
 
     console.print(
         f"[dim]~{meta.get('tokenEstimate', '?')} tokens · "
-        "`moment orient --prompt` for the agent-ready brief · "
-        "`moment sync` to mirror to .continuity/[/]")
+        "`moment page-read <slug>` reads a page in full · "
+        "`moment orient --prompt` prints the agent brief[/]")
 
     next_calls = payload.get("nextCalls") or []
     if next_calls:
@@ -514,6 +664,21 @@ def _packet_author(meta: dict) -> str:
     return user.get("name") or agent.get("name") or "unknown"
 
 
+def _packet_reader(item: dict) -> Optional[str]:
+    """The CLI call that reads an evidence item's source in full, when there is one."""
+    entity = item.get("entity") or {}
+    kind = str(entity.get("type") or "").upper()
+    project = entity.get("projectId")
+    scope = f"-p {project} " if project else ""
+    if kind == "PAGE":
+        href = str((item.get("locator") or {}).get("href") or "")
+        slug = entity.get("slug") or (href.split("page=", 1)[1].split("&", 1)[0] if "page=" in href else None)
+        return f"moment {scope}page-read {slug}" if slug else None
+    if kind == "RESOURCE" and entity.get("id"):
+        return f"moment {scope}project read-resource {entity['id']}"
+    return None
+
+
 def render_packet(payload: dict, quiet: bool = False) -> None:
     """A compiled Research Context Packet — inspectable evidence, not just ranked context."""
     evidence = payload.get("evidence") or []
@@ -539,15 +704,17 @@ def render_packet(payload: dict, quiet: bool = False) -> None:
         authority = str(item.get("authority") or "UNREVIEWED")
         freshness = str(item.get("freshness") or "UNKNOWN")
         entity = item.get("entity") or {}
-        source = str((item.get("provenance") or {}).get("sourceType") or entity.get("type") or "")
-        locator = item.get("locator") or {}
-        where = locator.get("label") or locator.get("href") or item.get("uri") or ""
+        evidence_id = item.get("evidenceId") or f"{entity.get('type', '?')}:{entity.get('id', '?')}"
+        date = str(item.get("updatedAt") or "")[:10]
+        author = (item.get("provenance") or {}).get("author")
+        reader = _packet_reader(item)
         line = (
-            f"[bold]{item.get('title', '(untitled)')}[/]"
-            + (f" [dim]· {source.lower()}[/]" if source else "")
+            f"[bold]{escape(str(evidence_id))}[/] {escape(str(item.get('title') or '(untitled)'))}"
             + f" {chip(authority, AUTHORITY_STYLE.get(authority, ACCENT_STRONG))}"
             + f" {chip(freshness, FRESHNESS_STYLE.get(freshness, 'dim'))}"
-            + (f" [dim]· {where}[/]" if where else "")
+            + (f" [dim]· {date}[/]" if date else "")
+            + (f" [dim]· {escape(str(author))}[/]" if author else "")
+            + (f" [dim]→ {escape(reader)}[/]" if reader else "")
         )
         console.print(line)
         reason = (item.get("match") or {}).get("reason")
@@ -597,16 +764,136 @@ def render_packet_list(packets: list) -> None:
 
 
 def render_page(payload: dict) -> None:
-    """A single page in full — title header, then the raw markdown body on stdout."""
+    """A single page in full: one header line (slug, role, version for --if-version,
+    date), then the raw markdown body on stdout."""
     page = payload.get("page") or {}
     title = page.get("title") or page.get("slug") or "(untitled)"
-    bits = [b for b in (page.get("role"), f"/{page.get('slug')}" if page.get("slug") else None) if b]
-    console.print(Panel(f"[bold]{title}[/]" + (f"\n[dim]{' · '.join(str(b) for b in bits)}[/]" if bits else ""), border_style=ACCENT_STRONG))
+    bits = [
+        page.get("slug"),
+        page.get("role"),
+        "pinned" if page.get("pinned") else None,
+        f"v{page['version']}" if page.get("version") is not None else None,
+        str(page.get("updatedAt") or "")[:10] or None,
+    ]
+    meta = " · ".join(str(bit) for bit in bits if bit)
+    if console.is_plain():
+        console.print(Text(f"# {title}" + (f" ({meta})" if meta else "")))
+    else:
+        console.print(Panel(f"[bold]{escape(title)}[/]" + (f"\n[dim]{escape(meta)}[/]" if meta else ""), border_style=ACCENT_STRONG))
     body = page.get("body") or ""
     if body.strip():
         sys.stdout.write(body.rstrip() + "\n")
     else:
         console.print("[dim](this page is empty)[/]")
+
+
+def _clip_line(text: Any, limit: int = 240) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def write_queued(result: dict) -> bool:
+    """Print the HTTP 202 outcome of a write on a project the key can't edit."""
+    if not (isinstance(result, dict) and result.get("queued")):
+        return False
+    proposal = result.get("proposal") or {}
+    console.print(Text(
+        f"Queued for an editor (proposal #{proposal.get('id', '?')}): "
+        f"{proposal.get('summary') or 'change'}. Not applied yet."
+    ))
+    return True
+
+
+def render_page_written(result: dict, searchable: Optional[str] = None) -> None:
+    if write_queued(result):
+        return
+    page = result.get("page") or {}
+    verb = "Created" if result.get("created") else "Updated"
+    bits = [page.get("slug"), f"v{page['version']}" if page.get("version") is not None else None,
+            "pinned" if page.get("pinned") else None]
+    line = f"{verb} page \"{page.get('title') or page.get('slug')}\" ({' · '.join(str(b) for b in bits if b)})."
+    console.print(Text(line + (f" {searchable}" if searchable else "")))
+
+
+def render_resource_added(result: dict, status: Optional[int]) -> None:
+    if write_queued(result):
+        return
+    resource = result.get("resource") or {}
+    state = "already on file" if status == 200 else "new"
+    console.print(Text(
+        f"Attached #{resource.get('id')} {resource.get('kind') or 'RESOURCE'} "
+        f"\"{resource.get('title') or resource.get('uri')}\" ({state})."
+        + (" Content is ingesting in the background." if result.get("ingesting") else "")
+    ))
+
+
+def render_resources(payload: dict, quiet: bool = False) -> None:
+    resources = payload.get("resources") or []
+    if not resources:
+        console.print(Text("No resources on this project."))
+        return
+    for resource in resources:
+        role = f" · {resource['role']}" if resource.get("role") else ""
+        console.print(Text(
+            f"#{resource.get('id')} {resource.get('kind') or 'OTHER'}{role} "
+            f"\"{resource.get('title') or 'untitled'}\" — {resource.get('uri') or ''}"
+        ))
+        if resource.get("summary") and not quiet:
+            console.print(Text(f"    {_clip_line(resource['summary'], 200)}"))
+    if payload.get("truncated"):
+        console.print(Text("(first 200 shown)"))
+    if not quiet:
+        console.print(Text("— read one: moment project read-resource <id> [--fidelity text]"))
+
+
+def render_resource_content(payload: dict) -> None:
+    resource = payload.get("resource") or {}
+    bits = [f"#{resource.get('id')}", payload.get("fidelity"),
+            f"~{payload['tokenEstimate']} tokens" if payload.get("tokenEstimate") else None]
+    console.print(Text(f"# {resource.get('title') or resource.get('uri')} ({' · '.join(str(b) for b in bits if b)})"))
+    if resource.get("uri"):
+        console.print(Text(str(resource["uri"])))
+    if payload.get("accessNote"):
+        console.print(Text(f"Access: {payload['accessNote']}"))
+    content = payload.get("content")
+    if isinstance(content, str):
+        sys.stdout.write(content.rstrip() + "\n")
+    elif content is not None:
+        print_json(content)
+    if payload.get("moreAvailable"):
+        console.print(Text("— more available: --fidelity text, or --section <heading>"))
+
+
+def _find_reader(hit: dict) -> Optional[str]:
+    """The CLI call that reads a search hit in full, when there is one."""
+    kind = str(hit.get("entityType") or "").upper()
+    project = hit.get("projectId")
+    scope = f"-p {project} " if project else ""
+    if kind == "PAGE" and hit.get("ref"):
+        return f"moment {scope}page-read {hit['ref']}"
+    if kind == "RESOURCE" and hit.get("entityId"):
+        return f"moment {scope}project read-resource {hit['entityId']}"
+    if kind == "TASK" and hit.get("entityId"):
+        return f"moment task show {hit['entityId']}"
+    if kind == "PROJECT" and (hit.get("entityId") or project):
+        return f"moment -p {hit.get('entityId') or project} orient"
+    return None
+
+
+def render_find(payload: dict, quiet: bool = False) -> None:
+    hits = payload.get("results") or []
+    if not hits:
+        console.print(Text("No matches. Try other words, or widen the scope (drop -p, --types, --since)."))
+        return
+    for index, hit in enumerate(hits, 1):
+        kind = hit.get("entityType") or "?"
+        where = f"project {hit['projectId']}" if hit.get("projectId") else ""
+        reader = _find_reader(hit)
+        ident = f" #{hit['entityId']}" if hit.get("entityId") and not reader else ""
+        line = f"{index}. {kind}{ident} \"{hit.get('title') or 'untitled'}\"" + (f" · {where}" if where else "")
+        console.print(Text(line + (f" → {reader}" if reader else "")))
+        if hit.get("snippet") and not quiet:
+            console.print(Text(f"   {_clip_line(hit['snippet'])}"))
 
 
 def render_graph(payload: dict, page: str) -> None:
@@ -694,15 +981,15 @@ def render_contribution_result(payload: dict) -> None:
         console.print(Panel("\n".join(lines), title="Message posted", border_style=GLOW))
         return
 
-    if payload.get("insight"):
-        ins = payload["insight"]
+    if payload.get("signal"):
+        sig = payload["signal"]
         lines = [
-            kv("Insight", ins["id"]),
-            kv("Type", ins["type"]),
-            kv("Project", ins["project"]["title"]),
-            kv("Created", ins["createdAt"]),
+            kv("Signal", sig["id"]),
+            kv("Type", sig["type"]),
+            kv("Project", sig["project"]["title"]),
+            kv("Created", sig["createdAt"]),
         ]
-        console.print(Panel("\n".join(lines), title="Insight created", border_style=GLOW))
+        console.print(Panel("\n".join(lines), title="Signal created", border_style=GLOW))
 
 
 def render_activity(payload: dict) -> None:

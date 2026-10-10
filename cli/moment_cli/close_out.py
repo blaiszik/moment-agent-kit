@@ -156,8 +156,8 @@ def commits_summary(range_str: str, repo_root: Optional[str] = None) -> Optional
     Capped at MAX_COMMIT_LINES (then "… and N more"). Returns None when the
     range is empty or invalid (never raises).
     """
-    if not range_str or not range_str.strip():
-        return None
+    if not range_str or not range_str.strip() or range_str.strip().startswith("-"):
+        return None  # a range never starts with "-"; git would read it as an option
     root = _discover_repo_root(repo_root)
     if not root:
         return None

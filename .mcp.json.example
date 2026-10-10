@@ -1,22 +1,19 @@
 {
   "mcpServers": {
-    "moment": {
-      "type": "stdio",
-      "command": "node",
-      "args": [
-        "./mcp-server/dist/index.js",
-        "--api-url=https://www.scientific-intelligence.com",
-        "--api-key=YOUR_MOMENT_API_KEY"
-      ]
+    "moment-research": {
+      "type": "http",
+      "url": "https://scientificintelligence.org/api/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MOMENT_API_KEY}"
+      }
     },
-    "moment-local": {
+    "moment-research-local": {
       "type": "stdio",
       "command": "node",
-      "args": [
-        "./mcp-server/dist/index.js",
-        "--api-url=http://localhost:3000",
-        "--api-key=YOUR_LOCAL_DEV_API_KEY"
-      ]
+      "args": ["<KIT_PATH>/mcp-server/dist/index.js", "--api-url=http://localhost:3000"],
+      "env": {
+        "MOMENT_MCP_API_KEY": "${MOMENT_LOCAL_API_KEY}"
+      }
     }
   }
 }

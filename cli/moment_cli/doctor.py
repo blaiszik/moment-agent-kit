@@ -33,6 +33,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from moment_cli.config import (
+    DEFAULT_API_URL,
     _extract_mcp_config,
     _find_up,
     read_repo_bindings,
@@ -144,7 +145,20 @@ def run_doctor(
         elif data is not None:
             results.append(CheckResult("binding", "fail", f"{binding_path}: not a JSON object"))
 
-    # --- 2. api-key: a key resolves via the config chain, without printing it. ---
+    # --- 2. agent-key provenance: minted by login, supplied, or missing. ---
+    try:
+        provenance_cfg = resolve_config(
+            api_url=api_url_override,
+            config_path=config_path,
+            require_api_key=False,
+            quiet=True,
+        )
+        provenance = provenance_cfg.api_key_source
+    except Exception:
+        provenance = "missing"
+    results.append(CheckResult("agent key", "ok" if provenance != "missing" else "fail", provenance))
+
+    # --- 3. api-key: a key resolves via the config chain, without printing it. ---
     cfg = None
     key_ok = False
     try:
@@ -156,11 +170,27 @@ def run_doctor(
     except Exception as exc:
         results.append(CheckResult("api-key", "fail", f"config error: {exc}"))
 
+    # --- 3b. server: may credentials go where the config points? ---
+    try:
+        server_cfg = cfg or resolve_config(
+            api_url=api_url_override, config_path=config_path, require_api_key=False, quiet=True,
+        )
+        if server_cfg.api_url_trusted:
+            results.append(CheckResult("server", "ok", f"{server_cfg.api_url} (from {server_cfg.api_url_source})"))
+        else:
+            results.append(CheckResult(
+                "server", "fail",
+                f"{server_cfg.api_url} chosen by {server_cfg.api_url_source}; credentials withheld until "
+                "you pass --api-url or list it in trustedApiUrls in ~/.moment.json",
+            ))
+    except Exception:
+        pass  # the api-key check above already reported the config error
+
     # Effective URL for reachability: resolved cfg wins, else override / binding / default.
-    probe_url = (cfg.api_url if cfg else None) or api_url_override or binding_url or "https://www.scientific-intelligence.com"
+    probe_url = (cfg.api_url if cfg else None) or api_url_override or binding_url or DEFAULT_API_URL
     probe_url = probe_url.rstrip("/")
 
-    # --- 3. api-reach: GET the API root with a short timeout. ---
+    # --- 4. api-reach: GET the API root with a short timeout. ---
     reach_ok = False
     try:
         import httpx
@@ -171,7 +201,7 @@ def run_doctor(
     except Exception as exc:
         results.append(CheckResult("api-reach", "fail", f"{probe_url} → {type(exc).__name__}: {exc}"))
 
-    # --- 4. auth: an authenticated whoami-grade call succeeds. ---
+    # --- 5. auth: an authenticated whoami-grade call succeeds. ---
     auth_ok = False
     if not key_ok:
         results.append(CheckResult("auth", "skip", "no API key to authenticate with"))
@@ -191,7 +221,7 @@ def run_doctor(
             detail = f"HTTP {status}: {exc}" if status else str(exc)
             results.append(CheckResult("auth", "fail", detail))
 
-    # --- 5. project: the selected default is readable with this key. ---
+    # --- 6. project: the selected default is readable with this key. ---
     if not binding_ok or project_id is None:
         results.append(CheckResult("project", "skip", "no bound project to read"))
     elif not auth_ok:
@@ -209,7 +239,7 @@ def run_doctor(
             detail = f"HTTP {status}: {exc}" if status else str(exc)
             results.append(CheckResult("project", "fail", f"#{project_id}: {detail}"))
 
-    # --- 6. mcp-config: repo .mcp.json moment server agrees with .moment.json apiUrl. ---
+    # --- 7. mcp-config: repo .mcp.json moment server agrees with .moment.json apiUrl. ---
     mcp_path = _find_up(cwd, ".mcp.json")
     if not mcp_path:
         results.append(CheckResult("mcp-config", "skip", "no .mcp.json in repo"))
