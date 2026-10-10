@@ -3,7 +3,7 @@ name = "moment-cli"
 version = "2.6.0"
 description = "Moment research agent CLI"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.10"
 keywords = ["research", "agents", "context", "cli"]
 classifiers = [
@@ -24,10 +24,11 @@ dependencies = [
 [project.urls]
 Homepage = "https://scientificintelligence.org"
 Documentation = "https://scientificintelligence.org/developers"
+Repository = "https://github.com/blaiszik/moment-agent-kit"
 
 [project.scripts]
 moment = "moment_cli.cli:app"
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"

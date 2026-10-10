@@ -68,7 +68,7 @@ Moment holds a research project's shared context: the handoff (next step, what w
 ## Resolve the project and the transport
 
 - **Project.** Use an explicit target from the user first. In an attached repository, `moment project list --for "<task>"` lists the projects in `.moment.json` and explains which one is selected. An id or an alias works wherever a project is expected. Ask only when the candidates remain materially ambiguous.
-- **Transport.** Use the `moment-research` MCP tools when they are connected; in Claude Code they are deferred, so load the ones you need in one ToolSearch call. Otherwise use the `moment` CLI (if it is missing: `uv tool install "git+https://github.com/blaiszik/moment-agent-kit#subdirectory=cli"`, or the same address with `pipx install`; it is not on PyPI). Fall back to REST (`/api/v1/agents/…`, catalog at `GET /api/v1/agents/openapi`) only when neither works. If an MCP call fails on transport, switch to the CLI.
+- **Transport.** Use the `moment-research` MCP tools when they are connected; in Claude Code they are deferred, so load the ones you need in one ToolSearch call. Otherwise use the `moment` CLI (if it is missing: `uv tool install moment-cli`, or `pipx install moment-cli`). Fall back to REST (`/api/v1/agents/…`, catalog at `GET /api/v1/agents/openapi`) only when neither works. If an MCP call fails on transport, switch to the CLI.
 - **Server or key trouble.** Run `moment doctor`, and read [servers](references/servers.md). Never print credentials. The CLI sends credentials only to the lab, localhost, or a server the person chose; if it refuses a server that a repository's config picked, tell the user. Trusting that server (`--api-url`, `trustedApiUrls`) is their decision, not yours.
 
 ## Using the CLI

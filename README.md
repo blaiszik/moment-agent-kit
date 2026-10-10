@@ -65,14 +65,13 @@ the full tool list and options.
 ### C. CLI
 
 ```bash
-uv tool install "git+https://github.com/blaiszik/moment-agent-kit#subdirectory=cli"
+uv tool install moment-cli
 moment onboard -p <projectId>   # signs you in the first time and binds this repository
 moment orient                   # the project brief: handoff, next step, watch-out
 ```
 
-No [uv](https://docs.astral.sh/uv/getting-started/installation/)? Use
-`pipx install "git+https://github.com/blaiszik/moment-agent-kit#subdirectory=cli"`, or
-`uv tool install ./cli` from a clone. The CLI needs Python 3.10+. `moment commands` maps every
+No [uv](https://docs.astral.sh/uv/getting-started/installation/)? Use `pipx install moment-cli`, or
+`uv tool install ./cli` from a clone. The package is [moment-cli on PyPI](https://pypi.org/project/moment-cli/). The CLI needs Python 3.10+. `moment commands` maps every
 command. For a hackathon entry: `moment campaign status`, then `moment campaign submission edit`.
 See [`cli/README.md`](cli/README.md).
 
