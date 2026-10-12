@@ -12,3 +12,7 @@ No [uv](https://docs.astral.sh/uv/getting-started/installation/)? `pipx install 
 `moment onboard` signs you in through the browser the first time, binds the current repository to the project, seeds useful repository context, updates the agent instructions, and installs supported ambient-capture hooks.
 
 Run `moment orient` at the start of a session to render the project's current brief and next steps.
+
+## Releasing
+
+Bump `version` in `pyproject.toml` and the fallback `__version__` in `moment_cli/__init__.py`. When the bump reaches `main` of the Moment repository, a GitHub Action tests, builds and publishes it to PyPI. See [RELEASING.md](RELEASING.md).

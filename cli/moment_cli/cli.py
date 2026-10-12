@@ -4935,7 +4935,8 @@ def _catalog_type(param: object) -> str:
     if choices:
         return "|".join(str(choice) for choice in choices)
     name = str(getattr(kind, "name", "") or "text").lower()
-    return {"integer": "int", "float": "number", "boolean": "bool"}.get(name, name)
+    # typer 0.27 names click's STRING type "str"; earlier releases said "text".
+    return {"integer": "int", "float": "number", "boolean": "bool", "str": "text", "string": "text"}.get(name, name)
 
 
 def _catalog_option(param: object) -> dict:

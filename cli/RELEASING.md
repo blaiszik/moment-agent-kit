@@ -1,18 +1,15 @@
 # Releasing `moment-cli`
 
-Ben owns the PyPI account and release token. The token stays in Ben's local credential store or CI secret storage and is never committed to this repository.
+Releases are automatic. Bump `version` in `pyproject.toml` **and** the fallback `__version__` in `moment_cli/__init__.py` on your branch. When the bump reaches `main` (the production deploy, `scripts/ship.sh`), `.github/workflows/publish-cli.yml`:
 
-From `tools/moment-cli`:
+1. skips if PyPI already has that version (so a push that touches the CLI without a bump does nothing), and fails if the two version strings disagree;
+2. runs the CLI tests, builds, runs `twine check --strict`, and installs the built wheel in a clean venv to check `moment --help` and the reported version;
+3. uploads with the repository secret `PYPI_TOKEN` (scoped to the moment-cli project only);
+4. tags the commit `moment-cli-v<version>`.
 
-```bash
-python -m build
-twine check dist/*
-python -m twine upload --repository testpypi dist/*
-pipx install --index-url https://test.pypi.org/simple/ moment-cli
-python -m twine upload dist/*
-```
+Releasing with the deploy is deliberate: a CLI release must never call routes production doesn't serve yet. To retry after a PyPI outage, run the workflow by hand (Actions → publish-cli → Run workflow); it still skips a published version. PyPI never accepts the same version twice, so a bad release is fixed with a new version, never a re-upload.
 
-Verify the TestPyPI installation before uploading the same artifacts to PyPI. Publishing is a manual Ben-owned step. Bump `version` in pyproject.toml for every upload (PyPI never accepts the same version twice). The upload token lives in `~/.pypirc` (mode 600) or is pasted at twine's prompt, never in a shell profile or this repository.
+By hand, as a fallback only (from `tools/moment-cli`): `python -m build && twine check dist/* && python -m twine upload dist/*`. A personal token lives in `~/.pypirc` (mode 600) or is pasted at twine's prompt, never in a shell profile or this repository.
 
 To rename the distribution, change exactly these two package-name constants together:
 
